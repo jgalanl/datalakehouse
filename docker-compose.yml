@@ -1,15 +1,23 @@
-﻿version: '3.8'
+﻿# Data Lakehouse Platform
+# Master's Degree Final Project - Technical Architecture
+# Components: MinIO, Iceberg, Nessie, Spark, Dremio, OpenMetadata, MLflow
 
 services:
+  # ============================================================================
+  # STORAGE LAYER - MinIO
+  # ============================================================================
+  # MinIO: S3-compatible object storage serving as the data lake foundation
   minio:
     image: minio/minio:latest
     container_name: datalakehouse-minio
+    hostname: minio
     ports:
-      - "9000:9000"  # MinIO S3 API
-      - "9001:9001"  # MinIO Web Console
+      - "9000:9000"  # S3 API endpoint
+      - "9001:9001"  # Console endpoint
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_CONSOLE_ADDRESS: ":9001"
     volumes:
       - minio_data:/minio/data
     command: minio server /minio/data --console-address ":9001"
@@ -18,14 +26,580 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 10s
     networks:
       - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: storage
+      component: minio
+
+  # ============================================================================
+  # METADATA CATALOGING - Project Nessie with PostgreSQL backend
+  # ============================================================================
+  # PostgreSQL: Backend for Nessie metadata catalog
+  nessie-postgres:
+    image: postgres:15-alpine
+    container_name: datalakehouse-nessie-postgres
+    hostname: nessie-postgres
+    environment:
+      POSTGRES_USER: ${NESSIE_DB_USER:-nessie}
+      POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie123}
+      POSTGRES_DB: ${NESSIE_DB_NAME:-nessie}
+    volumes:
+      - nessie_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: metadata
+      component: nessie-postgres
+
+  # Project Nessie: Metadata cataloging and Git-like versioning for data
+  nessie-server:
+    image: ghcr.io/projectnessie/nessie:0.82.0
+    container_name: datalakehouse-nessie
+    hostname: nessie-server
+    ports:
+      - "19120:19120"  # Nessie REST API
+    environment:
+      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://nessie-postgres:5432/nessie"
+      QUARKUS_DATASOURCE_USERNAME: ${NESSIE_DB_USER:-nessie}
+      QUARKUS_DATASOURCE_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie123}
+      QUARKUS_HTTP_PORT: 19120
+    depends_on:
+      nessie-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: metadata
+      component: nessie
+
+  # ============================================================================
+  # COMPUTE LAYER - Apache Spark
+  # ============================================================================
+  # Spark Master: Orchestrator for distributed data processing
+  spark-master:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: datalakehouse-spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080"   # Spark Master Web UI
+      - "7077:7077"   # Spark Master communication port
+      - "4040:4040"   # Spark Application UI
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+      SPARK_LOCAL_IP: spark-master
+      SPARK_MASTER_WEBUI_PORT: 8080
+      # Iceberg + Nessie configuration
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - spark_data:/home/spark
+      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./src:/opt/spark/src:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie-server:
+        condition: service_healthy
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: compute
+      component: spark-master
+
+  # Spark Worker 1: Distributed compute node
+  spark-worker-1:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: datalakehouse-spark-worker-1
+    hostname: spark-worker-1
+    ports:
+      - "8081:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - spark_worker_1_data:/home/spark
+      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+    depends_on:
+      - spark-master
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: compute
+      component: spark-worker
+
+  # Spark Worker 2: Distributed compute node
+  spark-worker-2:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: datalakehouse-spark-worker-2
+    hostname: spark-worker-2
+    ports:
+      - "8082:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - spark_worker_2_data:/home/spark
+      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+    depends_on:
+      - spark-master
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: compute
+      component: spark-worker
+
+  # ============================================================================
+  # TABLE FORMAT - Iceberg REST Catalog
+  # ============================================================================
+  # Iceberg REST Catalog: Provides OpenAPI-compliant table metadata management
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:latest
+    container_name: datalakehouse-iceberg-rest
+    hostname: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_S3_ENDPOINT: http://minio:9000
+      CATALOG_WAREHOUSE_LOCATION: s3://warehouse/
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      CATALOG_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      CATALOG_S3_PATH_STYLE_ACCESS_ENABLED: "true"
+      CATALOG_JDBC_USER: ${ICEBERG_DB_USER:-iceberg}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD:-iceberg123}
+      CATALOG_JDBC_URI: jdbc:postgresql://iceberg-postgres:5432/iceberg
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: catalog
+      component: iceberg-rest
+
+  # PostgreSQL: Backend for Iceberg REST Catalog
+  iceberg-postgres:
+    image: postgres:15-alpine
+    container_name: datalakehouse-iceberg-postgres
+    hostname: iceberg-postgres
+    environment:
+      POSTGRES_USER: ${ICEBERG_DB_USER:-iceberg}
+      POSTGRES_PASSWORD: ${ICEBERG_DB_PASSWORD:-iceberg123}
+      POSTGRES_DB: iceberg
+    volumes:
+      - iceberg_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: catalog
+      component: iceberg-postgres
+
+  # ============================================================================
+  # QUERY ENGINE - Dremio OSS
+  # ============================================================================
+  # PostgreSQL: Backend for Dremio coordination
+  dremio-postgres:
+    image: postgres:15-alpine
+    container_name: datalakehouse-dremio-postgres
+    hostname: dremio-postgres
+    environment:
+      POSTGRES_USER: ${DREMIO_DB_USER:-dremio}
+      POSTGRES_PASSWORD: ${DREMIO_DB_PASSWORD:-dremio123}
+      POSTGRES_DB: dremio
+    volumes:
+      - dremio_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dremio"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: query_engine
+      component: dremio-postgres
+
+  # Dremio: Analytical SQL engine with Iceberg support
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: datalakehouse-dremio
+    hostname: dremio
+    ports:
+      - "9047:9047"   # Dremio Web Console
+      - "31010:31010" # Flight RPC endpoint
+      - "45678:45678" # ODBC
+    environment:
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: |
+        -Ddremio.exec.catalog.udf.enabled=false
+        -Ddremio.store.file.text.warn_unsupported=false
+      DREMIO_METATSTORE_DB_TYPE: postgresql
+      DREMIO_METATSTORE_DB_DRIVER: org.postgresql.Driver
+      DREMIO_METATSTORE_DB_URL: "jdbc:postgresql://dremio-postgres:5432/dremio"
+      DREMIO_METATSTORE_DB_USER: ${DREMIO_DB_USER:-dremio}
+      DREMIO_METATSTORE_DB_PASSWORD: ${DREMIO_DB_PASSWORD:-dremio123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - dremio_data:/var/lib/dremio
+      - ./config/dremio/dremio.conf:/etc/dremio/dremio.conf:ro
+    depends_on:
+      dremio-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: query_engine
+      component: dremio
+
+  # ============================================================================
+  # DATA GOVERNANCE - OpenMetadata (Official Configuration)
+  # ============================================================================
+  
+  # PostgreSQL: Backend for OpenMetadata
+  openmetadata-postgres:
+    container_name: datalakehouse-openmetadata-postgres
+    image: docker.getcollate.io/openmetadata/postgresql:1.11.6
+    restart: always
+    command: 
+      - "-c"
+      - "work_mem=10MB"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    expose:
+      - 5432
+    ports:
+      - "5437:5432"
+    volumes:
+      - ./docker-volume/openmetadata-db-data:/var/lib/postgresql/data
+    networks:
+      - datalakehouse
+    healthcheck:
+      test: psql -U postgres -tAc 'select 1' -d openmetadata_db || exit 1
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    labels:
+      service: governance
+      component: openmetadata-postgres
+
+  # Elasticsearch: Search backend for OpenMetadata
+  openmetadata-elasticsearch:
+    container_name: datalakehouse-openmetadata-es
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.4
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
+      - xpack.security.enabled=false
+    networks:
+      - datalakehouse
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    healthcheck:
+      test: "curl -s http://localhost:9200/_cluster/health?pretty | grep status | grep -qE 'green|yellow' || exit 1"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    volumes:
+      - openmetadata_es_data:/usr/share/elasticsearch/data
+    labels:
+      service: governance
+      component: openmetadata-elasticsearch
+
+  # OpenMetadata Migration: Database setup and migration
+  openmetadata-migrate:
+    container_name: datalakehouse-openmetadata-migrate
+    image: docker.getcollate.io/openmetadata/server:1.11.6
+    command: "./bootstrap/openmetadata-ops.sh migrate"
+    environment:
+      OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
+      SERVER_PORT: ${SERVER_PORT:-8585}
+      SERVER_ADMIN_PORT: ${SERVER_ADMIN_PORT:-8586}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MIGRATION_LIMIT_PARAM: ${MIGRATION_LIMIT_PARAM:-1200}
+      AUTHORIZER_CLASS_NAME: ${AUTHORIZER_CLASS_NAME:-org.openmetadata.service.security.DefaultAuthorizer}
+      AUTHORIZER_REQUEST_FILTER: ${AUTHORIZER_REQUEST_FILTER:-org.openmetadata.service.security.JwtFilter}
+      AUTHORIZER_ADMIN_PRINCIPALS: ${AUTHORIZER_ADMIN_PRINCIPALS:-[admin]}
+      AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: ${AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN:-["all"]}
+      AUTHORIZER_INGESTION_PRINCIPALS: ${AUTHORIZER_INGESTION_PRINCIPALS:-[ingestion-bot]}
+      AUTHORIZER_PRINCIPAL_DOMAIN: ${AUTHORIZER_PRINCIPAL_DOMAIN:-"open-metadata.org"}
+      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: ${AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN:-false}
+      AUTHENTICATION_PROVIDER: ${AUTHENTICATION_PROVIDER:-basic}
+      AUTHENTICATION_ENABLE_SELF_SIGNUP: ${AUTHENTICATION_ENABLE_SELF_SIGNUP:-true}
+      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
+      DB_SCHEME: ${DB_SCHEME:-postgresql}
+      DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
+      DB_USER: ${DB_USER:-openmetadata_user}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_HOST: ${DB_HOST:-openmetadata-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
+      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT:-9200}
+      ELASTICSEARCH_SCHEME: ${ELASTICSEARCH_SCHEME:-http}
+      SEARCH_TYPE: ${SEARCH_TYPE:-elasticsearch}
+      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
+      RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
+      RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
+      JWT_ISSUER: ${JWT_ISSUER:-"open-metadata.org"}
+      JWT_KEY_ID: ${JWT_KEY_ID:-"Gb389a-9f76-gdjs-a92j-0242bk94356"}
+      SECRET_MANAGER: ${SECRET_MANAGER:-db}
+      FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+    depends_on:
+      openmetadata-elasticsearch:
+        condition: service_healthy
+      openmetadata-postgres:
+        condition: service_healthy
+    networks:
+      - datalakehouse
+    labels:
+      service: governance
+      component: openmetadata-migrate
+
+  # OpenMetadata: Data documentation and governance platform
+  openmetadata:
+    container_name: datalakehouse-openmetadata
+    restart: always
+    image: docker.getcollate.io/openmetadata/server:1.11.6
+    environment:
+      OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
+      SERVER_PORT: ${SERVER_PORT:-8585}
+      SERVER_ADMIN_PORT: ${SERVER_ADMIN_PORT:-8586}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUTHORIZER_CLASS_NAME: ${AUTHORIZER_CLASS_NAME:-org.openmetadata.service.security.DefaultAuthorizer}
+      AUTHORIZER_REQUEST_FILTER: ${AUTHORIZER_REQUEST_FILTER:-org.openmetadata.service.security.JwtFilter}
+      AUTHORIZER_ADMIN_PRINCIPALS: ${AUTHORIZER_ADMIN_PRINCIPALS:-[admin]}
+      AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: ${AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN:-["all"]}
+      AUTHORIZER_INGESTION_PRINCIPALS: ${AUTHORIZER_INGESTION_PRINCIPALS:-[ingestion-bot]}
+      AUTHORIZER_PRINCIPAL_DOMAIN: ${AUTHORIZER_PRINCIPAL_DOMAIN:-"open-metadata.org"}
+      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: ${AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN:-false}
+      AUTHENTICATION_PROVIDER: ${AUTHENTICATION_PROVIDER:-basic}
+      AUTHENTICATION_ENABLE_SELF_SIGNUP: ${AUTHENTICATION_ENABLE_SELF_SIGNUP:-true}
+      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
+      DB_SCHEME: ${DB_SCHEME:-postgresql}
+      DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
+      DB_USER: ${DB_USER:-openmetadata_user}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_HOST: ${DB_HOST:-openmetadata-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
+      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT:-9200}
+      ELASTICSEARCH_SCHEME: ${ELASTICSEARCH_SCHEME:-http}
+      SEARCH_TYPE: ${SEARCH_TYPE:-elasticsearch}
+      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
+      RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
+      RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
+      JWT_ISSUER: ${JWT_ISSUER:-"open-metadata.org"}
+      JWT_KEY_ID: ${JWT_KEY_ID:-"Gb389a-9f76-gdjs-a92j-0242bk94356"}
+      PIPELINE_SERVICE_CLIENT_ENDPOINT: ${PIPELINE_SERVICE_CLIENT_ENDPOINT:-http://ingestion:8080}
+      PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL: ${PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL:-300}
+      SERVER_HOST_API_URL: ${SERVER_HOST_API_URL:-http://openmetadata:8585/api}
+      PIPELINE_SERVICE_CLIENT_VERIFY_SSL: ${PIPELINE_SERVICE_CLIENT_VERIFY_SSL:-"no-ssl"}
+      PIPELINE_SERVICE_CLIENT_ENABLED: ${PIPELINE_SERVICE_CLIENT_ENABLED:-false}
+      SECRET_MANAGER: ${SECRET_MANAGER:-db}
+      FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+      MASK_PASSWORDS_API: ${MASK_PASSWORDS_API:-false}
+      WEB_CONF_URI_PATH: ${WEB_CONF_URI_PATH:-"/api"}
+    expose:
+      - 8585
+      - 8586
+    ports:
+      - "8585:8585"
+      - "8586:8586"
+    depends_on:
+      openmetadata-elasticsearch:
+        condition: service_healthy
+      openmetadata-postgres:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    networks:
+      - datalakehouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    labels:
+      service: governance
+      component: openmetadata
+
+  # ============================================================================
+  # ML OPERATIONS - MLflow
+  # ============================================================================
+  # PostgreSQL: Backend for MLflow tracking
+  mlflow-postgres:
+    image: postgres:15-alpine
+    container_name: datalakehouse-mlflow-postgres
+    hostname: mlflow-postgres
+    environment:
+      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow123}
+      POSTGRES_DB: mlflow
+    volumes:
+      - mlflow_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: ml_operations
+      component: mlflow-postgres
+
+  # MLflow Tracking Server: ML experiment tracking and model registry
+  mlflow:
+    build:
+      context: ./docker/mlflow
+      dockerfile: Dockerfile
+    container_name: datalakehouse-mlflow
+    hostname: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      BACKEND_STORE_URI: "postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow123}@mlflow-postgres:5432/mlflow"
+      DEFAULT_ARTIFACT_ROOT: s3://mlflow-artifacts/
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    labels:
+      service: ml_operations
+      component: mlflow
 
 volumes:
+  # Storage layer
   minio_data:
+    driver: local
+
+  # Metadata layer
+  nessie_postgres_data:
+    driver: local
+  iceberg_postgres_data:
+    driver: local
+
+  # Compute layer
+  spark_data:
+    driver: local
+  spark_worker_1_data:
+    driver: local
+  spark_worker_2_data:
+    driver: local
+
+  # Query engine layer
+  dremio_postgres_data:
+    driver: local
+  dremio_data:
+    driver: local
+
+  # Governance layer
+  openmetadata_postgres_data:
+    driver: local
+  openmetadata_es_data:
+    driver: local
+
+  # ML operations layer
+  mlflow_postgres_data:
     driver: local
 
 networks:
   datalakehouse:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
