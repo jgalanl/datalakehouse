@@ -1,7 +1,7 @@
-﻿ARG SPARK_VERSION=3.5.0
+﻿ARG SPARK_VERSION=3.5.2
 ARG HADOOP_VERSION=3
 
-FROM apache/spark:3.5.0
+FROM apache/spark:3.5.2
 
 # ============================================================================
 # Spark Iceberg and Dependencies Installation
@@ -9,7 +9,7 @@ FROM apache/spark:3.5.0
 # ============================================================================
 
 # Redefine args after FROM for use in subsequent stages
-ARG SPARK_VERSION=3.5.0
+ARG SPARK_VERSION=3.5.2
 ARG HADOOP_VERSION=3
 
 USER root
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y \
 
 # Install Python packages for Spark jobs
 RUN pip install --upgrade pip && pip install \
-    pyspark==3.5.0 \
+    pyspark==3.5.2 \
     pyarrow>=14.0.0 \
     pandas>=2.0.0 \
     numpy>=1.24.0

@@ -15,8 +15,8 @@ services:
       - "9000:9000"  # S3 API endpoint
       - "9001:9001"  # Console endpoint
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       MINIO_CONSOLE_ADDRESS: ":9001"
     volumes:
       - minio_data:/minio/data
@@ -43,8 +43,8 @@ services:
     container_name: datalakehouse-nessie-postgres
     hostname: nessie-postgres
     environment:
-      POSTGRES_USER: ${NESSIE_DB_USER:-nessie}
-      POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie123}
+      POSTGRES_USER: ${NESSIE_DB_USER}
+      POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD}
       POSTGRES_DB: ${NESSIE_DB_NAME:-nessie}
     volumes:
       - nessie_postgres_data:/var/lib/postgresql/data
@@ -72,8 +72,8 @@ services:
       - "19120:19120"  # Nessie REST API
     environment:
       QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://nessie-postgres:5432/nessie"
-      QUARKUS_DATASOURCE_USERNAME: ${NESSIE_DB_USER:-nessie}
-      QUARKUS_DATASOURCE_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie123}
+      QUARKUS_DATASOURCE_USERNAME: ${NESSIE_DB_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${NESSIE_DB_PASSWORD}
       QUARKUS_HTTP_PORT: 19120
     depends_on:
       nessie-postgres:
@@ -115,8 +115,8 @@ services:
       SPARK_MASTER_WEBUI_PORT: 8080
       # Iceberg + Nessie configuration
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - spark_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
@@ -150,8 +150,8 @@ services:
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - spark_worker_1_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
@@ -180,8 +180,8 @@ services:
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - spark_worker_2_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
@@ -205,16 +205,16 @@ services:
     ports:
       - "8181:8181"
     environment:
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_S3_ENDPOINT: http://minio:9000
       CATALOG_WAREHOUSE_LOCATION: s3://warehouse/
       CATALOG_S3_ENDPOINT: http://minio:9000
-      CATALOG_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      CATALOG_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      CATALOG_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      CATALOG_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       CATALOG_S3_PATH_STYLE_ACCESS_ENABLED: "true"
-      CATALOG_JDBC_USER: ${ICEBERG_DB_USER:-iceberg}
-      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD:-iceberg123}
+      CATALOG_JDBC_USER: ${ICEBERG_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD}
       CATALOG_JDBC_URI: jdbc:postgresql://iceberg-postgres:5432/iceberg
     depends_on:
       minio:
@@ -240,8 +240,8 @@ services:
     container_name: datalakehouse-iceberg-postgres
     hostname: iceberg-postgres
     environment:
-      POSTGRES_USER: ${ICEBERG_DB_USER:-iceberg}
-      POSTGRES_PASSWORD: ${ICEBERG_DB_PASSWORD:-iceberg123}
+      POSTGRES_USER: ${ICEBERG_DB_USER}
+      POSTGRES_PASSWORD: ${ICEBERG_DB_PASSWORD}
       POSTGRES_DB: iceberg
     volumes:
       - iceberg_postgres_data:/var/lib/postgresql/data
@@ -269,8 +269,8 @@ services:
     container_name: datalakehouse-dremio-postgres
     hostname: dremio-postgres
     environment:
-      POSTGRES_USER: ${DREMIO_DB_USER:-dremio}
-      POSTGRES_PASSWORD: ${DREMIO_DB_PASSWORD:-dremio123}
+      POSTGRES_USER: ${DREMIO_DB_USER}
+      POSTGRES_PASSWORD: ${DREMIO_DB_PASSWORD}
       POSTGRES_DB: dremio
     volumes:
       - dremio_postgres_data:/var/lib/postgresql/data
@@ -305,10 +305,10 @@ services:
       DREMIO_METATSTORE_DB_TYPE: postgresql
       DREMIO_METATSTORE_DB_DRIVER: org.postgresql.Driver
       DREMIO_METATSTORE_DB_URL: "jdbc:postgresql://dremio-postgres:5432/dremio"
-      DREMIO_METATSTORE_DB_USER: ${DREMIO_DB_USER:-dremio}
-      DREMIO_METATSTORE_DB_PASSWORD: ${DREMIO_DB_PASSWORD:-dremio123}
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      DREMIO_METATSTORE_DB_USER: ${DREMIO_DB_USER}
+      DREMIO_METATSTORE_DB_PASSWORD: ${DREMIO_DB_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - dremio_data:/var/lib/dremio
       - ./config/dremio/dremio.conf:/etc/dremio/dremio.conf:ro
@@ -337,8 +337,8 @@ services:
       - "-c"
       - "work_mem=10MB"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_USER: ${OPENMETADATA_DB_USER}
+      POSTGRES_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
     expose:
       - 5432
     ports:
@@ -509,8 +509,8 @@ services:
     container_name: datalakehouse-mlflow-postgres
     hostname: mlflow-postgres
     environment:
-      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
-      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow123}
+      POSTGRES_USER: ${MLFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD}
       POSTGRES_DB: mlflow
     volumes:
       - mlflow_postgres_data:/var/lib/postgresql/data
@@ -542,8 +542,8 @@ services:
       BACKEND_STORE_URI: "postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow123}@mlflow-postgres:5432/mlflow"
       DEFAULT_ARTIFACT_ROOT: s3://mlflow-artifacts/
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     depends_on:
       mlflow-postgres:
         condition: service_healthy
