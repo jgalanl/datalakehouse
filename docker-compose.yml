@@ -419,6 +419,11 @@ services:
       JWT_KEY_ID: ${JWT_KEY_ID:-"Gb389a-9f76-gdjs-a92j-0242bk94356"}
       SECRET_MANAGER: ${SECRET_MANAGER:-db}
       FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+      # Disable optional apps to prevent startup errors
+      APPS_RDF_INDEX_APP_ENABLED: "false"
+      APPS_CACHE_WARMUP_APP_ENABLED: "false"
+      # Configure cache
+      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
     depends_on:
       openmetadata-elasticsearch:
         condition: service_healthy
@@ -475,6 +480,11 @@ services:
       FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
       MASK_PASSWORDS_API: ${MASK_PASSWORDS_API:-false}
       WEB_CONF_URI_PATH: ${WEB_CONF_URI_PATH:-"/api"}
+      # Disable optional apps to prevent startup errors
+      APPS_RDF_INDEX_APP_ENABLED: "false"
+      APPS_CACHE_WARMUP_APP_ENABLED: "false"
+      # Configure cache
+      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
     expose:
       - 8585
       - 8586
