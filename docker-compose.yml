@@ -30,9 +30,52 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 256M
     labels:
       service: storage
       component: minio
+
+  # MinIO Initialization: Creates required buckets
+  minio-init:
+    image: minio/mc:latest
+    container_name: datalakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set datalakehouse http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb -p datalakehouse/warehouse || true;
+      mc mb -p datalakehouse/mlflow-artifacts || true;
+      mc mb -p datalakehouse/spark-logs || true;
+      mc mb -p datalakehouse/dremio-uploads || true;
+      mc mb -p datalakehouse/raw-data || true;
+      mc mb -p datalakehouse/processed-data || true;
+      mc version enable datalakehouse/warehouse || true;
+      mc version enable datalakehouse/mlflow-artifacts || true;
+      echo 'MinIO buckets initialized successfully';
+      "
+    networks:
+      - datalakehouse
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    labels:
+      service: storage
+      component: minio-init
 
   # ============================================================================
   # METADATA CATALOGING - Project Nessie with PostgreSQL backend
@@ -45,13 +88,13 @@ services:
     environment:
       POSTGRES_USER: ${NESSIE_DB_USER}
       POSTGRES_PASSWORD: ${NESSIE_DB_PASSWORD}
-      POSTGRES_DB: ${NESSIE_DB_NAME:-nessie}
+      POSTGRES_DB: ${NESSIE_DB_NAME}
     volumes:
       - nessie_postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nessie"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -59,6 +102,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     labels:
       service: metadata
       component: nessie-postgres
@@ -71,7 +121,7 @@ services:
     ports:
       - "19120:19120"  # Nessie REST API
     environment:
-      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://nessie-postgres:5432/nessie"
+      QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://nessie-postgres:5432/${NESSIE_DB_NAME}"
       QUARKUS_DATASOURCE_USERNAME: ${NESSIE_DB_USER}
       QUARKUS_DATASOURCE_PASSWORD: ${NESSIE_DB_PASSWORD}
       QUARKUS_HTTP_PORT: 19120
@@ -87,6 +137,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 256M
     labels:
       service: metadata
       component: nessie
@@ -130,6 +187,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 512M
     labels:
       service: compute
       component: spark-master
@@ -160,6 +224,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 1G
     labels:
       service: compute
       component: spark-worker
@@ -190,6 +261,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 1G
     labels:
       service: compute
       component: spark-worker
@@ -215,7 +293,7 @@ services:
       CATALOG_S3_PATH_STYLE_ACCESS_ENABLED: "true"
       CATALOG_JDBC_USER: ${ICEBERG_DB_USER}
       CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD}
-      CATALOG_JDBC_URI: jdbc:postgresql://iceberg-postgres:5432/iceberg
+      CATALOG_JDBC_URI: "jdbc:postgresql://iceberg-postgres:5432/${ICEBERG_DB_NAME}"
     depends_on:
       minio:
         condition: service_healthy
@@ -230,6 +308,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 256M
     labels:
       service: catalog
       component: iceberg-rest
@@ -242,13 +327,13 @@ services:
     environment:
       POSTGRES_USER: ${ICEBERG_DB_USER}
       POSTGRES_PASSWORD: ${ICEBERG_DB_PASSWORD}
-      POSTGRES_DB: iceberg
+      POSTGRES_DB: ${ICEBERG_DB_NAME}
     volumes:
       - iceberg_postgres_data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U iceberg"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -256,6 +341,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     labels:
       service: catalog
       component: iceberg-postgres
@@ -271,13 +363,13 @@ services:
     environment:
       POSTGRES_USER: ${DREMIO_DB_USER}
       POSTGRES_PASSWORD: ${DREMIO_DB_PASSWORD}
-      POSTGRES_DB: dremio
+      POSTGRES_DB: ${DREMIO_DB_NAME}
     volumes:
       - dremio_postgres_data:/var/lib/postgresql/data
     ports:
       - "5434:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dremio"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -285,6 +377,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     labels:
       service: query_engine
       component: dremio-postgres
@@ -302,11 +401,11 @@ services:
       DREMIO_JAVA_SERVER_EXTRA_OPTS: |
         -Ddremio.exec.catalog.udf.enabled=false
         -Ddremio.store.file.text.warn_unsupported=false
-      DREMIO_METATSTORE_DB_TYPE: postgresql
-      DREMIO_METATSTORE_DB_DRIVER: org.postgresql.Driver
-      DREMIO_METATSTORE_DB_URL: "jdbc:postgresql://dremio-postgres:5432/dremio"
-      DREMIO_METATSTORE_DB_USER: ${DREMIO_DB_USER}
-      DREMIO_METATSTORE_DB_PASSWORD: ${DREMIO_DB_PASSWORD}
+      DREMIO_METASTORE_DB_TYPE: postgresql
+      DREMIO_METASTORE_DB_DRIVER: org.postgresql.Driver
+      DREMIO_METASTORE_DB_URL: "jdbc:postgresql://dremio-postgres:5432/${DREMIO_DB_NAME}"
+      DREMIO_METASTORE_DB_USER: ${DREMIO_DB_USER}
+      DREMIO_METASTORE_DB_PASSWORD: ${DREMIO_DB_PASSWORD}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -317,9 +416,22 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9047"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 1G
     labels:
       service: query_engine
       component: dremio
@@ -333,25 +445,32 @@ services:
     container_name: datalakehouse-openmetadata-postgres
     image: docker.getcollate.io/openmetadata/postgresql:1.11.6
     restart: always
-    command: 
+    command:
       - "-c"
       - "work_mem=10MB"
     environment:
-      POSTGRES_USER: ${OPENMETADATA_DB_USER}
-      POSTGRES_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_USER_PASSWORD}
     expose:
       - 5432
     ports:
       - "5437:5432"
     volumes:
-      - ./docker-volume/openmetadata-db-data:/var/lib/postgresql/data
+      - openmetadata_postgres_data:/var/lib/postgresql/data
     networks:
       - datalakehouse
     healthcheck:
-      test: psql -U postgres -tAc 'select 1' -d openmetadata_db || exit 1
+      test: ["CMD-SHELL", "psql -U $${POSTGRES_USER} -tAc 'select 1' -d openmetadata_db || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     labels:
       service: governance
       component: openmetadata-postgres
@@ -376,6 +495,13 @@ services:
       retries: 10
     volumes:
       - openmetadata_es_data:/usr/share/elasticsearch/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 1G
     labels:
       service: governance
       component: openmetadata-elasticsearch
@@ -403,8 +529,8 @@ services:
       DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
       DB_SCHEME: ${DB_SCHEME:-postgresql}
       DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
-      DB_USER: ${DB_USER:-openmetadata_user}
-      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_USER: ${DB_USER}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
       DB_HOST: ${DB_HOST:-openmetadata-postgres}
       DB_PORT: ${DB_PORT:-5432}
       OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
@@ -415,10 +541,10 @@ services:
       OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
       RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
       RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
-      JWT_ISSUER: ${JWT_ISSUER:-"open-metadata.org"}
-      JWT_KEY_ID: ${JWT_KEY_ID:-"Gb389a-9f76-gdjs-a92j-0242bk94356"}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_KEY_ID: ${JWT_KEY_ID}
       SECRET_MANAGER: ${SECRET_MANAGER:-db}
-      FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+      FERNET_KEY: ${FERNET_KEY}
       # Disable optional apps to prevent startup errors
       APPS_RDF_INDEX_APP_ENABLED: "false"
       APPS_CACHE_WARMUP_APP_ENABLED: "false"
@@ -431,6 +557,13 @@ services:
         condition: service_healthy
     networks:
       - datalakehouse
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 512M
     labels:
       service: governance
       component: openmetadata-migrate
@@ -457,8 +590,8 @@ services:
       DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
       DB_SCHEME: ${DB_SCHEME:-postgresql}
       DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
-      DB_USER: ${DB_USER:-openmetadata_user}
-      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_USER: ${DB_USER}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
       DB_HOST: ${DB_HOST:-openmetadata-postgres}
       DB_PORT: ${DB_PORT:-5432}
       OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
@@ -469,15 +602,15 @@ services:
       OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
       RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
       RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
-      JWT_ISSUER: ${JWT_ISSUER:-"open-metadata.org"}
-      JWT_KEY_ID: ${JWT_KEY_ID:-"Gb389a-9f76-gdjs-a92j-0242bk94356"}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_KEY_ID: ${JWT_KEY_ID}
       PIPELINE_SERVICE_CLIENT_ENDPOINT: ${PIPELINE_SERVICE_CLIENT_ENDPOINT:-http://ingestion:8080}
       PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL: ${PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL:-300}
       SERVER_HOST_API_URL: ${SERVER_HOST_API_URL:-http://openmetadata:8585/api}
       PIPELINE_SERVICE_CLIENT_VERIFY_SSL: ${PIPELINE_SERVICE_CLIENT_VERIFY_SSL:-"no-ssl"}
       PIPELINE_SERVICE_CLIENT_ENABLED: ${PIPELINE_SERVICE_CLIENT_ENABLED:-false}
       SECRET_MANAGER: ${SECRET_MANAGER:-db}
-      FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+      FERNET_KEY: ${FERNET_KEY}
       MASK_PASSWORDS_API: ${MASK_PASSWORDS_API:-false}
       WEB_CONF_URI_PATH: ${WEB_CONF_URI_PATH:-"/api"}
       # Disable optional apps to prevent startup errors
@@ -506,6 +639,13 @@ services:
       timeout: 10s
       retries: 20
       start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 1G
     labels:
       service: governance
       component: openmetadata
@@ -521,13 +661,13 @@ services:
     environment:
       POSTGRES_USER: ${MLFLOW_DB_USER}
       POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD}
-      POSTGRES_DB: mlflow
+      POSTGRES_DB: ${MLFLOW_DB_NAME}
     volumes:
       - mlflow_postgres_data:/var/lib/postgresql/data
     ports:
       - "5435:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -535,6 +675,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
     labels:
       service: ml_operations
       component: mlflow-postgres
@@ -549,7 +696,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-      BACKEND_STORE_URI: "postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow123}@mlflow-postgres:5432/mlflow"
+      BACKEND_STORE_URI: "postgresql://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@mlflow-postgres:5432/${MLFLOW_DB_NAME}"
       DEFAULT_ARTIFACT_ROOT: s3://mlflow-artifacts/
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
@@ -568,6 +715,13 @@ services:
     networks:
       - datalakehouse
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 256M
     labels:
       service: ml_operations
       component: mlflow

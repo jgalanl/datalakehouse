@@ -29,11 +29,8 @@ EXPOSE 5000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=15s \
-    CMD curl -f http://localhost:5000/ || exit 1
+    CMD ["curl", "-f", "http://localhost:5000/"]
 
 # Start MLflow tracking server
-CMD ["mlflow", "server", \
-    "--backend-store-uri", "${BACKEND_STORE_URI}", \
-    "--default-artifact-root", "${DEFAULT_ARTIFACT_ROOT}", \
-    "--host", "0.0.0.0", \
-    "--port", "5000"]
+# Using sh -c in exec form to allow environment variable expansion at runtime
+CMD ["sh", "-c", "mlflow server --backend-store-uri \"${BACKEND_STORE_URI}\" --default-artifact-root \"${DEFAULT_ARTIFACT_ROOT}\" --host 0.0.0.0 --port 5000"]
