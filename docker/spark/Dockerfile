@@ -1,5 +1,5 @@
 ﻿ARG SPARK_VERSION=3.5.2
-ARG HADOOP_VERSION=3
+ARG HADOOP_VERSION=3.3.4
 
 FROM apache/spark:3.5.2
 
@@ -10,7 +10,7 @@ FROM apache/spark:3.5.2
 
 # Redefine args after FROM for use in subsequent stages
 ARG SPARK_VERSION=3.5.2
-ARG HADOOP_VERSION=3
+ARG HADOOP_VERSION=3.3.4
 
 USER root
 
@@ -20,12 +20,15 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages for Spark jobs
+# Install Python packages for Spark jobs and Jupyter
 RUN pip install --upgrade pip && pip install \
     pyspark==3.5.2 \
     pyarrow>=14.0.0 \
     pandas>=2.0.0 \
-    numpy>=1.24.0
+    numpy>=1.24.0 \
+    kagglehub>=0.2.0 \
+    jupyter \
+    notebook
 
 # ============================================================================
 # Iceberg and Related Libraries
@@ -36,23 +39,24 @@ RUN mkdir -p /opt/spark/jars
 
 WORKDIR /opt/spark/jars
 
-# Download Iceberg Spark runtime JAR
-RUN curl -L https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-${SPARK_VERSION}_2.13/1.4.2/iceberg-spark-runtime-${SPARK_VERSION}_2.13-1.4.2.jar -o iceberg-spark-runtime.jar
+# Download Iceberg Spark runtime JAR (must match Scala 2.12 bundled in Spark image)
+RUN curl -fL https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.2/iceberg-spark-runtime-3.5_2.12-1.5.2.jar -o iceberg-spark-runtime.jar
 
-# Download Nessie Spark Extensions
-RUN curl -L https://repo1.maven.org/maven2/org/projectnessie/nessie-spark-extensions-${SPARK_VERSION}_2.13/0.82.0/nessie-spark-extensions-${SPARK_VERSION}_2.13-0.82.0.jar -o nessie-spark-extensions.jar
+# Download Nessie Spark Extensions (must match Scala 2.12)
+RUN curl -fL https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.82.0/nessie-spark-extensions-3.5_2.12-0.82.0.jar -o nessie-spark-extensions.jar
 
 # Download AWS SDK for S3 access
-RUN curl -L https://repo1.maven.org/maven2/software/amazon/awssdk/bundles/aws-java-sdk-bundle/1.12.565/aws-java-sdk-bundle-1.12.565.jar -o aws-java-sdk-bundle.jar
+RUN curl -fL https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.565/aws-java-sdk-bundle-1.12.565.jar -o aws-java-sdk-bundle.jar
 
-# Download Hadoop AWS for S3 support
-RUN curl -L https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}.13.3/hadoop-aws-${HADOOP_VERSION}.13.3.jar -o hadoop-aws.jar
+# Download Hadoop AWS for S3 support (must match bundled Hadoop version)
+RUN curl -fL https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar -o hadoop-aws.jar
 
 # Download PostgreSQL JDBC driver for Nessie catalog
-RUN curl -L https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar -o postgresql-jdbc.jar
+RUN curl -fL https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar -o postgresql-jdbc.jar
 
-# Create logs directory
-RUN mkdir -p /home/spark/logs && chmod -R 777 /home/spark/logs
+# Create home directories with proper permissions for spark user
+RUN mkdir -p /home/spark/logs /home/spark/.kaggle && \
+    chown -R spark:spark /home/spark
 
 # Switch back to spark user
 USER spark

@@ -1,34 +1,37 @@
-﻿# Data Lakehouse Platform Requirements
-# Python 3.9+
+# Data Lakehouse Platform Requirements
+# Python 3.14+
 
 # Core Data Processing
-pyspark==3.5.2
-pyarrow>=14.0.0
-pandas>=2.0.0
-numpy>=1.24.0
+pyspark>=3.5.2
+pyarrow>=18.0.0
+pandas>=2.2.0
+numpy>=2.1.0
 
 # Iceberg and Nessie
-pyiceberg[s3]>=1.4.0
-nessie-python>=0.82.0
+pyiceberg[s3fs]>=0.8.0
+pynessie>=0.67.0
 
 # MLflow
-mlflow[databricks,postgres,s3]==2.10.0
+mlflow[databricks,postgres,s3]>=2.18.0
 
 # Database drivers
 psycopg2-binary>=2.9.0
 
 # AWS SDK (for S3)
-boto3>=1.28.0
-botocore>=1.31.0
+boto3>=1.35.0
+botocore>=1.35.0
 
 # Development
-pytest>=7.4.0
-pytest-cov>=4.1.0
-black>=23.0.0
-flake8>=6.0.0
-mypy>=1.0.0
+pytest>=8.0.0
+pytest-cov>=6.0.0
+black>=24.0.0
+flake8>=7.0.0
+mypy>=1.13.0
+
+# Kaggle
+kagglehub>=0.2.0
 
 # Utilities
 python-dotenv>=1.0.0
-requests>=2.31.0
-pydantic>=2.0.0
+requests>=2.32.0
+pydantic>=2.10.0

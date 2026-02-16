@@ -1,7 +1,5 @@
 ﻿# Environment variables
 .env
-.env.local
-.env.*.local
 
 # Docker volumes and data
 docker-volume/
@@ -19,10 +17,8 @@ docker-volumes/
 *.log
 logs/
 
-# Node modules (if applicable)
-node_modules/
-package-lock.json
-yarn.lock
+# Notebooks
+.ipynb_checkpoints/
 
 # Python
 __pycache__/

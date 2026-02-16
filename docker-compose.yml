@@ -174,11 +174,13 @@ services:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Kaggle API configuration
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
     volumes:
       - spark_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-      - ./src:/opt/spark/src:ro
+      - ./src:/opt/spark/src
     depends_on:
       minio:
         condition: service_healthy
@@ -198,6 +200,43 @@ services:
       service: compute
       component: spark-master
 
+  # Jupyter Notebook: Interactive development environment for Spark
+  spark-notebook:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: datalakehouse-spark-notebook
+    hostname: spark-notebook
+    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=", "--NotebookApp.password=", "--notebook-dir=/opt/spark/src"]
+    ports:
+      - "8888:8888"   # Jupyter Notebook
+      - "4041:4040"   # Spark Application UI
+    environment:
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
+    volumes:
+      - spark_data:/home/spark
+      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./src:/opt/spark/src
+    depends_on:
+      - spark-master
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 512M
+    labels:
+      service: compute
+      component: spark-notebook
+
   # Spark Worker 1: Distributed compute node
   spark-worker-1:
     build:
@@ -205,20 +244,22 @@ services:
       dockerfile: Dockerfile
     container_name: datalakehouse-spark-worker-1
     hostname: spark-worker-1
+    command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--webui-port", "8081", "--cores", "2", "--memory", "2G"]
     ports:
       - "8081:8081"
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_WEBUI_PORT: 8081
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
       SPARK_CLASSPATH: "/opt/spark/jars/*"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Kaggle API configuration
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
     volumes:
       - spark_worker_1_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./src:/opt/spark/src:ro
     depends_on:
       - spark-master
     networks:
@@ -242,20 +283,22 @@ services:
       dockerfile: Dockerfile
     container_name: datalakehouse-spark-worker-2
     hostname: spark-worker-2
+    command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--webui-port", "8081", "--cores", "2", "--memory", "2G"]
     ports:
       - "8082:8081"
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_WEBUI_PORT: 8081
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
       SPARK_CLASSPATH: "/opt/spark/jars/*"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Kaggle API configuration
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
     volumes:
       - spark_worker_2_data:/home/spark
       - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./src:/opt/spark/src:ro
     depends_on:
       - spark-master
     networks:
