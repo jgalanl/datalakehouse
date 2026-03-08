@@ -103,7 +103,7 @@ Spark Master (8080, 7077)
 ```
 Dremio UI/SQL
     ↓
-Iceberg REST Catalog
+Nessie Catalog (REST API, port 19120)
     ↓
 MinIO (Storage)
 ```
@@ -133,7 +133,7 @@ MinIO (Storage)
 
 ```
 OpenMetadata Server
-    ├── MySQL (Metadata store)
+    ├── PostgreSQL (Metadata store)
     ├── Elasticsearch (Search)
     └── Connectors
         ├── Iceberg connector
@@ -178,26 +178,19 @@ MLflow (Tracking Server)
 
 ### PostgreSQL Services
 
-| Service | Purpose          | Database   | Port |
-| ------- | ---------------- | ---------- | ---- |
-| Nessie  | Catalog metadata | PostgreSQL | 5432 |
-| Iceberg | REST catalog     | PostgreSQL | 5433 |
-| Dremio  | Coordination     | PostgreSQL | 5434 |
-| MLflow  | Tracking         | PostgreSQL | 5435 |
+| Service      | Purpose        | Database   | Port |
+| ------------ | -------------- | ---------- | ---- |
+| MLflow       | Tracking       | PostgreSQL | 5435 |
+| OpenMetadata | Metadata store | PostgreSQL | 5432 |
 
-**Rationale**: PostgreSQL chosen for:
+**Rationale**: PostgreSQL chosen for reliability, ACID guarantees, JSONB support, and wide adoption in open-source projects.
 
-- Reliability and ACID guarantees
-- JSONB support for complex metadata
-- Wide adoption in open-source projects
+### Embedded Storage (no external database)
 
-### MySQL Service
-
-| Service      | Purpose        | Database | Port |
-| ------------ | -------------- | -------- | ---- |
-| OpenMetadata | Metadata store | MySQL    | 3306 |
-
-**Rationale**: OpenMetadata's native database choice
+| Service | Storage    | Notes                                              |
+| ------- | ---------- | -------------------------------------------------- |
+| Nessie  | RocksDB    | Embedded; state persisted in `./nessie-data` mount |
+| Dremio  | RocksDB    | Embedded; state in `dremio_data` Docker volume     |
 
 ## 8. Network Architecture
 
@@ -206,8 +199,8 @@ MLflow (Tracking Server)
 ```
 Bridge Network (172.20.0.0/16)
     ├── Storage: minio
-    ├── Metadata: nessie-server, iceberg-rest
-    ├── Compute: spark-master, spark-worker-1, spark-worker-2
+    ├── Metadata: nessie-server
+    ├── Compute: spark-master, spark-worker-1
     ├── Query: dremio
     ├── Governance: openmetadata
     └── ML: mlflow
@@ -334,4 +327,4 @@ Service Discovery: Internal DNS (e.g., minio:9000)
 
 ---
 
-**Last Updated**: January 2026
+**Last Updated**: March 2026

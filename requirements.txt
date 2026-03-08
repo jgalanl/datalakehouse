@@ -1,5 +1,5 @@
 # Data Lakehouse Platform Requirements
-# Python 3.14+
+# Python 3.12+
 
 # Core Data Processing
 pyspark>=3.5.2

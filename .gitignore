@@ -4,6 +4,8 @@
 # Docker volumes and data
 docker-volume/
 docker-volumes/
+minio-data/
+nessie-data/
 
 # IDE and Editor
 .vscode/
@@ -40,3 +42,4 @@ temp/
 
 # Claude
 .claude/
+CLAUDE.md

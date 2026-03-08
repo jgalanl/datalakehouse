@@ -1,71 +1,75 @@
-﻿ARG SPARK_VERSION=3.5.2
+# Spark image with Iceberg and Nessie support.
+#
+# Before building, verify that the Hadoop version bundled in the base image
+# still matches HADOOP_VERSION. Run:
+#   docker run --rm apache/spark:3.5.8 ls /opt/spark/jars/ | grep hadoop-common
+# If it differs from 3.3.4, update HADOOP_VERSION and AWS_SDK_VERSION to match.
+
+ARG SPARK_VERSION=3.5.8
 ARG HADOOP_VERSION=3.3.4
+ARG ICEBERG_VERSION=1.10.1
+ARG NESSIE_VERSION=0.106.0
+# AWS SDK version must align with hadoop-aws 3.3.4 — check the dependency tree at
+# https://mvnrepository.com/artifact/org.apache.hadoop/hadoop-aws/3.3.4
+ARG AWS_SDK_VERSION=1.12.262
 
-FROM apache/spark:3.5.2
+FROM apache/spark:${SPARK_VERSION}
 
-# ============================================================================
-# Spark Iceberg and Dependencies Installation
-# Reference: https://iceberg.apache.org/docs/latest/getting-started/
-# ============================================================================
-
-# Redefine args after FROM for use in subsequent stages
-ARG SPARK_VERSION=3.5.2
-ARG HADOOP_VERSION=3.3.4
+# ARGs need to be redeclared after FROM to be in scope for the rest of the build
+ARG SPARK_VERSION
+ARG HADOOP_VERSION
+ARG ICEBERG_VERSION
+ARG NESSIE_VERSION
+ARG AWS_SDK_VERSION
 
 USER root
 
-# Install curl for health checks and dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages for Spark jobs and Jupyter
-RUN pip install --upgrade pip && pip install \
-    pyspark==3.5.2 \
-    pyarrow>=14.0.0 \
-    pandas>=2.0.0 \
-    numpy>=1.24.0 \
-    kagglehub>=0.2.0 \
-    jupyter \
-    notebook
+# All Python versions pinned for reproducibility
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
+    pyspark==${SPARK_VERSION} \
+    pyarrow==17.0.0 \
+    pandas==2.2.3 \
+    numpy==1.26.4 \
+    kagglehub==0.3.6 \
+    jupyter==1.1.1 \
+    notebook==7.2.2 \
+    mlflow==2.20.3 \
+    boto3==1.35.92
 
-# ============================================================================
-# Iceberg and Related Libraries
-# ============================================================================
-
-# Create jars directory
+# JARs: Iceberg runtime, Nessie extensions, Hadoop-AWS connector, AWS SDK bundle
 RUN mkdir -p /opt/spark/jars
-
 WORKDIR /opt/spark/jars
 
-# Download Iceberg Spark runtime JAR (must match Scala 2.12 bundled in Spark image)
-RUN curl -fL https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.2/iceberg-spark-runtime-3.5_2.12-1.5.2.jar -o iceberg-spark-runtime.jar
+RUN curl -fSL https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar \
+    -o iceberg-spark-runtime.jar
 
-# Download Nessie Spark Extensions (must match Scala 2.12)
-RUN curl -fL https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.82.0/nessie-spark-extensions-3.5_2.12-0.82.0.jar -o nessie-spark-extensions.jar
+# Nessie extensions add CREATE BRANCH, MERGE BRANCH, SHOW LOG to Spark SQL
+RUN curl -fSL https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/${NESSIE_VERSION}/nessie-spark-extensions-3.5_2.12-${NESSIE_VERSION}.jar \
+    -o nessie-spark-extensions.jar
 
-# Download AWS SDK for S3 access
-RUN curl -fL https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.565/aws-java-sdk-bundle-1.12.565.jar -o aws-java-sdk-bundle.jar
+RUN curl -fSL https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar \
+    -o aws-java-sdk-bundle.jar
 
-# Download Hadoop AWS for S3 support (must match bundled Hadoop version)
-RUN curl -fL https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar -o hadoop-aws.jar
+# hadoop-aws version must match the Hadoop bundled in the Spark base image
+RUN curl -fSL https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar \
+    -o hadoop-aws.jar
 
-# Download PostgreSQL JDBC driver for Nessie catalog
-RUN curl -fL https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar -o postgresql-jdbc.jar
+# No PostgreSQL JDBC driver needed — Spark talks to Nessie over REST, not JDBC
 
-# Create home directories with proper permissions for spark user
 RUN mkdir -p /home/spark/logs /home/spark/.kaggle && \
     chown -R spark:spark /home/spark
 
-# Switch back to spark user
 USER spark
 
 WORKDIR /opt/spark
 
-# Set environment variables
+ENV HOME=/home/spark
 ENV SPARK_HOME=/opt/spark
-ENV PATH=$PATH:$SPARK_HOME/bin
+ENV PATH="${SPARK_HOME}/bin:${PATH}"
 
-# Default command
 CMD ["spark-class", "org.apache.spark.deploy.master.Master"]
