@@ -53,16 +53,15 @@ docker-compose up -d
 
 ```
 src/
-├── core.py                 # Core utilities
-├── ingestion/
-│   ├── __init__.py
-│   └── data_ingestion.py   # Data ingestion services
-├── processing/
-│   ├── __init__.py
-│   └── transformations.py  # Data processing logic
-└── ml/
-    ├── __init__.py
-    └── mlflow_ops.py       # ML operations
+├── common/                     # Shared utilities (SparkSession, Nessie helpers)
+├── etl/
+│   ├── bronze/                 # Source download + Iceberg ingestion (no separate landing zone)
+│   │   ├── ingest_yellow_taxi.py   # NYC TLC yellow taxi → nessie.bronze.yellow_taxi
+│   │   └── ingest_zone_lookup.py   # Taxi zone lookup → nessie.bronze.taxi_zone_lookup
+│   ├── silver/                 # Bronze → Silver (clean, conform, deduplicate)
+│   └── gold/                   # Silver → Gold (join, aggregate, ML features)
+├── ml/                         # ML experiments (MLflow tracking)
+└── notebooks/                  # Jupyter notebooks
 ```
 
 ### Code Style
@@ -359,7 +358,7 @@ spark.sql("SELECT * FROM table").explain(extended=True)
 
 # Collect metrics
 df = spark.sql("SELECT * FROM table")
-df.write.format("parquet").save("s3a://warehouse/output")
+df.write.format("parquet").save("s3a://warehouse/gold/output")
 
 # View Web UI
 # http://localhost:4040

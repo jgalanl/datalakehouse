@@ -10,13 +10,13 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 
 - S3-compatible object storage
 - Self-hosted data lake foundation
-- Support for multiple buckets (warehouse, artifacts, logs, uploads)
+- Single `warehouse` bucket for all Iceberg tables (physical layout managed by Iceberg)
+- Auxiliary buckets: `mlflow-artifacts` (versioned), `spark-logs`
 
 ### 2. **Metadata & Cataloging: Nessie + Iceberg**
 
-- **Nessie**: Git-like versioning for data objects
-- **Iceberg**: Open table format with ACID guarantees
-- **Iceberg REST Catalog**: REST API for metadata management
+- **Nessie**: Git-like versioning for data objects (single Iceberg catalog, embedded RocksDB)
+- **Iceberg**: Open table format with ACID guarantees and hidden partitioning
 
 ### 3. **Compute Layer: Apache Spark**
 
@@ -95,12 +95,14 @@ datalakehouse/
 ├── docker/                     # Custom Dockerfiles
 │   ├── spark/                  # Spark with Iceberg
 │   └── mlflow/                 # MLflow tracking server
-├── src/                        # Python modules
-│   ├── core.py                 # Core utilities
-│   ├── ingestion/              # Data ingestion
-│   ├── processing/             # Data transformation
-│   └── ml/                     # ML operations
-├── notebooks/                  # Jupyter notebooks
+├── src/                        # Pipeline code (mounted into Spark containers)
+│   ├── common/                 # Shared utilities (SparkSession, Nessie helpers)
+│   ├── etl/
+│   │   ├── bronze/             # Source download + Iceberg ingestion (no separate landing zone)
+│   │   ├── silver/             # Bronze → Silver (clean, conform, deduplicate)
+│   │   └── gold/               # Silver → Gold (join, aggregate, ML features)
+│   ├── ml/                     # ML experiments (MLflow tracking)
+│   └── notebooks/              # Jupyter notebooks
 ├── scripts/                    # Initialization & automation
 ├── tests/                      # Unit tests
 ├── data/                       # Sample data
@@ -197,14 +199,14 @@ ML pipeline showing:
 
 | Layer      | Technology                                   | Version       |
 | ---------- | -------------------------------------------- | ------------- |
-| Storage    | MinIO                                        | 2024-01-18    |
-| Metadata   | Nessie                                       | 0.82.0        |
-| Format     | Iceberg                                      | 1.4.2         |
-| Compute    | Apache Spark                                 | 3.5.0         |
-| Query      | Dremio                                       | Latest OSS    |
-| Governance | OpenMetadata                                 | 1.3.0.0       |
-| ML Ops     | MLflow                                       | 2.10.0        |
-| Databases  | PostgreSQL 15 / MySQL 8 / Elasticsearch 7.17 | -             |
+| Storage    | MinIO                                        | 2025-04-22    |
+| Metadata   | Nessie (embedded RocksDB)                    | 0.106.0       |
+| Format     | Iceberg                                      | 1.10.1        |
+| Compute    | Apache Spark                                 | 3.5.8         |
+| Query      | Dremio OSS                                   | 25.2.0        |
+| Governance | OpenMetadata                                 | 1.12.1        |
+| ML Ops     | MLflow                                       | 2.20.3        |
+| Databases  | PostgreSQL 15 / Elasticsearch 8.11.4         | -             |
 | Container  | Docker & Docker Compose                      | 20.10+ / 2.0+ |
 
 ## Installation & Setup

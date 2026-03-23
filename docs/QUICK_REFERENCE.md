@@ -2,30 +2,28 @@
 
 ## Service Access
 
-| Service         | URL                           | Username          | Password        |
-| --------------- | ----------------------------- | ----------------- | --------------- |
-| MinIO Console   | http://localhost:9001         | minioadmin        | minioadmin123   |
-| MinIO S3 API    | http://localhost:9000         | minioadmin        | minioadmin123   |
-| Spark Master    | http://localhost:8080         | N/A               | N/A             |
-| Spark Worker 1  | http://localhost:8081         | N/A               | N/A             |
-| Spark Worker 2  | http://localhost:8082         | N/A               | N/A             |
-| Dremio Console  | http://localhost:9047         | admin@example.com | dremio123       |
-| Dremio Flight   | grpc://localhost:31010        | N/A               | N/A             |
-| Dremio ODBC     | localhost:45678               | N/A               | N/A             |
-| OpenMetadata    | http://localhost:8585         | admin@example.com | openmetadata123 |
-| MLflow Tracking | http://localhost:5000         | N/A               | N/A             |
-| Nessie API      | http://localhost:19120/api/v2 | N/A               | N/A             |
-| Iceberg REST    | http://localhost:8181         | N/A               | N/A             |
+| Service         | URL                           | Credentials              |
+| --------------- | ----------------------------- | ------------------------ |
+| MinIO Console   | http://localhost:9001         | See `.env`               |
+| MinIO S3 API    | http://localhost:9000         | See `.env`               |
+| Spark Master    | http://localhost:8080         | N/A                      |
+| Spark Worker 1  | http://localhost:8081         | N/A                      |
+| Spark Worker 2  | http://localhost:8082         | N/A                      |
+| Dremio Console  | http://localhost:9047         | Configured on first boot |
+| Dremio Flight   | grpc://localhost:31010        | N/A                      |
+| Dremio ODBC     | localhost:45678               | N/A                      |
+| OpenMetadata    | http://localhost:8585         | See `.env`               |
+| MLflow Tracking | http://localhost:5000         | N/A                      |
+| Nessie API      | http://localhost:19120/api/v2 | N/A                      |
+| Jupyter Notebook| http://localhost:8888         | N/A                      |
 
 ## Database Access
 
-| Database             | Host      | Port | Username | Password        |
-| -------------------- | --------- | ---- | -------- | --------------- |
-| PostgreSQL (Nessie)  | localhost | 5432 | nessie   | nessie123       |
-| PostgreSQL (Iceberg) | localhost | 5433 | iceberg  | iceberg123      |
-| PostgreSQL (Dremio)  | localhost | 5434 | dremio   | dremio123       |
-| PostgreSQL (MLflow)  | localhost | 5435 | mlflow   | mlflow123       |
-| MySQL (OpenMetadata) | localhost | 3306 | root     | openmetadata123 |
+| Database                  | Host      | Port | Credentials |
+| ------------------------- | --------- | ---- | ----------- |
+| PostgreSQL (MLflow)       | localhost | 5435 | See `.env`  |
+| PostgreSQL (OpenMetadata) | localhost | 5432 | See `.env`  |
+| Elasticsearch (OM)        | localhost | 9200 | N/A         |
 
 ## Common Commands
 
@@ -51,8 +49,8 @@ docker-compose ps
 ### MinIO Client
 
 ```bash
-# Create alias
-mc alias set minio http://localhost:9000 minioadmin minioadmin123
+# Create alias (use credentials from .env)
+mc alias set minio http://localhost:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
 
 # List buckets
 mc ls minio/
@@ -68,23 +66,23 @@ mc cp file.txt minio/bucket/
 
 ```bash
 # Submit job to cluster
-docker exec datalakehouse-spark-master spark-submit \
+docker exec spark-master spark-submit \
   --master spark://spark-master:7077 \
   --deploy-mode client \
-  /path/to/script.py
+  /opt/spark/work-dir/path/to/script.py
 
 # Access Spark Shell
-docker exec -it datalakehouse-spark-master spark-shell
+docker exec -it spark-master spark-shell
 ```
 
 ### Database Access
 
 ```bash
-# PostgreSQL (Nessie)
-psql -h localhost -p 5432 -U nessie -d nessie
+# PostgreSQL (MLflow)
+psql -h localhost -p 5435 -U mlflow -d mlflow
 
-# MySQL (OpenMetadata)
-mysql -h localhost -u root -p
+# PostgreSQL (OpenMetadata)
+psql -h localhost -p 5432 -U openmetadata_user -d openmetadata_db
 ```
 
 ## S3/MinIO S3 CLI
@@ -92,20 +90,20 @@ mysql -h localhost -u root -p
 ### Using AWS CLI with MinIO
 
 ```bash
-# Configure
+# Configure (use credentials from .env)
 aws configure
 # Endpoint URL: http://localhost:9000
-# Access Key: minioadmin
-# Secret Key: minioadmin123
+# Access Key: $MINIO_ROOT_USER
+# Secret Key: $MINIO_ROOT_PASSWORD
 
 # List buckets
 aws s3 --endpoint-url http://localhost:9000 ls
 
 # Upload file
-aws s3 --endpoint-url http://localhost:9000 cp file.txt s3://warehouse/
+aws s3 --endpoint-url http://localhost:9000 cp file.txt s3://warehouse/bronze/
 
 # Download file
-aws s3 --endpoint-url http://localhost:9000 cp s3://warehouse/file.txt .
+aws s3 --endpoint-url http://localhost:9000 cp s3://warehouse/bronze/file.txt .
 ```
 
 ## Spark SQL Examples
@@ -119,64 +117,63 @@ spark = SparkSession.builder \
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
     .config("spark.sql.catalog.nessie", "org.apache.iceberg.spark.SparkCatalog") \
     .config("spark.sql.catalog.nessie.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog") \
-    .config("spark.sql.catalog.nessie.uri", "http://nessie-server:19120/api/v2") \
+    .config("spark.sql.catalog.nessie.uri", "http://nessie:19120/api/v2") \
     .config("spark.sql.catalog.nessie.warehouse", "s3a://warehouse/") \
     .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
-    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
-    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123") \
+    .config("spark.hadoop.fs.s3a.access.key", "<MINIO_ROOT_USER>") \
+    .config("spark.hadoop.fs.s3a.secret.key", "<MINIO_ROOT_PASSWORD>") \
     .config("spark.hadoop.fs.s3a.path.style.access", "true") \
     .getOrCreate()
 
-# Create database
-spark.sql("CREATE DATABASE IF NOT EXISTS nessie.demo")
+# Create medallion namespaces
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
 
-# Create table
+# Create bronze table with hidden partitioning
 spark.sql("""
-    CREATE TABLE IF NOT EXISTS nessie.demo.users (
-        id BIGINT,
-        name STRING,
-        email STRING,
-        created_at TIMESTAMP
+    CREATE TABLE IF NOT EXISTS nessie.bronze.yellow_taxi (
+        VendorID INT,
+        tpep_pickup_datetime TIMESTAMP,
+        tpep_dropoff_datetime TIMESTAMP,
+        passenger_count DOUBLE,
+        trip_distance DOUBLE,
+        fare_amount DOUBLE,
+        tip_amount DOUBLE,
+        total_amount DOUBLE
     )
     USING iceberg
+    PARTITIONED BY (month(tpep_pickup_datetime))
 """)
 
-# Write data
-spark.createDataFrame([
-    (1, "Alice", "alice@example.com", "2024-01-01"),
-    (2, "Bob", "bob@example.com", "2024-01-02"),
-]).toDF("id", "name", "email", "created_at") \
-    .write.mode("append") \
-    .format("iceberg") \
-    .saveAsTable("nessie.demo.users")
-
 # Read data
-spark.sql("SELECT * FROM nessie.demo.users").show()
+spark.sql("SELECT * FROM nessie.bronze.yellow_taxi").show()
 
 # Time travel
-spark.sql("SELECT * FROM nessie.demo.users VERSION AS OF 0").show()
+spark.sql("SELECT * FROM nessie.bronze.yellow_taxi VERSION AS OF 0").show()
 ```
 
 ## Dremio SQL Examples
 
 ```sql
--- Create Iceberg Catalog connection
--- (Done through UI)
+-- Nessie data source configured via Dremio UI
 
--- Query Iceberg table
-SELECT * FROM iceberg_nessie.demo.users
+-- Query silver table
+SELECT * FROM nessie.silver.yellow_taxi
+WHERE tpep_pickup_datetime >= '2024-01-01'
 LIMIT 10;
 
--- Join tables
-SELECT u.id, u.name, o.total
-FROM iceberg_nessie.demo.users u
-JOIN iceberg_nessie.demo.orders o ON u.id = o.user_id;
+-- Join with zone lookup
+SELECT t.*, z.Zone, z.Borough
+FROM nessie.silver.yellow_taxi t
+JOIN nessie.silver.taxi_zone_lookup z ON t.PULocationID = z.LocationID;
 
--- Aggregate
-SELECT name, COUNT(*) as order_count
-FROM iceberg_nessie.demo.users u
-JOIN iceberg_nessie.demo.orders o ON u.id = o.user_id
-GROUP BY name;
+-- Aggregate by zone
+SELECT z.Zone, COUNT(*) as trip_count, AVG(t.fare_amount) as avg_fare
+FROM nessie.gold.taxi_analytics t
+JOIN nessie.silver.taxi_zone_lookup z ON t.PULocationID = z.LocationID
+GROUP BY z.Zone
+ORDER BY trip_count DESC;
 ```
 
 ## MLflow Examples
@@ -204,6 +201,33 @@ client = MlflowClient()
 runs = client.search_runs(experiment_ids=[experiment_id])
 best_run = max(runs, key=lambda r: r.data.metrics.get("accuracy", 0))
 ```
+
+## Bronze Ingestion
+
+```bash
+# Ingest yellow taxi data: download from TLC, write to nessie.bronze.yellow_taxi
+docker exec -it spark-master python3 /opt/spark/work-dir/src/etl/bronze/ingest_yellow_taxi.py
+
+# Ingest zone lookup: download from TLC, write to nessie.bronze.taxi_zone_lookup
+docker exec -it spark-master python3 /opt/spark/work-dir/src/etl/bronze/ingest_zone_lookup.py
+```
+
+### Nessie namespace structure (layer-first medallion)
+
+```
+nessie (catalog)
+├── bronze
+│   ├── yellow_taxi              (monthly partitioned by tpep_pickup_datetime)
+│   └── taxi_zone_lookup         (unpartitioned, small reference table)
+├── silver
+│   ├── yellow_taxi              (cleaned, typed, deduplicated)
+│   └── taxi_zone_lookup         (standardized)
+└── gold
+    └── taxi_analytics           (joined, aggregated, ML features)
+```
+
+Iceberg manages the physical file layout in MinIO (`s3a://warehouse/`) automatically.
+No manual folder organization — hidden partitioning handles it.
 
 ## Troubleshooting Commands
 

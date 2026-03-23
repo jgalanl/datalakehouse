@@ -39,19 +39,32 @@ This document details the architectural decisions and technical rationale behind
 
 - **Open table format**: Not vendor-locked
 - **ACID guarantees**: Full transaction support
-- **Schema evolution**: Non-breaking schema updates
+- **Schema evolution**: Non-breaking schema updates. Demonstrated in bronze ingestion: the `cbd_congestion_fee` field (added by NYC TLC in Jan 2025) is added via `ALTER TABLE ADD COLUMNS` on the ETL branch when the first 2025 file is ingested. Pre-2025 data returns `NULL` for this column automatically.
 - **Hidden partitioning**: Partition pruning without exposing partition columns
 - **Snapshot isolation**: Multiple readers/writers without conflicts
 
 ### Integration Pattern
 
 ```
-Data Writers → Iceberg → Nessie (Versions) → MinIO (Storage)
-                ↓
-          REST Catalog
-                ↓
-Data Readers (Spark, Dremio)
+Data Writers → Iceberg → Nessie (Single Catalog) → MinIO (Storage)
+                                    ↓
+                        Data Readers (Spark, Dremio)
 ```
+
+### Data Model (Layer-First Medallion)
+
+Following Strengholt's centralized medallion pattern, Nessie namespaces represent layers:
+
+```
+nessie.bronze.yellow_taxi          — raw ingestion, PARTITIONED BY month(tpep_pickup_datetime)
+nessie.bronze.taxi_zone_lookup     — reference table, unpartitioned (~265 rows)
+nessie.silver.yellow_taxi          — cleaned, typed, deduplicated
+nessie.silver.taxi_zone_lookup     — standardized zone names
+nessie.gold.taxi_analytics         — joined with zones, aggregated, ML features
+```
+
+No separate landing zone: bronze ingestion downloads source data and writes Iceberg tables
+directly. Iceberg hidden partitioning manages the physical file layout in MinIO.
 
 ### Trade-offs
 
@@ -199,7 +212,7 @@ MLflow (Tracking Server)
 ```
 Bridge Network (172.20.0.0/16)
     ├── Storage: minio
-    ├── Metadata: nessie-server
+    ├── Metadata: nessie
     ├── Compute: spark-master, spark-worker-1
     ├── Query: dremio
     ├── Governance: openmetadata
@@ -216,14 +229,14 @@ Service Discovery: Internal DNS (e.g., minio:9000)
 
 ## 9. Data Flow Patterns
 
-### Batch Ingestion Pattern
+### Batch Ingestion Pattern (Medallion)
 
 ```
-1. Source Data (CSV/Parquet)
-2. Spark Ingestion Job
-3. Iceberg Table (Nessie catalog)
-4. Dremio Query Layer
-5. Analytics/BI Tools
+1. Source Data (NYC TLC Parquet/CSV)
+2. Bronze: Spark downloads + writes Iceberg table (nessie.bronze.*)
+3. Silver: Spark reads bronze, cleans/deduplicates, writes (nessie.silver.*)
+4. Gold:   Spark reads silver, joins/aggregates, writes (nessie.gold.*)
+5. Dremio Query Layer / ML Features
 ```
 
 ### ML Pipeline Pattern
