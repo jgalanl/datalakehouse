@@ -45,6 +45,7 @@ services:
       component: minio
 
   # MinIO Initialization: Creates required buckets
+  # Medallion layers get one bucket each; auxiliary services get their own buckets.
   minio-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     container_name: minio-init
@@ -61,10 +62,7 @@ services:
       mc mb -p datalakehouse/warehouse || true;
       mc mb -p datalakehouse/mlflow-artifacts || true;
       mc mb -p datalakehouse/spark-logs || true;
-      mc mb -p datalakehouse/dremio-uploads || true;
-      mc mb -p datalakehouse/raw-data || true;
-      mc mb -p datalakehouse/processed-data || true;
-      mc version enable datalakehouse/warehouse || true;
+      echo '' | mc pipe datalakehouse/spark-logs/events/.keep || true;
       mc version enable datalakehouse/mlflow-artifacts || true;
       echo 'MinIO buckets initialized successfully';
       "
@@ -138,6 +136,7 @@ services:
       SPARK_MASTER_WEBUI_PORT: 8080
       SPARK_NO_DAEMONIZE: "true"
       SPARK_CLASSPATH: "/opt/spark/jars/*"
+      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -188,6 +187,7 @@ services:
       - "4041:4040"   # Application UI (notebook driver)
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
+      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       MLFLOW_TRACKING_URI: http://mlflow:5000
@@ -200,8 +200,6 @@ services:
     depends_on:
       spark-master:
         condition: service_started
-      mlflow:
-        condition: service_healthy
     networks:
       - datalakehouse
     restart: unless-stopped
@@ -233,6 +231,7 @@ services:
       - "8081:8081"
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
+      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -307,6 +306,7 @@ services:
 
   # Custom OpenMetadata PostgreSQL image pre-creates the openmetadata_db database
   openmetadata-postgres:
+    profiles: ["governance"]
     container_name: openmetadata-postgres
     image: docker.getcollate.io/openmetadata/postgresql:1.12.1
     restart: always
@@ -340,6 +340,7 @@ services:
       component: openmetadata-postgres
 
   openmetadata-elasticsearch:
+    profiles: ["governance"]
     container_name: openmetadata-es
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.4
     environment:
@@ -372,6 +373,7 @@ services:
 
   # Runs schema migrations and exits — must complete before the server starts
   openmetadata-migrate:
+    profiles: ["governance"]
     container_name: openmetadata-migrate
     image: docker.getcollate.io/openmetadata/server:1.12.1
     command: "./bootstrap/openmetadata-ops.sh migrate"
@@ -431,6 +433,7 @@ services:
       component: openmetadata-migrate
 
   openmetadata:
+    profiles: ["governance"]
     container_name: openmetadata
     restart: always
     image: docker.getcollate.io/openmetadata/server:1.12.1
@@ -509,6 +512,7 @@ services:
   # --- ML operations ---
 
   mlflow-postgres:
+    profiles: ["ml"]
     image: postgres:16-alpine
     container_name: mlflow-postgres
     hostname: mlflow-postgres
@@ -541,6 +545,7 @@ services:
       component: mlflow-postgres
 
   mlflow:
+    profiles: ["ml"]
     build:
       context: ./docker/mlflow
       dockerfile: Dockerfile
