@@ -39,6 +39,7 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+.tmp_ingest/
 
 # Claude
 .claude/
