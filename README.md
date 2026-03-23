@@ -12,9 +12,8 @@ The platform consists of seven core components organized into logical layers:
 
 ### Metadata & Cataloging Layer
 
-- **Project Nessie**: Git-like versioning and metadata cataloging for data
+- **Project Nessie**: Git-like versioning and metadata cataloging for data (single Iceberg catalog)
 - **Apache Iceberg**: Open table format enabling ACID transactions on data lakes
-- **Iceberg REST Catalog**: OpenAPI-compliant metadata management
 
 ### Compute Layer
 
@@ -54,18 +53,22 @@ The platform consists of seven core components organized into logical layers:
            │                                             │
     ┌──────▼─────────────────────────────────────────────▼──────────┐
     │  MinIO Object Storage (S3-Compatible)                         │
-    │  - warehouse/ (Iceberg tables)                                │
-    │  - mlflow-artifacts/ (ML models)                              │
-    │  - spark-logs/ (Application logs)                             │
-    │  - dremio-uploads/ (Query results)                            │
+    │  Buckets:                                                     │
+    │  - warehouse (all Iceberg tables — physical layout by Iceberg)│
+    │  - mlflow-artifacts (ML model artifacts, versioned)           │
+    │  - spark-logs (Spark event logs)                              │
     └───────────────────────────────────────────────────────────────┘
 
+    Nessie Namespaces (layer-first medallion):
+    ├── nessie.bronze.yellow_taxi          (raw ingestion, monthly partitioned)
+    ├── nessie.bronze.taxi_zone_lookup     (reference, unpartitioned)
+    ├── nessie.silver.yellow_taxi          (cleaned, typed, deduplicated)
+    ├── nessie.silver.taxi_zone_lookup     (standardized)
+    └── nessie.gold.taxi_analytics         (joined, aggregated, ML features)
+
 Supporting Services:
-├── PostgreSQL (Nessie catalog DB)
-├── PostgreSQL (Iceberg REST catalog DB)
-├── PostgreSQL (Dremio coordination DB)
 ├── PostgreSQL (MLflow tracking DB)
-├── MySQL (OpenMetadata DB)
+├── PostgreSQL (OpenMetadata DB)
 └── Elasticsearch (OpenMetadata search)
 ```
 
@@ -130,14 +133,14 @@ curl http://localhost:9000/minio/health/live
 
 ### 4. Access Web Interfaces
 
-| Service       | URL                           | Credentials                         |
-| ------------- | ----------------------------- | ----------------------------------- |
-| MinIO Console | http://localhost:9001         | minioadmin / minioadmin123          |
-| Spark Master  | http://localhost:8080         | N/A                                 |
-| Dremio        | http://localhost:9047         | admin@example.com / dremio123       |
-| OpenMetadata  | http://localhost:8585         | admin@example.com / openmetadata123 |
-| MLflow        | http://localhost:5000         | N/A                                 |
-| Nessie API    | http://localhost:19120/api/v2 | N/A                                 |
+| Service       | URL                           | Credentials              |
+| ------------- | ----------------------------- | ------------------------ |
+| MinIO Console | http://localhost:9001         | See `.env`               |
+| Spark Master  | http://localhost:8080         | N/A                      |
+| Dremio        | http://localhost:9047         | Configured on first boot |
+| OpenMetadata  | http://localhost:8585         | See `.env`               |
+| MLflow        | http://localhost:5000         | N/A                      |
+| Nessie API    | http://localhost:19120/api/v2 | N/A                      |
 
 ## Service Details
 
@@ -149,7 +152,7 @@ curl http://localhost:9000/minio/health/live
 
 - S3 API: http://localhost:9000
 - Console: http://localhost:9001
-- Default Buckets: warehouse, mlflow-artifacts, spark-logs, dremio-uploads
+- Default Buckets: warehouse (Iceberg tables), mlflow-artifacts (ML artifacts), spark-logs
 
 **Documentation**: https://min.io/docs/minio/linux/
 
@@ -178,7 +181,6 @@ curl http://localhost:9000/minio/health/live
 - Partition pruning
 - Time travel
 
-**REST Catalog**: http://localhost:8181
 **Documentation**: https://iceberg.apache.org/
 
 ### Apache Spark (Compute)
@@ -252,18 +254,7 @@ curl http://localhost:9000/minio/health/live
 
 ### Environment Variables (`.env`)
 
-```bash
-# MinIO
-MINIO_ROOT_USER=minioadmin
-MINIO_ROOT_PASSWORD=minioadmin123
-
-# Database Passwords
-NESSIE_DB_PASSWORD=nessie123
-ICEBERG_DB_PASSWORD=iceberg123
-DREMIO_DB_PASSWORD=dremio123
-OPENMETADATA_DB_PASSWORD=openmetadata123
-MLFLOW_DB_PASSWORD=mlflow123
-```
+Copy `.env.example` to `.env` and fill in your credentials. See `.env.example` for the full list of required variables.
 
 ### Spark Configuration (`config/spark/spark-defaults.conf`)
 
@@ -278,58 +269,42 @@ Key configurations:
 
 Key configurations:
 
-- Iceberg REST Catalog source
-- MinIO S3 source
-- PostgreSQL backend for coordination
+- Single-node deployment (coordinator + executor)
+- Embedded RocksDB for metadata (no external PostgreSQL)
+- Nessie data source configured via Dremio UI
 
 ## Development Workflow
 
-### 1. Data Ingestion
+### 1. Bronze Ingestion
 
 ```python
-from pyspark.sql import SparkSession
-from src.core import SparkSessionBuilder, CatalogManager
-from src.ingestion.data_ingestion import DataIngestionService
+# Create medallion namespaces
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
 
-# Initialize Spark
-spark = SparkSessionBuilder.build(
-    app_name="data_ingestion",
-    use_nessie=True
-)
-
-# Create catalog and database
-catalog = CatalogManager(spark, catalog_name="nessie")
-catalog.create_database("raw_data", location="s3a://warehouse/raw_data/")
-
-# Ingest data
-ingestion = DataIngestionService(spark, catalog_name="nessie")
-ingestion.ingest_csv(
-    file_path="data/raw/input.csv",
-    database_name="raw_data",
-    table_name="source_data",
-    overwrite=True
-)
+# Write yellow taxi data to bronze (hidden partitioning by month)
+df.writeTo("nessie.bronze.yellow_taxi") \
+    .tableProperty("write.format.default", "parquet") \
+    .partitionedBy(months("tpep_pickup_datetime")) \
+    .createOrReplace()
 ```
 
-### 2. Data Processing
+### 2. Silver Processing
 
 ```python
-# Process with Spark
-df = spark.read.table("nessie.raw_data.source_data")
-processed_df = df.filter(df.value > 0).select("id", "value")
-
-# Write processed data
-processed_df.write.mode("overwrite").format("iceberg") \
-    .option("write.format.default", "parquet") \
-    .saveAsTable("nessie.processed_data.cleaned_data")
+# Read from bronze, clean, write to silver
+bronze_df = spark.read.table("nessie.bronze.yellow_taxi")
+silver_df = bronze_df.filter("fare_amount > 0 AND trip_distance > 0").dropDuplicates()
+silver_df.writeTo("nessie.silver.yellow_taxi").createOrReplace()
 ```
 
 ### 3. Query with Dremio
 
 ```sql
--- Query through Dremio SQL
-SELECT * FROM iceberg_nessie.raw_data.source_data
-WHERE value > 100
+-- Query through Dremio (Nessie source configured via UI)
+SELECT * FROM nessie.silver.yellow_taxi
+WHERE tpep_pickup_datetime >= '2024-01-01'
 LIMIT 1000;
 ```
 
@@ -401,13 +376,13 @@ datalakehouse/
 │   └── mlflow/
 │       └── Dockerfile         # MLflow tracking server
 ├── src/
-│   ├── core.py               # Core utilities and configuration
-│   ├── ingestion/
-│   │   └── data_ingestion.py # Data ingestion service
-│   ├── processing/           # Data processing modules
-│   └── ml/
-│       └── mlflow_ops.py    # MLflow operations
-├── notebooks/                # Jupyter notebooks for exploration
+│   ├── common/              # Shared utilities (SparkSession, Nessie helpers)
+│   ├── etl/
+│   │   ├── bronze/          # Source download + Iceberg ingestion (no separate landing zone)
+│   │   ├── silver/          # Bronze → Silver (clean, conform, deduplicate)
+│   │   └── gold/            # Silver → Gold (join, aggregate, ML features)
+│   ├── ml/                  # ML experiments (MLflow tracking)
+│   └── notebooks/           # Jupyter notebooks for exploration
 ├── tests/                    # Unit tests
 ├── scripts/
 │   ├── init-platform.sh     # Linux/macOS initialization
@@ -522,7 +497,7 @@ docker-compose down -v
 ### Access Container Shell
 
 ```bash
-docker exec -it datalakehouse-spark-master /bin/bash
+docker exec -it spark-master /bin/bash
 ```
 
 ## Troubleshooting
@@ -546,9 +521,9 @@ netstat -tulpn | grep -E ':(9000|8080|5432)'
 # Verify MinIO is running
 curl http://localhost:9000/minio/health/live
 
-# Manually create buckets
-docker exec datalakehouse-minio mc alias set minio http://localhost:9000 minioadmin minioadmin123
-docker exec datalakehouse-minio mc mb minio/warehouse
+# Manually create buckets (use credentials from .env)
+docker exec minio mc alias set datalakehouse http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+docker exec minio mc mb datalakehouse/warehouse
 ```
 
 ### Spark Can't Access MinIO
@@ -557,17 +532,17 @@ docker exec datalakehouse-minio mc mb minio/warehouse
 # Check S3 credentials in spark-defaults.conf
 # Verify MinIO endpoint: http://minio:9000 (from Spark container perspective)
 # Test connection from Spark container
-docker exec datalakehouse-spark-master curl http://minio:9000/minio/health/live
+docker exec spark-master curl http://minio:9000/minio/health/live
 ```
 
 ### Database Connection Issues
 
 ```bash
-# Test PostgreSQL connection
-docker exec -it datalakehouse-nessie-postgres psql -U nessie -d nessie -c "SELECT version();"
+# Test MLflow PostgreSQL connection
+docker exec -it mlflow-postgres psql -U mlflow -d mlflow -c "SELECT version();"
 
-# Check connection settings
-grep POSTGRES config/spark/spark-defaults.conf
+# Test OpenMetadata PostgreSQL connection
+docker exec -it openmetadata-postgres psql -U openmetadata_user -d openmetadata_db -c "SELECT 1;"
 ```
 
 ## Performance Tuning
