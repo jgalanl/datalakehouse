@@ -6,6 +6,7 @@ Small reference table (~265 rows). WAP: branch, validate, merge to bronze.
 import os
 import shutil
 import sys
+from datetime import date
 from pathlib import Path
 from urllib.request import urlretrieve
 from urllib.error import URLError
@@ -43,8 +44,14 @@ def main() -> None:
         nessie.ensure_persistent_branches(spark=spark)
         spark = nessie.set_spark_branch(spark=spark, branch="bronze")
 
-        branch_name = nessie.etl_branch_name(layer="bronze", table="taxi_zone_lookup")
-        tag_name = nessie.etl_tag_name(layer="bronze", table="taxi_zone_lookup")
+        today = date.today()
+        branch_name = nessie.etl_branch_name(
+            layer="bronze", table="taxi_zone_lookup",
+            year=today.year, month=today.month,
+        )
+        tag_name = nessie.etl_tag_name(
+            layer="bronze", table="taxi_zone_lookup", year=today.year,
+        )
 
         print(f"  Creating branch '{branch_name}' from bronze")
         nessie.create_branch(spark=spark, name=branch_name, from_ref="bronze")
