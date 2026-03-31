@@ -1,7 +1,7 @@
-﻿# MLflow Requirements
+# MLflow Requirements
 # Reference: https://mlflow.org/docs/latest/
 
-mlflow[databricks,postgres,s3]==2.20.3
+mlflow[databricks,postgres,s3]==3.9.0rc0
 psycopg2-binary>=2.9.0
 boto3>=1.28.0
 pyarrow>=14.0.0
