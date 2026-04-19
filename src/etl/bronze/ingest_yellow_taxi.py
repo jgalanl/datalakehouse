@@ -21,7 +21,6 @@ from pyspark.sql.types import (
 
 from common.spark_factory import get_spark
 from common import nessie_manager as nessie
-from common.nessie_manager import NoCommonAncestorError
 
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
 YEARS = [2019, 2020, 2022, 2023, 2025]
@@ -207,33 +206,13 @@ def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
 
 def wap_ingest(spark: SparkSession, path: Path, year: int, month: int,
                branch_name: str) -> int:
-    """Branch from bronze -> ingest -> validate -> merge back.
-
-    Handles stale bronze branches (from previous Nessie instances) by
-    recreating the branch and retrying once.
-    """
-    def _run():
+    """Branch from bronze -> ingest -> validate -> merge back."""
+    try:
         nessie.create_branch(spark, branch_name, from_ref="bronze")
         nessie.set_spark_branch(spark, branch_name)
         count = ingest_month(spark, path, year, month)
         validate_ingestion(spark, expected_count=count)
         nessie.merge_branch(spark, source=branch_name, into="bronze")
-        return count
-
-    try:
-        return _run()
-    except NoCommonAncestorError:
-        print("  Stale bronze detected (no common ancestor). Recovering...")
-        nessie.drop_branch(spark, branch_name)
-        nessie.recreate_branch(spark, name="bronze", from_ref="main")
-        try:
-            count = _run()
-        except NoCommonAncestorError:
-            print("\n  Auto-recovery failed — Nessie commit graph is corrupted.")
-            print("  Manual fix: stop services, delete ./nessie-data, restart.")
-            print("    docker compose down && rm -rf ./nessie-data && docker compose up -d")
-            sys.exit(1)
-        print("  Recovery successful.")
         return count
     finally:
         nessie.set_spark_branch(spark, "bronze")
@@ -251,7 +230,7 @@ def main():
 
         for year, month, url, name in file_list:
             label = f"{year}-{month:02d}"
-            branch_name = f"etl/bronze-yellow_taxi-{year}-{month:02d}"
+            branch_name = nessie.etl_branch_name("bronze", "yellow_taxi", year, month)
 
             print(f"\n  [{label}] Downloading...")
             path = download_one(url, name)
@@ -270,7 +249,7 @@ def main():
                 nessie.drop_branch(spark, branch_name)
 
                 if month == MONTHS[-1]:
-                    tag_name = f"bronze-yellow_taxi-{year}"
+                    tag_name = nessie.etl_tag_name("bronze", "yellow_taxi", year)
                     print(f"  Creating tag '{tag_name}'")
                     nessie.create_tag(spark, tag_name, from_ref="bronze")
 
