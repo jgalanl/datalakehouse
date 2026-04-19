@@ -17,10 +17,10 @@ The platform consists of seven core components organized into logical layers:
 
 ### Compute Layer
 
-- **Apache Spark**: Distributed data processing engine (3.5.0)
+- **Apache Spark**: Distributed data processing engine (3.5.8)
   - 1 Master node
   - 2 Worker nodes
-  - Configured with Iceberg and Nessie support
+  - Configured with Iceberg 1.10.1 and Nessie 0.106.0 support
 
 ### Query & Analytics Layer
 
@@ -292,12 +292,25 @@ df.writeTo("nessie.bronze.yellow_taxi") \
 
 ### 2. Silver Processing
 
-```python
-# Read from bronze, clean, write to silver
-bronze_df = spark.read.table("nessie.bronze.yellow_taxi")
-silver_df = bronze_df.filter("fare_amount > 0 AND trip_distance > 0").dropDuplicates()
-silver_df.writeTo("nessie.silver.yellow_taxi").createOrReplace()
+Silver ETL follows the Write-Audit-Publish (WAP) pattern: each run branches off the
+persistent `silver` branch, writes the cleaned output, audits it, and only merges back
+on success. Failing audits are quarantined as immutable `review/` tags and the run
+continues (see `src/etl/silver/clean_yellow_taxi.py` and `clean_zone_lookup.py`).
+
+```bash
+# Yellow taxi (monthly, partitioned, WAP with 20% drop-ratio threshold)
+docker exec -it spark-master spark-submit /opt/spark/src/etl/silver/clean_yellow_taxi.py
+
+# Zone lookup (small reference, full refresh)
+docker exec -it spark-master spark-submit /opt/spark/src/etl/silver/clean_zone_lookup.py
+
+# Reset the silver layer (drops all silver refs, wipes s3a://warehouse/silver/, recreates silver from main)
+docker exec -it spark-master spark-submit /opt/spark/src/etl/silver/reset_silver.py
 ```
+
+Verify the silver layer interactively via `src/notebooks/verify_silver_iceberg.ipynb`
+(Jupyter at http://localhost:8888): Nessie refs, schema, snapshots, yearly growth,
+cleaning-rule assertions, bronze↔silver retention, and zone-lookup orphan detection.
 
 ### 3. Query with Dremio
 
@@ -364,7 +377,7 @@ datalakehouse/
 ├── config/
 │   ├── spark/
 │   │   ├── spark-defaults.conf
-│   │   └── log4j.properties
+│   │   └── log4j2.properties
 │   ├── dremio/
 │   │   └── dremio.conf
 │   ├── mlflow/
