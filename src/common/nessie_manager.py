@@ -28,43 +28,40 @@ def drop_branch(spark: SparkSession, name: str) -> None:
     spark.sql(f"DROP BRANCH IF EXISTS `{name}` IN nessie")
 
 
-def recreate_branch(spark: SparkSession, name: str, from_ref: str = "main") -> None:
-    """Drop + recreate. Used when a branch has divergent history."""
-    spark.sql(f"DROP BRANCH IF EXISTS `{name}` IN nessie")
-    spark.sql(f"CREATE BRANCH `{name}` IN nessie FROM `{from_ref}`")
-
-
 def merge_branch(spark: SparkSession, source: str, into: str = "main") -> None:
     try:
         spark.sql(f"MERGE BRANCH `{source}` INTO `{into}` IN nessie")
     except Exception as e:
-        # Stale branch from a previous Nessie instance
+        # Stale branch from a previous Nessie instance — manual reset required
+        # (delete ./nessie-data, restart Nessie). See CLAUDE.md "Known Gotchas".
         if "No common ancestor" in str(e):
             raise NoCommonAncestorError(
                 f"Cannot merge '{source}' into '{into}': no common ancestor. "
-                f"'{into}' likely has stale history from a previous Nessie instance."
+                f"Nessie likely has stale history from a previous instance. "
+                f"Fix: stop Nessie, delete ./nessie-data, restart."
             ) from e
         raise
 
 
 def ensure_persistent_branches(spark: SparkSession) -> None:
-    """Create bronze/silver from main if missing, and seed bronze with a namespace commit.
+    """Create bronze/silver from main if missing, then seed namespaces.
 
-    Without at least one real commit (with a parent), Nessie's merge algorithm
-    can't find a common ancestor when ETL branches try to merge back.
+    Safe to call repeatedly: existing branches are left untouched (never
+    dropped or recreated). If a branch is truly stale from a prior Nessie
+    instance, an ETL merge will raise NoCommonAncestorError with a clear
+    message directing to manual reset.
     """
     for branch in PERSISTENT_BRANCHES:
         if branch == "main":
             continue
-        if not ref_exists(spark, branch):
+        if ref_exists(spark, branch):
+            print(f"  Persistent branch '{branch}' already exists")
+        else:
             print(f"  Creating persistent branch '{branch}' from main")
             create_branch(spark, branch, from_ref="main")
-        else:
-            print(f"  Persistent branch '{branch}' already exists")
-
-    # Seed bronze so it has at least one commit with a parent
-    set_spark_branch(spark, "bronze")
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
+        # Seed the branch with a namespace commit (idempotent).
+        set_spark_branch(spark, branch)
+        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS nessie.{branch}")
     set_spark_branch(spark, "main")
 
 
@@ -87,6 +84,11 @@ def etl_branch_name(layer: str, table: str, year: int, month: int) -> str:
 
 def etl_tag_name(layer: str, table: str, year: int) -> str:
     return f"{layer}-{table}-{year}"
+
+
+def review_tag_name(layer: str, table: str, year: int, month: int) -> str:
+    """Tag name for a month quarantined by the audit step (WAP reject)."""
+    return f"review/{layer}-{table}-{year}-{month:02d}"
 
 
 def print_references(spark: SparkSession) -> None:
