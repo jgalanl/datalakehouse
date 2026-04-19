@@ -141,7 +141,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - spark_data:/home/spark
-      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
       - ./src:/opt/spark/src
     depends_on:
@@ -194,7 +194,7 @@ services:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - spark_data:/home/spark
-      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
       - ./src:/opt/spark/src
     depends_on:
@@ -236,7 +236,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
       - spark_worker_1_data:/home/spark
-      - ./config/spark/log4j.properties:/opt/spark/conf/log4j.properties:ro
+      - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./src:/opt/spark/src:ro
     depends_on:
       spark-master:
