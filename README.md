@@ -308,7 +308,7 @@ docker exec -it spark-master spark-submit /opt/spark/src/etl/silver/clean_zone_l
 docker exec -it spark-master spark-submit /opt/spark/src/etl/silver/reset_silver.py
 ```
 
-Verify the silver layer interactively via `src/notebooks/verify_silver_iceberg.ipynb`
+Verify the silver layer interactively via `src/notebooks/silver/verify_iceberg.ipynb`
 (Jupyter at http://localhost:8888): Nessie refs, schema, snapshots, yearly growth,
 cleaning-rule assertions, bronze↔silver retention, and zone-lookup orphan detection.
 
@@ -395,7 +395,10 @@ datalakehouse/
 │   │   ├── silver/          # Bronze → Silver (clean, conform, deduplicate)
 │   │   └── gold/            # Silver → Gold (join, aggregate, ML features)
 │   ├── ml/                  # ML experiments (MLflow tracking)
-│   └── notebooks/           # Jupyter notebooks for exploration
+│   └── notebooks/           # Jupyter notebooks, split per medallion layer
+│       ├── bronze/          # explore (pandas, raw parquet → first look), preprocess (Spark, full dataset → silver-rule evidence), verify_iceberg
+│       ├── silver/          # verify_iceberg
+│       └── gold/            # feature engineering, ML prep
 ├── tests/                    # Unit tests
 ├── scripts/
 │   ├── init-platform.sh     # Linux/macOS initialization

@@ -102,7 +102,7 @@ datalakehouse/
 │   │   ├── silver/             # Bronze → Silver (clean, conform, deduplicate)
 │   │   └── gold/               # Silver → Gold (join, aggregate, ML features)
 │   ├── ml/                     # ML experiments (MLflow tracking)
-│   └── notebooks/              # Jupyter notebooks
+│   └── notebooks/              # Jupyter notebooks (bronze: explore + preprocess + verify_iceberg; silver: verify_iceberg; gold)
 ├── scripts/                    # Initialization & automation
 ├── tests/                      # Unit tests
 ├── data/                       # Sample data
@@ -360,7 +360,7 @@ This project demonstrates:
 - **Code**: ~2000+ lines (Python, YAML, Dockerfiles)
 - **Documentation**: 5 comprehensive guides + inline
 - **Examples**: 2 complete end-to-end examples
-- **Notebooks**: 1 interactive tutorial
+- **Notebooks**: 4 interactive notebooks (bronze: explore, preprocess, verify_iceberg; silver: verify_iceberg)
 - **Configuration Files**: 10+ service configurations
 - **Test Infrastructure**: Unit test framework
 

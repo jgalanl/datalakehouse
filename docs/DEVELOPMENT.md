@@ -61,7 +61,10 @@ src/
 │   ├── silver/                 # Bronze → Silver (clean, conform, deduplicate)
 │   └── gold/                   # Silver → Gold (join, aggregate, ML features)
 ├── ml/                         # ML experiments (MLflow tracking)
-└── notebooks/                  # Jupyter notebooks
+└── notebooks/                  # Jupyter notebooks, split per medallion layer
+    ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019), preprocess.ipynb (Spark, full-dataset EDA), verify_iceberg.ipynb
+    ├── silver/                 # verify_iceberg.ipynb
+    └── gold/                   # feature engineering, ML prep
 ```
 
 ### Code Style

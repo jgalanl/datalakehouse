@@ -95,7 +95,8 @@ Spark Master (8080, 7077)
 
 - Master: 1 core (orchestration only)
 - Workers: 2 cores each, 2GB memory (tunable)
-- Driver: 1GB memory
+- Driver (Spark heap): 1GB
+- Notebook container (`spark-notebook`): 2 cores / 2GB OS memory — wider than Spark driver heap to leave room for pandas-based exploration on a full month (~7.7M rows)
 
 ### Trade-offs
 
