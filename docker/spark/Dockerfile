@@ -35,6 +35,8 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
     pyarrow==17.0.0 \
     pandas==2.2.3 \
     numpy==1.26.4 \
+    matplotlib==3.9.4 \
+    seaborn==0.13.2 \
     kagglehub==0.3.6 \
     jupyter==1.1.1 \
     notebook==7.2.2 \
