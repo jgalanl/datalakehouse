@@ -1,6 +1,9 @@
 ﻿# Environment variables
 .env
 
+# Temp folder
+*.tmp*
+
 # Docker volumes and data
 docker-volume/
 docker-volumes/

@@ -4,7 +4,7 @@
 # Dremio connects to Nessie as a data source (configured via the Dremio UI).
 # Both services work on the same underlying data files.
 #
-# Estimated steady-state memory: ~13 GB. Allocate at least 16 GB and 6 CPUs
+# Estimated steady-state memory: ~15 GB. Allocate at least 18 GB and 6 CPUs
 # in Docker Desktop.
 
 services:
@@ -207,9 +207,9 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 2G
+          memory: 4G
         reservations:
-          memory: 1G
+          memory: 2G
     labels:
       service: compute
       component: spark-notebook
