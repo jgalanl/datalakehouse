@@ -21,8 +21,9 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 ### 3. **Compute Layer: Apache Spark**
 
 - Distributed batch processing
-- 1 Master + 2 Worker configuration
+- 1 Master + 1 Worker + 1 Jupyter notebook driver
 - Native Iceberg and Nessie integration
+- Spark MLlib used by the ML training scripts (no separate ML stack)
 
 ### 4. **Query Engine: Dremio OSS**
 
@@ -45,9 +46,9 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 
 ### 7. **Supporting Infrastructure**
 
-- PostgreSQL databases for metadata persistence
-- MySQL and Elasticsearch for OpenMetadata
-- Docker Compose orchestration
+- PostgreSQL for MLflow tracking (`ml` profile)
+- PostgreSQL + Elasticsearch for OpenMetadata (`governance` profile)
+- Docker Compose orchestration with Compose profiles to opt in/out of ML and governance stacks
 
 ## Technical Highlights
 
@@ -87,25 +88,23 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 datalakehouse/
 ├── docker-compose.yml          # Complete infrastructure
 ├── .env                        # Environment configuration
+├── RUNBOOK.md                  # End-to-end execution sequence
 ├── config/                     # Service configurations
 │   ├── spark/                  # Spark configs & logging
 │   ├── dremio/                 # Dremio configuration
 │   ├── mlflow/                 # MLflow setup
 │   └── openmetadata/           # OpenMetadata configs
 ├── docker/                     # Custom Dockerfiles
-│   ├── spark/                  # Spark with Iceberg
+│   ├── spark/                  # Spark with Iceberg + Nessie
 │   └── mlflow/                 # MLflow tracking server
 ├── src/                        # Pipeline code (mounted into Spark containers)
-│   ├── common/                 # Shared utilities (SparkSession, Nessie helpers)
-│   ├── etl/
-│   │   ├── bronze/             # Source download + Iceberg ingestion (no separate landing zone)
-│   │   ├── silver/             # Bronze → Silver (clean, conform, deduplicate)
-│   │   └── gold/               # Silver → Gold (join, aggregate, ML features)
-│   ├── ml/                     # ML experiments (MLflow tracking)
-│   └── notebooks/              # Jupyter notebooks (bronze: explore + preprocess + verify_iceberg; silver: verify_iceberg; gold)
-├── scripts/                    # Initialization & automation
-├── tests/                      # Unit tests
-├── data/                       # Sample data
+│   ├── common/                 # spark_factory.py, nessie_manager.py, iceberg_schema.py
+│   ├── pipelines/
+│   │   ├── bronze/             # ingest_yellow_taxi.py, ingest_zone_lookup.py
+│   │   ├── silver/             # clean_yellow_taxi.py, clean_zone_lookup.py, reset_silver.py
+│   │   └── gold/               # build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py
+│   ├── ml/                     # common.py, fare_prediction.py, trip_duration.py, demand_forecast.py
+│   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (diagnostics)
 └── docs/                       # Documentation
 ```
 
@@ -130,11 +129,10 @@ datalakehouse/
 
 ### ✅ Development Features
 
-- Interactive notebooks for exploration
-- Example ETL and ML pipelines
-- Comprehensive Python API
-- Type hints and documentation
-- Unit test framework
+- Interactive notebooks for exploration and per-layer verification
+- ETL and ML pipelines with strict per-layer Iceberg schemas
+- WAP audit gates (drop-ratio, row-count parity, pickup conservation)
+- Type hints and concise inline documentation
 
 ## Proof-of-Concept Scenarios
 
@@ -158,42 +156,61 @@ Experiment tracking, model registration, staging, and version management.
 
 ### Python Modules
 
-#### core.py - Core Utilities
+#### `src/common/` — shared utilities
 
-- `LakehouseConfig`: Environment configuration
-- `SparkSessionBuilder`: Spark initialization with Iceberg/Nessie
-- `CatalogManager`: Database and table operations
+- `spark_factory.get_spark(app_name)`: SparkSession factory (config from `spark-defaults.conf`)
+- `nessie_manager`: Spark-SQL wrappers for Nessie refs (`create_branch`, `merge_branch`,
+  `create_tag`, `set_spark_branch`, `wap_branch_name`, `review_tag_name`,
+  `ensure_persistent_branches`, ...)
+- `iceberg_schema.schema_to_ddl(StructType)`: generates Iceberg column DDL with
+  `NOT NULL` constraints from a Spark `StructType`. Each pipeline declares its
+  target schema with explicit nullability and creates the table via SQL DDL so
+  the constraints land in Iceberg's column metadata.
 
-#### ingestion/data_ingestion.py
+#### `src/pipelines/bronze/` — bronze ingestion
 
-- `DataIngestionService`: CSV/Parquet ingestion
-- Data quality validation
-- Schema management
+- `ingest_yellow_taxi.py`: downloads NYC TLC parquet (Q1 of 2019/2020/2022/2023/2025),
+  reconciles schema drift, writes `nessie.bronze.yellow_taxi` via WAP per month
+- `ingest_zone_lookup.py`: writes the small reference table `nessie.bronze.taxi_zone_lookup`
 
-#### ml/mlflow_ops.py
+#### `src/pipelines/silver/` — silver cleaning
 
-- `MLflowManager`: Experiment and model management
-- `MLExperimentTracker`: Training pipeline helper
+- `clean_yellow_taxi.py`: WAP per month against `nessie.silver.yellow_taxi`, audit on
+  drop ratio, quarantine to `review/silver-...` tag on failure
+- `clean_zone_lookup.py`: full refresh of `nessie.silver.taxi_zone_lookup`
+- `reset_silver.py`: drops all silver refs and rebuilds the layer from scratch
 
-### Example Applications
+#### `src/pipelines/gold/` — gold curation
 
-#### src/processing/example_etl.py
+- `build_yellow_taxi_trips.py`: joins silver trips with the zone lookup, derives time
+  features, writes `nessie.gold.yellow_taxi_trips` (partitioned by month) via WAP on `main`
+- `aggregate_demand_zone_hour.py`: aggregates silver trips to
+  `(pu_location_id, hour_bucket)` and writes `nessie.gold.pickup_demand_zone_hour`
+  (target dataset for the demand model)
 
-Complete ETL pipeline demonstrating:
+#### `src/ml/` — ML training (Spark MLlib + MLflow)
 
-- Data loading and transformation
-- Multi-stage processing
-- Aggregation and analytics
-- Data quality validation
+- `common.py`: shared helpers (MLflow setup, gold loaders, temporal split:
+  train 2019/2020/2022/2023 vs test 2025, pipeline + evaluation helpers) **plus
+  `train_regression()`** — the full GBT training skeleton (Spark/MLflow setup,
+  load, optional pre-filter, split, fit, evaluate, log params + metrics + model)
+  shared by the three use cases. `DEFAULT_GBT_PARAMS` is also defined here.
+- `fare_prediction.py`: use case 1 — declares the source/label/feature lists and
+  calls `train_regression(...)`. Target: `fare_amount`.
+- `trip_duration.py`: use case 2 — same skeleton + `pre_filter` to drop trips
+  with `trip_duration_minutes <= 0` (sub-second trips). Target: `trip_duration_minutes`.
+- `demand_forecast.py`: use case 3 — same skeleton + `year_col="hour_year"` for
+  the temporal split. Target: `n_pickups`.
 
-#### src/ml/example_training.py
+### Notebooks
 
-ML pipeline showing:
-
-- Data preparation
-- Hyperparameter tuning
-- Model training and evaluation
-- MLflow experiment tracking and model registration
+- `bronze/explore.ipynb`: pandas first-look on raw TLC parquet
+- `bronze/preprocess.ipynb`: Spark EDA on the full dataset; quantitatively justifies
+  the silver cleaning rules
+- `bronze|silver|gold/verify_iceberg.ipynb`: layer-specific Iceberg + Nessie audits
+- `ml/*_diagnostics.ipynb`: one diagnostics notebook per ML use case — loads the
+  latest MLflow run, plots predicted vs actual, residuals, feature importance and
+  per-year drift; **does not re-train**
 
 ## Technology Stack
 
@@ -225,10 +242,8 @@ ML pipeline showing:
 git clone <repository>
 cd datalakehouse
 
-# Initialize platform
-./scripts/init-platform.sh  # Linux/macOS
-# or
-scripts\init-platform.bat  # Windows
+# Bring up the full stack (ML profile enables MLflow)
+docker compose --profile ml up -d
 
 # Access services
 # MinIO: http://localhost:9001
@@ -237,15 +252,19 @@ scripts\init-platform.bat  # Windows
 # MLflow: http://localhost:5000
 ```
 
+End-to-end execution sequence (bronze → silver → gold → ML) is documented in
+[RUNBOOK.md](RUNBOOK.md).
+
 ## Documentation
 
 ### Main Documents
 
-1. **README.md** - Complete project guide
-2. **QUICK_REFERENCE.md** - Command cheatsheet
-3. **ARCHITECTURE.md** - Technical deep dive
-4. **DEVELOPMENT.md** - Developer guide
-5. **GETTING_STARTED.md** - Quick orientation
+1. **[README.md](README.md)** — Complete project guide
+2. **[RUNBOOK.md](RUNBOOK.md)** — End-to-end execution sequence
+3. **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** — Command cheatsheet
+4. **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Technical deep dive
+5. **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** — Developer guide
+6. **[CLAUDE.md](CLAUDE.md)** — Codebase conventions for Claude Code (also useful as a quick architectural reference)
 
 ### Interactive Resources
 
@@ -256,11 +275,11 @@ scripts\init-platform.bat  # Windows
 
 ### Implementation Standards
 
-- **Type Hints**: Full type annotations for IDE support
-- **Documentation**: Google-style docstrings on all functions
-- **Logging**: Comprehensive logging for debugging
-- **Error Handling**: Proper exception handling and messages
-- **Testing**: Unit test framework and examples
+- **Type Hints**: Full type annotations on shared helpers
+- **Documentation**: Concise comments — explain *why*, not *what*
+- **Logging**: Pipeline progress printed at every WAP step
+- **Error Handling**: Non-raising audits + quarantine tags (failures don't crash the run)
+- **Verification**: Per-layer notebooks under `src/notebooks/*/verify_iceberg.ipynb`
 
 ### Architecture Principles
 
@@ -357,12 +376,16 @@ This project demonstrates:
 ## Project Metrics
 
 - **Components**: 7 major services
-- **Code**: ~2000+ lines (Python, YAML, Dockerfiles)
+- **Code**: ~2500+ lines (Python, YAML, Dockerfiles)
 - **Documentation**: 5 comprehensive guides + inline
-- **Examples**: 2 complete end-to-end examples
-- **Notebooks**: 4 interactive notebooks (bronze: explore, preprocess, verify_iceberg; silver: verify_iceberg)
+- **ETL pipelines**: 7 scripts across bronze (2), silver (3), gold (2) — all WAP
+- **ML pipelines**: 3 use cases (fare regression, duration regression, demand forecast)
+- **Notebooks**: 8 interactive notebooks
+  - bronze: `explore`, `preprocess`, `verify_iceberg`
+  - silver: `verify_iceberg`
+  - gold: `verify_iceberg`
+  - ml: `fare_prediction_diagnostics`, `trip_duration_diagnostics`, `demand_forecast_diagnostics`
 - **Configuration Files**: 10+ service configurations
-- **Test Infrastructure**: Unit test framework
 
 ## Support & Maintenance
 
@@ -399,5 +422,5 @@ The platform meets all requirements for a master's degree final project by demon
 
 **Project Version**: 1.0.0
 **Status**: Completed - Production Ready for PoC/Development
-**Last Updated**: January 2026
+**Last Updated**: May 2026
 **Target**: Master's Degree Final Project

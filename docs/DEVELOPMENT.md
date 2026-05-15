@@ -53,18 +53,34 @@ docker-compose up -d
 
 ```
 src/
-├── common/                     # Shared utilities (SparkSession, Nessie helpers)
-├── etl/
+├── common/                     # SparkSession factory + Nessie branch helpers + Iceberg DDL generator
+│   ├── spark_factory.py        # get_spark(app_name) — config from spark-defaults.conf
+│   ├── nessie_manager.py       # create_branch / merge_branch / create_tag / set_spark_branch / ...
+│   └── iceberg_schema.py       # schema_to_ddl(StructType) — generates Iceberg column DDL with NOT NULL
+├── pipelines/
 │   ├── bronze/                 # Source download + Iceberg ingestion (no separate landing zone)
-│   │   ├── ingest_yellow_taxi.py   # NYC TLC yellow taxi → nessie.bronze.yellow_taxi
-│   │   └── ingest_zone_lookup.py   # Taxi zone lookup → nessie.bronze.taxi_zone_lookup
+│   │   ├── ingest_yellow_taxi.py     # NYC TLC yellow taxi → nessie.bronze.yellow_taxi (WAP per month)
+│   │   └── ingest_zone_lookup.py     # Taxi zone lookup → nessie.bronze.taxi_zone_lookup
 │   ├── silver/                 # Bronze → Silver (clean, conform, deduplicate)
+│   │   ├── clean_yellow_taxi.py      # WAP per month, audit on drop ratio, quarantine on fail
+│   │   ├── clean_zone_lookup.py      # full refresh, row-count audit
+│   │   └── reset_silver.py           # drops all silver refs and rebuilds from main
 │   └── gold/                   # Silver → Gold (join, aggregate, ML features)
-├── ml/                         # ML experiments (MLflow tracking)
+│       ├── build_yellow_taxi_trips.py        # trip-level enriched + time features (WAP on main)
+│       └── aggregate_demand_zone_hour.py     # (zone, hour) demand aggregate (WAP on main)
+├── ml/                         # ML training scripts (Spark MLlib + MLflow), gold-only
+│   ├── common.py                       # Shared helpers + train_regression() — full GBT skeleton (Spark+MLflow setup,
+│   │                                   #   load, optional pre-filter, temporal split, fit, evaluate, log) used by all 3 scripts
+│   ├── fare_prediction.py              # Use case 1 — config + main(); calls train_regression
+│   ├── trip_duration.py                # Use case 2 — same, with pre_filter to drop trip_duration_minutes <= 0
+│   └── demand_forecast.py              # Use case 3 — same, with year_col="hour_year" for the temporal split
 └── notebooks/                  # Jupyter notebooks, split per medallion layer
-    ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019), preprocess.ipynb (Spark, full-dataset EDA), verify_iceberg.ipynb
+    ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019),
+    │                           # preprocess.ipynb (Spark, full-dataset EDA → silver-rule evidence),
+    │                           # verify_iceberg.ipynb
     ├── silver/                 # verify_iceberg.ipynb
-    └── gold/                   # feature engineering, ML prep
+    ├── gold/                   # verify_iceberg.ipynb (trips + demand audits)
+    └── ml/                     # *_diagnostics.ipynb (one per ML use case, loads latest MLflow run)
 ```
 
 ### Code Style
@@ -127,79 +143,59 @@ class MyService:
         return data
 ```
 
-## Testing
+## Declaring a Schema in a Pipeline
 
-### Test Structure
-
-```
-tests/
-├── __init__.py
-├── test_core.py
-├── test_ingestion.py
-├── test_ml_ops.py
-└── conftest.py
-```
-
-### Writing Tests
+Every pipeline declares its target Iceberg schema at the top of the file as a
+`StructType` with explicit nullability, then creates the table with SQL DDL
+generated from that schema. The pattern:
 
 ```python
-import pytest
-from src.core import SparkSessionBuilder, CatalogManager
+from pyspark.sql.types import (
+    DoubleType, LongType, StringType, StructField, StructType, TimestampNTZType,
+)
+from common.iceberg_schema import schema_to_ddl
 
+# 1. Declare — NOT NULL only where the pipeline provably guarantees it.
+TARGET_SCHEMA = StructType([
+    StructField("pickup_datetime", TimestampNTZType(), nullable=False),
+    StructField("fare_amount",     DoubleType(),       nullable=False),
+    StructField("airport_fee",     DoubleType(),       nullable=True),   # year-dependent
+    # ...
+])
 
-@pytest.fixture
-def spark():
-    """Provide Spark session for tests."""
-    return SparkSessionBuilder.build(
-        app_name="test",
-        master="local[*]"
+# 2. Create — SQL DDL generated from the StructType.
+spark.sql(f"""
+    CREATE TABLE {TARGET} (
+        {schema_to_ddl(TARGET_SCHEMA)}
+    ) USING iceberg
+    PARTITIONED BY (months(pickup_datetime))
+    TBLPROPERTIES (
+        'format-version' = '2',
+        'write.spark.check-nullability' = 'false'
     )
+""")
 
-
-@pytest.fixture
-def catalog_manager(spark):
-    """Provide catalog manager."""
-    return CatalogManager(spark)
-
-
-def test_create_database(catalog_manager):
-    """Test database creation."""
-    result = catalog_manager.create_database("test_db")
-    assert result is True
-
-
-def test_list_tables_empty(catalog_manager):
-    """Test listing empty database."""
-    catalog_manager.create_database("empty_db")
-    tables = catalog_manager.list_tables("empty_db")
-    assert tables == []
-
-
-@pytest.mark.parametrize("db_name", ["db1", "db2", "db3"])
-def test_multiple_databases(catalog_manager, db_name):
-    """Test creating multiple databases."""
-    result = catalog_manager.create_database(db_name)
-    assert result is True
+# 3. Write — plain append; Iceberg row-level writer enforces NOT NULL on actual values.
+df.writeTo(TARGET).append()
 ```
 
-### Running Tests
+`write.spark.check-nullability = 'false'` is required because Spark does not
+propagate `filter(isNotNull)` / `between(...)` into the DataFrame's schema, so
+without it the planner would reject the write into a `NOT NULL` column.
 
-```bash
-# Run all tests
-pytest
+## Verification
 
-# Run specific test
-pytest tests/test_core.py::test_create_database
+This PoC does not ship a unit-test suite. Pipeline correctness is verified
+end-to-end through the WAP audit gates (drop-ratio thresholds, row-count parity,
+pickup conservation, zero-NULL-zone checks) and through the interactive notebooks:
 
-# Run with verbose output
-pytest -v
+- [src/notebooks/bronze/verify_iceberg.ipynb](../src/notebooks/bronze/verify_iceberg.ipynb) — Iceberg metadata, snapshots, partitions, data quality for bronze.
+- [src/notebooks/silver/verify_iceberg.ipynb](../src/notebooks/silver/verify_iceberg.ipynb) — Nessie refs, schema, snapshots, growth-by-yearly-tag, partitions, cleaning-rule assertions, bronze↔silver retention, zone-lookup orphan detection.
+- [src/notebooks/gold/verify_iceberg.ipynb](../src/notebooks/gold/verify_iceberg.ipynb) — schemas, snapshots, partitions, quality assertions, silver↔gold row-count parity, `sum(n_pickups)` conservation.
 
-# Run with coverage
-pytest --cov=src
-
-# Run only fast tests
-pytest -m "not slow"
-```
+When the schema changes (e.g. tightening `nullable=False`), re-run the verify
+notebook for the affected layer and confirm that `printSchema()` reflects the
+new contract.
 
 ## Notebooks
 
@@ -467,4 +463,4 @@ docker exec container-name nslookup service-name
 
 ---
 
-**Last Updated**: January 2026
+**Last Updated**: May 2026

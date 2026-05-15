@@ -39,7 +39,7 @@ This document details the architectural decisions and technical rationale behind
 
 - **Open table format**: Not vendor-locked
 - **ACID guarantees**: Full transaction support
-- **Schema evolution**: Non-breaking schema updates. Demonstrated in bronze ingestion: the `cbd_congestion_fee` field (added by NYC TLC in Jan 2025) is added via `ALTER TABLE ADD COLUMNS` on the ETL branch when the first 2025 file is ingested. Pre-2025 data returns `NULL` for this column automatically.
+- **Schema evolution**: Non-breaking schema updates. Demonstrated in bronze ingestion: the `cbd_congestion_fee` field (added by NYC TLC in Jan 2025) is added via `ALTER TABLE ADD COLUMNS` on the WAP branch when the first 2025 file is ingested. Pre-2025 data returns `NULL` for this column automatically.
 - **Hidden partitioning**: Partition pruning without exposing partition columns
 - **Snapshot isolation**: Multiple readers/writers without conflicts
 
@@ -56,15 +56,55 @@ Data Writers → Iceberg → Nessie (Single Catalog) → MinIO (Storage)
 Following Strengholt's centralized medallion pattern, Nessie namespaces represent layers:
 
 ```
-nessie.bronze.yellow_taxi          — raw ingestion, PARTITIONED BY month(tpep_pickup_datetime)
-nessie.bronze.taxi_zone_lookup     — reference table, unpartitioned (~265 rows)
-nessie.silver.yellow_taxi          — cleaned, typed, deduplicated
-nessie.silver.taxi_zone_lookup     — standardized zone names
-nessie.gold.taxi_analytics         — joined with zones, aggregated, ML features
+nessie.bronze.yellow_taxi              — raw ingestion, PARTITIONED BY month(tpep_pickup_datetime)
+nessie.bronze.taxi_zone_lookup         — reference table, unpartitioned (~265 rows)
+nessie.silver.yellow_taxi              — cleaned, typed, deduplicated
+nessie.silver.taxi_zone_lookup         — standardized zone names
+nessie.gold.yellow_taxi_trips          — trip-level: silver enriched with denormalized zones (broadcast left join)
+                                         and derived time features (year/month/week/dow/hour, trip_duration_minutes);
+                                         partitioned by month(pickup_datetime)
+nessie.gold.pickup_demand_zone_hour    — aggregated to (pu_location_id, hour_bucket) where
+                                         hour_bucket = date_trunc('hour', tpep_pickup_datetime);
+                                         partitioned by month(hour_bucket); target dataset for the demand model
 ```
 
 No separate landing zone: bronze ingestion downloads source data and writes Iceberg tables
 directly. Iceberg hidden partitioning manages the physical file layout in MinIO.
+
+### Layer Consumption Policy
+
+- **ML pipelines must read only from gold** (`nessie.gold.*` on `main`). Anything under
+  `src/ml/` is restricted to gold tables — silver is internal to the data platform.
+- **Data engineers and data scientists** may read from any layer for ad-hoc exploration,
+  EDA or rule justification. Notebooks under `src/notebooks/bronze/` and
+  `src/notebooks/silver/` exist for exactly this.
+- This is the strict interpretation of Strengholt's medallion pattern: production-like
+  consumers (ML) only see curated, validated data, while humans retain full visibility
+  into the lower layers for debugging and design decisions.
+
+### Schema Strictness Across Layers
+
+Each pipeline declares its own `StructType` schema with explicit nullability and
+creates the Iceberg table via `CREATE TABLE ... USING iceberg` SQL DDL — generated
+from the schema by `src/common/iceberg_schema.py.schema_to_ddl()`. This puts the
+`NOT NULL` constraints in Iceberg's column metadata, not just in convention.
+
+| Layer       | Policy                                                                                       |
+|-------------|----------------------------------------------------------------------------------------------|
+| Bronze      | All columns `NULLABLE` — bronze is faithful to source, including its missing values.         |
+| Silver      | `NOT NULL` on every column the `clean()` function provably filters (datetimes, IDs, amounts checked `>= 0`, fields with `isin`/`between`/`isNotNull`). Surcharges not filtered (`extra`, `mta_tax`, `improvement_surcharge`) and year-dependent fields (`congestion_surcharge`, `airport_fee`, `cbd_congestion_fee`) stay `NULLABLE`. |
+| Gold        | `NOT NULL` on every column traceable to a silver `NOT NULL` column, on every derived time feature (year/month/week/dow/hour, `trip_duration_minutes`), and on every zone field the audit gate guarantees (`pu_borough`, `pu_zone`, `do_borough`, `do_zone`). `pu_service_zone` and `do_service_zone` stay `NULLABLE` because silver's `taxi_zone_lookup.service_zone` is not filtered. |
+
+**`passenger_count` is `NOT NULL` from silver onward** — the existing
+`between(1, 6)` filter in `clean()` drops `NULL` implicitly (`NULL BETWEEN 1 AND 6 → NULL`).
+Trips with no passenger count never enter silver.
+
+**Iceberg property `write.spark.check-nullability = false`** is set on every table.
+This disables Spark/Iceberg's planning-time nullability check (which would otherwise
+reject `nullable=True` DataFrames into `NOT NULL` columns, since Spark's `filter()`
+does not propagate non-null predicates into the DataFrame schema). The row-level
+check in the Iceberg/Parquet writer is the real safety net: if any actual `NULL`
+value reached a `NOT NULL` column, the write would fail at row level.
 
 ### Trade-offs
 
@@ -81,8 +121,8 @@ directly. Iceberg hidden partitioning manages the physical file layout in MinIO.
 ```
 Spark Master (8080, 7077)
     ├── Worker 1 (8081)
-    ├── Worker 2 (8082)
-    └── Driver (4040)
+    ├── Driver in spark-master (4040)        — invoked by `spark-submit` from inside spark-master
+    └── Driver in spark-notebook (4041)      — Jupyter-resident driver for interactive work
 ```
 
 #### Configuration Strategy
@@ -94,9 +134,10 @@ Spark Master (8080, 7077)
 ### Resource Allocation
 
 - Master: 1 core (orchestration only)
-- Workers: 2 cores each, 2GB memory (tunable)
-- Driver (Spark heap): 1GB
-- Notebook container (`spark-notebook`): 2 cores / 2GB OS memory — wider than Spark driver heap to leave room for pandas-based exploration on a full month (~7.7M rows)
+- Worker: 2 cores, 2GB memory (Spark heap 1536m, ~500MB headroom for JVM overhead)
+- Notebook container (`spark-notebook`): 2 cores / 4GB OS memory — wider than the
+  Spark driver heap to leave room for pandas-based exploration on a full month
+  (~7.7M rows) and for MLflow client serialization during model logging
 
 ### Trade-offs
 
@@ -172,16 +213,36 @@ OpenMetadata Server
 ### Pipeline Integration
 
 ```
-ML Code
+src/ml/{fare_prediction,trip_duration,demand_forecast}.py
+    ↓ (reads only nessie.gold.* on main — strict medallion)
+Spark MLlib pipeline (StringIndexer → VectorAssembler → GBTRegressor)
     ↓
-MLflow (Tracking Server)
-    ├── PostgreSQL (Runs metadata)
-    └── MinIO S3 (Artifacts)
+MLflow (Tracking Server, behind the `ml` profile)
+    ├── PostgreSQL (run metadata, params, metrics)
+    └── MinIO S3 (PipelineModel artifacts in mlflow-artifacts bucket)
         ↓
-    Model Registry
+    Model Registry (MLflow)
         ↓
-    Serve/Deploy
+    Diagnostics notebooks load the latest run
+    (predicted vs actual, residuals, feature importance, per-year drift)
 ```
+
+### ML Use Cases
+
+| # | Script                  | Target                  | Source table                          | Year split                       |
+|---|-------------------------|-------------------------|---------------------------------------|----------------------------------|
+| 1 | `fare_prediction.py`    | `fare_amount`           | `nessie.gold.yellow_taxi_trips`       | train: 2019/2020/2022/2023; test: 2025 |
+| 2 | `trip_duration.py`      | `trip_duration_minutes` | `nessie.gold.yellow_taxi_trips`       | same                             |
+| 3 | `demand_forecast.py`    | `n_pickups`             | `nessie.gold.pickup_demand_zone_hour` | same (year column: `hour_year`)  |
+
+All three share the `train_regression(...)` helper in `src/ml/common.py`, which
+encapsulates Spark/MLflow setup, optional pre-filter, temporal split, pipeline
+build, fit, evaluate and logging. Each use-case script just declares its
+constants (source, label, feature lists) and calls the helper. Default GBT
+hyperparameters (`DEFAULT_GBT_PARAMS = {maxIter: 50, maxDepth: 6, stepSize: 0.1,
+seed: 42}`) are baseline-only — overridable per script via `gbt_params`.
+
+Pre-trip / known-at-pickup features only — no leakage from post-trip amounts.
 
 ### Trade-offs
 
@@ -230,24 +291,32 @@ Service Discovery: Internal DNS (e.g., minio:9000)
 
 ## 9. Data Flow Patterns
 
-### Batch Ingestion Pattern (Medallion)
+### Batch Ingestion Pattern (Medallion + WAP)
+
+Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 
 ```
 1. Source Data (NYC TLC Parquet/CSV)
 2. Bronze: Spark downloads + writes Iceberg table (nessie.bronze.*)
+           — WAP branch off `bronze`, audit, merge back, drop branch
 3. Silver: Spark reads bronze, cleans/deduplicates, writes (nessie.silver.*)
+           — non-raising audit; failed months → `review/silver-...` quarantine tag
 4. Gold:   Spark reads silver, joins/aggregates, writes (nessie.gold.*)
-5. Dremio Query Layer / ML Features
+           — strict audit (row-count parity for trips, pickup conservation for demand)
+5. Dremio Query Layer / ML training
 ```
 
 ### ML Pipeline Pattern
 
 ```
-1. Feature Engineering (Spark)
-2. Model Training (MLflow experiment)
-3. Model Registry (MLflow)
-4. Batch Predictions (Spark)
-5. Results Storage (Iceberg)
+1. Read gold (only nessie.gold.* on `main`)        — src/ml/common.py.get_ml_spark
+2. Stratified split into train/val/test_id/test_ood — src/ml/common.py.make_splits
+3. Three-phase workflow                            — algorithm comparison → tuning → year-subset curve
+4. Spark MLlib pipeline                            — StringIndexer (+ optional OHE/Scaler) → VectorAssembler → estimator
+5. Train + evaluate                                — RMSE, MAE, R² on every split
+6. Log to MLflow                                   — params, metrics, PipelineModel artifact per run
+7. Register the final model                        — Pareto champion/challenger (val_rmse + test_id_rmse guard)
+8. Diagnostics notebook                            — load via models:/{name}@champion, drift analysis
 ```
 
 ### Query Pattern
@@ -297,7 +366,7 @@ Service Discovery: Internal DNS (e.g., minio:9000)
 ### Current Limits
 
 - Single MinIO node (not distributed)
-- 2 Spark workers
+- 1 Spark worker + 1 notebook driver
 - Single OpenMetadata instance
 - Single MLflow instance
 
@@ -341,4 +410,4 @@ Service Discovery: Internal DNS (e.g., minio:9000)
 
 ---
 
-**Last Updated**: March 2026
+**Last Updated**: May 2026
