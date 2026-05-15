@@ -48,8 +48,14 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
 
     Safe to call repeatedly: existing branches are left untouched (never
     dropped or recreated). If a branch is truly stale from a prior Nessie
-    instance, an ETL merge will raise NoCommonAncestorError with a clear
-    message directing to manual reset.
+    instance, a WAP merge will raise NoCommonAncestorError with a
+    clear message directing to manual reset.
+
+    Also seeds nessie.gold on main itself: gold lives on main (no separate
+    gold branch). Seeding gives main a real namespace commit so wap/gold-*
+    branches forked from main share a non-trivial ancestor with it. Without
+    this seed, the very first gold merge into main throws a spurious
+    "No common ancestor" because both refs sit at the initial empty commit.
     """
     for branch in PERSISTENT_BRANCHES:
         if branch == "main":
@@ -62,7 +68,9 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
         # Seed the branch with a namespace commit (idempotent).
         set_spark_branch(spark, branch)
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS nessie.{branch}")
+    # Seed the gold namespace on main (gold lives on main).
     set_spark_branch(spark, "main")
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
 
 
 def create_tag(spark: SparkSession, name: str, from_ref: str = "main") -> None:
@@ -78,11 +86,13 @@ def set_spark_branch(spark: SparkSession, branch: str) -> SparkSession:
     return spark
 
 
-def etl_branch_name(layer: str, table: str, year: int, month: int) -> str:
-    return f"etl/{layer}-{table}-{year}-{month:02d}"
+def wap_branch_name(layer: str, table: str, year: int, month: int) -> str:
+    """Working-branch name for one WAP cycle (Write → Audit → Publish)."""
+    return f"wap/{layer}-{table}-{year}-{month:02d}"
 
 
-def etl_tag_name(layer: str, table: str, year: int) -> str:
+def yearly_tag_name(layer: str, table: str, year: int) -> str:
+    """Yearly audit tag created on the persistent layer after the last merged month."""
     return f"{layer}-{table}-{year}"
 
 
