@@ -4,25 +4,23 @@ Reads only nessie.nyc.pickup_demand_zone_hour on main (gold). Per-bucket regress
 with calendar + zone features (no lag features). Three-phase workflow per
 script run, all logged to the same MLflow experiment with `phase` tag:
 
-  Phase 1 — algorithm comparison: LR, RF, GBT with default hyperparameters.
+  Phase 1 — algorithm comparison: Ridge, RF, GBT with default hyperparameters.
   Phase 2 — hyperparameter tuning of the algorithm with lowest val RMSE.
-  Phase 3 — learning curve over cumulative year subsets with the tuned model.
+  Phase 3 — learning curve over cumulative year subsets, for every algorithm.
 """
 
 import sys
 
 from ml.ml_common import (
-    DEFAULT_PARAMS,
     MLFLOW_TRACKING_URI,
-    PARAM_GRIDS,
     TEST_YEARS,
-    TRAIN_YEAR_SUBSETS,
     algorithm_pipeline_config,
     build_regression_pipeline,
     get_ml_spark,
     make_estimator,
     make_splits,
     register_final_model,
+    resolve_run_config,
     setup_mlflow,
     train_and_log_run,
 )
@@ -42,7 +40,7 @@ NUMERICAL_COLS = [
 CATEGORICAL_COLS = [
     "pu_location_id", "pu_borough", "pu_service_zone",
 ]
-ALGORITHMS = ("lr", "rf", "gbt")
+ALGORITHMS = ("ridge", "rf", "gbt")
 
 
 def _build_pipeline(algorithm: str, params: dict):
@@ -66,9 +64,18 @@ def main() -> None:
     try:
         setup_mlflow(EXPERIMENT)
 
+        cfg = resolve_run_config()
+        if cfg.fast:
+            print(
+                f"\n*** FAST MODE — sampling {cfg.sample_fraction:.0%} of the gold "
+                "table, shrunk grids/subsets. Smoke test only. ***\n"
+            )
+
         # Project to just the label + features — caching only the columns the
         # model uses keeps the cached split small on a 1 GB executor heap.
         df = spark.table(SOURCE).select(LABEL_COL, *NUMERICAL_COLS, *CATEGORICAL_COLS)
+        if cfg.sample_fraction is not None:
+            df = df.sample(cfg.sample_fraction, seed=42)
         train, val, test_id, test_ood = make_splits(df, YEAR_COL, TEST_YEARS)
         train, val, test_id, test_ood = (
             train.cache(), val.cache(), test_id.cache(), test_ood.cache(),
@@ -99,7 +106,7 @@ def main() -> None:
         val_rmse: dict[str, float] = {}
         for algorithm in ALGORITHMS:
             print(f"\n--- {algorithm} ---")
-            params = DEFAULT_PARAMS[algorithm]
+            params = cfg.default_params[algorithm]
             _, metrics = train_and_log_run(
                 splits=splits,
                 label_col=LABEL_COL,
@@ -118,7 +125,7 @@ def main() -> None:
         print(f"\n=== Phase 2: Tuning {winner} ===")
         best_params: dict | None = None
         best_val_rmse = float("inf")
-        for i, params in enumerate(PARAM_GRIDS[winner]):
+        for i, params in enumerate(cfg.param_grids[winner]):
             print(f"\n--- {winner}-grid-{i}: {params} ---")
             _, metrics = train_and_log_run(
                 splits=splits,
@@ -136,54 +143,68 @@ def main() -> None:
         assert best_params is not None
         print(f"\n>>> Phase 2 best params: {best_params} (val RMSE = {best_val_rmse:.4f})")
 
-        # ============ Phase 3: Year-subset learning curve ============
-        print(f"\n=== Phase 3: Learning curve with tuned {winner} ===")
+        # ============ Phase 3: Year-subset learning curve (all algorithms) ============
+        # Each cumulative year subset trains a fresh model per algorithm, all
+        # evaluated on the same val/test_id/test_ood — so the curve shows
+        # whether more historical data helps or hurts each algorithm family.
+        # The Phase-1 winner runs with its Phase-2 best_params; the others run
+        # with DEFAULT_PARAMS (the `tuned` tag records which is which).
+        print("\n=== Phase 3: Learning curve (all algorithms) ===")
         curve: list[dict] = []
-        last_run_id: str | None = None
-        last_metrics: dict[str, dict[str, float]] | None = None
-        for train_years in TRAIN_YEAR_SUBSETS:
-            print(f"\n--- Train years: {train_years} ---")
-            sub_train = train.filter(train[YEAR_COL].isin(train_years))
-            sub_train_count = sub_train.count()
-            print(f"  train subset: {sub_train_count:,} rows")
-            if sub_train_count == 0:
-                print(f"  Skipping {train_years}: empty after filter.")
-                continue
+        winner_run_id: str | None = None
+        winner_metrics: dict[str, dict[str, float]] | None = None
+        for algorithm in ALGORITHMS:
+            params = best_params if algorithm == winner else cfg.default_params[algorithm]
+            tuned = algorithm == winner
+            print(f"\n--- {algorithm} ({'tuned' if tuned else 'default'} params) ---")
+            for train_years in cfg.train_year_subsets:
+                sub_train = train.filter(train[YEAR_COL].isin(train_years))
+                sub_train_count = sub_train.count()
+                print(f"  train years {train_years}: {sub_train_count:,} rows")
+                if sub_train_count == 0:
+                    print(f"  Skipping {train_years}: empty after filter.")
+                    continue
 
-            sub_splits = {**splits, "train": sub_train}
-            run_id, metrics = train_and_log_run(
-                splits=sub_splits,
-                label_col=LABEL_COL,
-                pipeline=_build_pipeline(winner, best_params),
-                run_name=f"subset-up-to-{train_years[-1]}",
-                tags={
-                    **common_tags,
-                    "phase": "subset",
-                    "algorithm": winner,
-                    "train_years": str(train_years),
-                },
-                extra_params={
-                    **common_params,
-                    **best_params,
-                    "train_count": sub_train_count,
-                    "n_train_years": len(train_years),
-                },
-            )
-            last_run_id, last_metrics = run_id, metrics
-            curve.append({
-                "train_years": train_years,
-                **{f"{s}_rmse": metrics[s]["rmse"] for s in metrics},
-            })
-            _print_metrics(metrics)
+                sub_splits = {**splits, "train": sub_train}
+                run_id, metrics = train_and_log_run(
+                    splits=sub_splits,
+                    label_col=LABEL_COL,
+                    pipeline=_build_pipeline(algorithm, params),
+                    run_name=f"subset-{algorithm}-up-to-{train_years[-1]}",
+                    tags={
+                        **common_tags,
+                        "phase": "subset",
+                        "algorithm": algorithm,
+                        "train_years": str(train_years),
+                        "tuned": str(tuned),
+                    },
+                    extra_params={
+                        **common_params,
+                        **params,
+                        "train_count": sub_train_count,
+                        "n_train_years": len(train_years),
+                    },
+                )
+                if algorithm == winner:
+                    winner_run_id, winner_metrics = run_id, metrics
+                curve.append({
+                    "algorithm": algorithm,
+                    "train_years": train_years,
+                    **{f"{s}_rmse": metrics[s]["rmse"] for s in metrics},
+                })
+                _print_metrics(metrics)
 
         # Final summary
         print("\n=== Summary (learning curve, RMSE per split) ===")
-        header = f"{'train_years':<28} {'val':>10} {'test_id':>10} {'test_ood':>10}"
+        header = (
+            f"{'algorithm':<10} {'train_years':<28} "
+            f"{'val':>10} {'test_id':>10} {'test_ood':>10}"
+        )
         print(header)
         print("-" * len(header))
         for r in curve:
             print(
-                f"{str(r['train_years']):<28} "
+                f"{r['algorithm']:<10} {str(r['train_years']):<28} "
                 f"{r['val_rmse']:>10.4f} {r['test_id_rmse']:>10.4f} {r['test_ood_rmse']:>10.4f}"
             )
 
@@ -191,17 +212,17 @@ def main() -> None:
         # Champion / challenger pattern: new version is registered every time;
         # if it beats the current @champion on val_rmse it gets promoted, else
         # it stays as @challenger.
-        if last_run_id is not None and last_metrics is not None:
+        if winner_run_id is not None and winner_metrics is not None:
             version_description = (
                 f"Algo: {winner}. Params: {best_params}. "
-                f"Train years: {TRAIN_YEAR_SUBSETS[-1]}.\n"
+                f"Train years: {cfg.train_year_subsets[-1]}.\n"
                 f"Source: {SOURCE} (Nessie main). Target: {LABEL_COL}.\n"
                 f"Numerical features: {', '.join(NUMERICAL_COLS)}.\n"
                 f"Categorical features: {', '.join(CATEGORICAL_COLS)}.\n"
                 f"Scores: "
-                f"val_rmse={last_metrics['val']['rmse']:.4f}, "
-                f"test_id_rmse={last_metrics['test_id']['rmse']:.4f}, "
-                f"test_ood_rmse={last_metrics['test_ood']['rmse']:.4f}."
+                f"val_rmse={winner_metrics['val']['rmse']:.4f}, "
+                f"test_id_rmse={winner_metrics['test_id']['rmse']:.4f}, "
+                f"test_ood_rmse={winner_metrics['test_ood']['rmse']:.4f}."
             )
             model_description = (
                 f"Spark MLlib regression for {EXPERIMENT}. "
@@ -222,20 +243,20 @@ def main() -> None:
             }
             version_tags_dict = {
                 "algorithm": winner,
-                "n_train_years": str(len(TRAIN_YEAR_SUBSETS[-1])),
-                "train_years": str(TRAIN_YEAR_SUBSETS[-1]),
-                "val_rmse":      f"{last_metrics['val']['rmse']:.4f}",
-                "val_mae":       f"{last_metrics['val']['mae']:.4f}",
-                "val_r2":        f"{last_metrics['val']['r2']:.4f}",
-                "test_id_rmse":  f"{last_metrics['test_id']['rmse']:.4f}",
-                "test_id_mae":   f"{last_metrics['test_id']['mae']:.4f}",
-                "test_id_r2":    f"{last_metrics['test_id']['r2']:.4f}",
-                "test_ood_rmse": f"{last_metrics['test_ood']['rmse']:.4f}",
-                "test_ood_mae":  f"{last_metrics['test_ood']['mae']:.4f}",
-                "test_ood_r2":   f"{last_metrics['test_ood']['r2']:.4f}",
+                "n_train_years": str(len(cfg.train_year_subsets[-1])),
+                "train_years": str(cfg.train_year_subsets[-1]),
+                "val_rmse":      f"{winner_metrics['val']['rmse']:.4f}",
+                "val_mae":       f"{winner_metrics['val']['mae']:.4f}",
+                "val_r2":        f"{winner_metrics['val']['r2']:.4f}",
+                "test_id_rmse":  f"{winner_metrics['test_id']['rmse']:.4f}",
+                "test_id_mae":   f"{winner_metrics['test_id']['mae']:.4f}",
+                "test_id_r2":    f"{winner_metrics['test_id']['r2']:.4f}",
+                "test_ood_rmse": f"{winner_metrics['test_ood']['rmse']:.4f}",
+                "test_ood_mae":  f"{winner_metrics['test_ood']['mae']:.4f}",
+                "test_ood_r2":   f"{winner_metrics['test_ood']['r2']:.4f}",
             }
             mv, alias, _promoted = register_final_model(
-                run_id=last_run_id,
+                run_id=winner_run_id,
                 name=EXPERIMENT,
                 version_description=version_description,
                 version_tags=version_tags_dict,

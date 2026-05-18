@@ -10,9 +10,11 @@ logger.
 """
 
 import os
+import sys
 import time
 from datetime import datetime
 from functools import reduce
+from typing import NamedTuple
 
 # MLflow + MinIO env. spark-master inherits AWS_* from docker-compose but not
 # MLFLOW_*; setting them before importing mlflow lets boto3 reach MinIO when
@@ -31,6 +33,7 @@ from pyspark.ml.feature import (  # noqa: E402
     StandardScaler,
     StringIndexer,
     VectorAssembler,
+    VectorIndexer,
 )
 from pyspark.ml.regression import (  # noqa: E402
     GBTRegressor,
@@ -81,7 +84,20 @@ def get_ml_spark(app_name: str) -> SparkSession:
 
 
 def setup_mlflow(experiment_name: str) -> None:
+    """Point MLflow at the tracking server and activate `experiment_name`.
+
+    If the experiment was soft-deleted in the UI, mlflow.set_experiment would
+    raise — MLflow won't reuse a deleted name, it can only be restored or
+    permanently purged. Restore it so the script survives a half-done cleanup.
+    Restoring brings back any old runs too; delete individual runs in the UI
+    if you want them gone.
+    """
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    client = MlflowClient()
+    exp = client.get_experiment_by_name(experiment_name)
+    if exp is not None and exp.lifecycle_stage == "deleted":
+        client.restore_experiment(exp.experiment_id)
+        progress(f"Restored soft-deleted MLflow experiment '{experiment_name}'.")
     mlflow.set_experiment(experiment_name)
 
 
@@ -127,6 +143,21 @@ def make_splits(
     )
 
 
+# VectorIndexer treats an assembled-vector column as categorical when it has at
+# most this many distinct values, continuous otherwise — low-cardinality fields
+# (borough, vendor, ratecode, payment type) become genuine categorical splits
+# while the ~265-value location IDs fall through to continuous.
+TREE_MAX_CATEGORIES = 32
+
+# maxBins for the tree estimators. Spark's buildMetadata requires
+# maxBins >= the arity of every feature the trees still treat as categorical.
+# The StringIndexer-coded location IDs carry ~265 levels (+1 for
+# handleInvalid="keep"), so the default maxBins (32) fails the check before
+# VectorIndexer's continuous re-stamp can take effect. 300 clears that headroom
+# and is harmless for continuous features (it only bounds their binning).
+TREE_MAX_BINS = 300
+
+
 def build_regression_pipeline(
     numerical_cols: list[str],
     categorical_cols: list[str],
@@ -134,14 +165,25 @@ def build_regression_pipeline(
     estimator,
     one_hot: bool = False,
     scale: bool = False,
+    vector_index: bool = False,
 ) -> Pipeline:
-    """StringIndex categoricals → optionally OneHot → VectorAssemble → optionally Scale → estimator.
+    """StringIndex categoricals → optional OneHot → VectorAssemble →
+    optional VectorIndexer → estimator. With scale=True the numerical columns
+    are StandardScaled before the final assemble.
 
-    Tree-based estimators (GBT, RF) work fine with integer-encoded categoricals
-    so leave one_hot=False, scale=False (the default). Linear models (LR) need
-    one_hot=True + scale=True to be a fair baseline — otherwise StringIndexer
-    output gets read as an ordinal variable and unscaled features make
-    regularization meaningless.
+    Linear model (ridge): one_hot=True + scale=True — StringIndexer output
+    would otherwise be read as an ordinal variable, and unscaled numerical
+    features make regularization meaningless. Only the numerical columns are
+    scaled: dividing a sparse one-hot column by its (tiny) standard deviation
+    would inflate rare categories to huge magnitudes and wreck the linear fit.
+
+    Tree models (RF, GBT): vector_index=True. VectorAssembler alone leaves the
+    StringIndexer codes carrying their nominal metadata, so the trees try to
+    treat a ~265-value location ID as a categorical split and fail the maxBins
+    check. VectorIndexer re-stamps the assembled vector — columns with at most
+    TREE_MAX_CATEGORIES distinct values become genuine categorical splits,
+    wider ones (location IDs) become continuous. This is the documented Spark
+    MLlib pattern for tree regressors.
     """
     indexers = [
         StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
@@ -156,33 +198,71 @@ def build_regression_pipeline(
     else:
         encoders = []
         cat_feature_cols = [f"{c}_idx" for c in categorical_cols]
-    feature_cols = numerical_cols + cat_feature_cols
+    stages: list = [*indexers, *encoders]
+
     # handleInvalid="error": silver guarantees the feature columns are non-NULL,
     # so a NULL here means a real bug (silver regressed, or gold left a hole).
-    assembler = VectorAssembler(
-        inputCols=feature_cols,
-        outputCol="raw_features" if scale else "features",
-        handleInvalid="error",
-    )
-    stages: list = [*indexers, *encoders, assembler]
     if scale:
+        # Scale only the numerical block. Assemble it on its own, StandardScale
+        # it, then assemble the scaled numericals with the (untouched 0/1)
+        # one-hot columns. Scaling the one-hot columns instead would divide each
+        # by its near-zero std and blow rare categories up to magnitudes in the
+        # thousands — the linear fit then mispredicts catastrophically on those
+        # rows (huge RMSE while MAE stays normal).
+        stages.append(VectorAssembler(
+            inputCols=numerical_cols,
+            outputCol="numerical_raw",
+            handleInvalid="error",
+        ))
         stages.append(StandardScaler(
-            inputCol="raw_features",
-            outputCol="features",
+            inputCol="numerical_raw",
+            outputCol="numerical_scaled",
             withMean=False,
             withStd=True,
         ))
-    estimator.setLabelCol(label_col).setFeaturesCol("features")
+        assembler_inputs = ["numerical_scaled"] + cat_feature_cols
+    else:
+        assembler_inputs = numerical_cols + cat_feature_cols
+
+    stages.append(VectorAssembler(
+        inputCols=assembler_inputs,
+        outputCol="assembled_features",
+        handleInvalid="error",
+    ))
+    features_col = "assembled_features"
+
+    if vector_index:
+        # handleInvalid="keep": a held-out year may carry a categorical value
+        # unseen at fit time — bucket it rather than failing the transform.
+        stages.append(VectorIndexer(
+            inputCol=features_col,
+            outputCol="indexed_features",
+            maxCategories=TREE_MAX_CATEGORIES,
+            handleInvalid="keep",
+        ))
+        features_col = "indexed_features"
+
+    estimator.setLabelCol(label_col).setFeaturesCol(features_col)
     stages.append(estimator)
     return Pipeline(stages=stages)
 
 
 # Algorithm catalogue. Each script's Phase 1 (algorithm comparison) iterates
 # over these three estimators with the DEFAULT_PARAMS shown below; Phase 2
-# (tuning) iterates over PARAM_GRIDS[winner].
+# (tuning) iterates over PARAM_GRIDS[winner]. The three are distinct model
+# families: `ridge` is the linear baseline (LinearRegression with Huber loss
+# and the elastic-net mix pinned to pure L2 — regularized because the
+# one-hot-expanded location IDs make plain OLS prone to overfit), `rf` is a
+# bagging ensemble and `gbt` a boosting ensemble.
 def make_estimator(algorithm: str, **params):
-    if algorithm == "lr":
-        return LinearRegression(**params)
+    if algorithm == "ridge":
+        # L2-regularized linear model (elastic-net mix fixed at 0). Huber loss
+        # instead of squared error: gold deliberately keeps upper-tail outliers
+        # (negotiated fares, airport runs), and a squared-error fit lets a
+        # handful of extreme rows dominate the objective — Huber caps each
+        # residual's influence past `epsilon`, the standard robust-regression
+        # remedy. Huber loss requires the pure-L2 mix, already pinned here.
+        return LinearRegression(loss="huber", elasticNetParam=0.0, **params)
     if algorithm == "rf":
         return RandomForestRegressor(**params)
     if algorithm == "gbt":
@@ -191,40 +271,104 @@ def make_estimator(algorithm: str, **params):
 
 
 def algorithm_pipeline_config(algorithm: str) -> dict:
-    """Preprocessing config per algorithm — linear models need OHE + scaling."""
-    if algorithm == "lr":
+    """Preprocessing config per algorithm — the linear model needs OHE +
+    scaling, the tree models need VectorIndexer to tag categorical splits."""
+    if algorithm == "ridge":
         return {"one_hot": True, "scale": True}
-    return {"one_hot": False, "scale": False}
+    return {"vector_index": True}
 
 
 DEFAULT_PARAMS: dict[str, dict] = {
-    "lr": {"regParam": 0.01, "elasticNetParam": 0.0},
-    "rf": {"numTrees": 20, "maxDepth": 8, "seed": 42},
-    "gbt": {"maxIter": 50, "maxDepth": 6, "stepSize": 0.1, "seed": 42},
+    "ridge": {"regParam": 0.1},   # elasticNetParam fixed at 0.0, loss="huber" by make_estimator
+    "rf": {"numTrees": 20, "maxDepth": 8, "maxBins": TREE_MAX_BINS, "seed": 42},
+    "gbt": {"maxIter": 50, "maxDepth": 6, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
 }
 
 # Compact grids — total runtime stays manageable on a local Spark cluster.
 PARAM_GRIDS: dict[str, list[dict]] = {
-    "lr": [
-        {"regParam": 0.0, "elasticNetParam": 0.0},
-        {"regParam": 0.01, "elasticNetParam": 0.0},
-        {"regParam": 0.1, "elasticNetParam": 0.0},
-        {"regParam": 0.01, "elasticNetParam": 0.5},
+    # Ridge sweeps the L2 penalty strength.
+    "ridge": [
+        {"regParam": 0.01},
+        {"regParam": 0.1},
+        {"regParam": 1.0},
+        {"regParam": 10.0},
     ],
     "rf": [
-        {"numTrees": 20, "maxDepth": 6, "seed": 42},
-        {"numTrees": 20, "maxDepth": 10, "seed": 42},
-        {"numTrees": 50, "maxDepth": 6, "seed": 42},
-        {"numTrees": 50, "maxDepth": 10, "seed": 42},
+        {"numTrees": 20, "maxDepth": 6, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"numTrees": 20, "maxDepth": 10, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"numTrees": 50, "maxDepth": 6, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"numTrees": 50, "maxDepth": 10, "maxBins": TREE_MAX_BINS, "seed": 42},
     ],
     "gbt": [
-        {"maxIter": 50, "maxDepth": 4, "stepSize": 0.1, "seed": 42},
-        {"maxIter": 50, "maxDepth": 6, "stepSize": 0.1, "seed": 42},
-        {"maxIter": 50, "maxDepth": 8, "stepSize": 0.1, "seed": 42},
-        {"maxIter": 100, "maxDepth": 6, "stepSize": 0.05, "seed": 42},
-        {"maxIter": 100, "maxDepth": 6, "stepSize": 0.1, "seed": 42},
+        {"maxIter": 50, "maxDepth": 4, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"maxIter": 50, "maxDepth": 6, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"maxIter": 50, "maxDepth": 8, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"maxIter": 100, "maxDepth": 6, "stepSize": 0.05, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"maxIter": 100, "maxDepth": 6, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
     ],
 }
+
+
+# ---- Fast mode (smoke test) ----------------------------------------------
+# A full three-phase run trains ~11 models on tens of millions of rows and
+# takes hours. Fast mode samples the gold table and shrinks the grids /
+# year-subsets so the whole pipeline — every algorithm, every phase, the
+# registry — runs end to end in minutes. It verifies the process completes
+# correctly; the metrics it produces are not meaningful.
+FAST_SAMPLE_FRACTION = 0.01
+FAST_TRAIN_YEAR_SUBSETS: list[list[int]] = [[2019], [2019, 2020, 2022, 2023]]
+FAST_DEFAULT_PARAMS: dict[str, dict] = {
+    "ridge": {"regParam": 0.1},
+    "rf": {"numTrees": 5, "maxDepth": 4, "maxBins": TREE_MAX_BINS, "seed": 42},
+    "gbt": {"maxIter": 5, "maxDepth": 3, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+}
+FAST_PARAM_GRIDS: dict[str, list[dict]] = {
+    "ridge": [{"regParam": 0.1}, {"regParam": 1.0}],
+    "rf": [
+        {"numTrees": 5, "maxDepth": 4, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"numTrees": 8, "maxDepth": 5, "maxBins": TREE_MAX_BINS, "seed": 42},
+    ],
+    "gbt": [
+        {"maxIter": 5, "maxDepth": 3, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+        {"maxIter": 8, "maxDepth": 4, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
+    ],
+}
+
+
+class RunConfig(NamedTuple):
+    """Resolved run parameters — full run vs fast-mode smoke test."""
+    fast: bool
+    sample_fraction: float | None  # None = read the full gold table
+    default_params: dict[str, dict]
+    param_grids: dict[str, list[dict]]
+    train_year_subsets: list[list[int]]
+
+
+def resolve_run_config(argv: list[str] | None = None) -> RunConfig:
+    """Pick full vs fast-mode parameters for a training script.
+
+    Fast mode is on when `--fast` appears in the script args (everything after
+    the .py on the spark-submit line) or ML_FAST_MODE=1 is set. Each script
+    calls this once in main() and reads grids / subsets / sample fraction off
+    the returned config instead of the module-level constants.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    fast = "--fast" in args or os.environ.get("ML_FAST_MODE") == "1"
+    if fast:
+        return RunConfig(
+            fast=True,
+            sample_fraction=FAST_SAMPLE_FRACTION,
+            default_params=FAST_DEFAULT_PARAMS,
+            param_grids=FAST_PARAM_GRIDS,
+            train_year_subsets=FAST_TRAIN_YEAR_SUBSETS,
+        )
+    return RunConfig(
+        fast=False,
+        sample_fraction=None,
+        default_params=DEFAULT_PARAMS,
+        param_grids=PARAM_GRIDS,
+        train_year_subsets=TRAIN_YEAR_SUBSETS,
+    )
 
 
 def evaluate_regression(
