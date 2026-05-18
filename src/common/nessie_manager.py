@@ -4,6 +4,22 @@ from pyspark.sql import Row, SparkSession
 
 PERSISTENT_BRANCHES = ["main", "silver", "bronze"]
 
+# Data domain. All tables live under a single namespace `nessie.{DOMAIN}` —
+# the medallion layer is encoded by the Nessie branch (bronze/silver/main),
+# not the namespace, so a table identifier never echoes its branch name.
+DOMAIN = "nyc"
+NAMESPACE = f"nessie.{DOMAIN}"
+
+
+def table_location(layer: str, table: str) -> str:
+    """Physical warehouse path for an Iceberg table: {layer}/{domain}/{table}.
+
+    Tables declare this as an explicit LOCATION so the on-disk medallion
+    folders survive the single shared namespace — without it every layer
+    would collide under the same `.../{domain}/` prefix.
+    """
+    return f"s3a://warehouse/{layer}/{DOMAIN}/{table}"
+
 
 class NoCommonAncestorError(Exception):
     pass
@@ -51,7 +67,7 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
     instance, a WAP merge will raise NoCommonAncestorError with a
     clear message directing to manual reset.
 
-    Also seeds nessie.gold on main itself: gold lives on main (no separate
+    Also seeds the namespace on main itself: gold lives on main (no separate
     gold branch). Seeding gives main a real namespace commit so wap/gold-*
     branches forked from main share a non-trivial ancestor with it. Without
     this seed, the very first gold merge into main throws a spurious
@@ -67,10 +83,10 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
             create_branch(spark, branch, from_ref="main")
         # Seed the branch with a namespace commit (idempotent).
         set_spark_branch(spark, branch)
-        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS nessie.{branch}")
-    # Seed the gold namespace on main (gold lives on main).
+        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NAMESPACE}")
+    # Seed the namespace on main too (gold lives on main).
     set_spark_branch(spark, "main")
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NAMESPACE}")
 
 
 def create_tag(spark: SparkSession, name: str, from_ref: str = "main") -> None:

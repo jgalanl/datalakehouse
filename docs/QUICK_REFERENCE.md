@@ -140,15 +140,15 @@ spark = SparkSession.builder \
     .config("spark.hadoop.fs.s3a.path.style.access", "true") \
     .getOrCreate()
 
-# Create medallion namespaces
-spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
-spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
-spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
+# Create the domain namespace — one namespace `nyc`; the medallion layer is
+# the Nessie branch (bronze/silver/main), not the namespace.
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.nyc")
 
-# Create bronze table with hidden partitioning (faithful to source: all NULLABLE)
+# Create bronze table with hidden partitioning (faithful to source: all NULLABLE).
 # Note the Iceberg-Spark partition transform is `months(...)` (plural), not `month(...)`.
+# The explicit LOCATION keeps the layer folders distinct under the shared namespace.
 spark.sql("""
-    CREATE TABLE IF NOT EXISTS nessie.bronze.yellow_taxi (
+    CREATE TABLE IF NOT EXISTS nessie.nyc.yellow_taxi (
         VendorID BIGINT,
         tpep_pickup_datetime TIMESTAMP_NTZ,
         tpep_dropoff_datetime TIMESTAMP_NTZ,
@@ -160,6 +160,7 @@ spark.sql("""
     )
     USING iceberg
     PARTITIONED BY (months(tpep_pickup_datetime))
+    LOCATION 's3a://warehouse/bronze/nyc/yellow_taxi'
     TBLPROPERTIES ('format-version' = '2')
 """)
 
@@ -167,11 +168,11 @@ spark.sql("""
 # Each pipeline declares its StructType and feeds it to common.iceberg_schema.schema_to_ddl()
 # (see DEVELOPMENT.md → "Declaring a Schema in a Pipeline").
 
-# Read data
-spark.sql("SELECT * FROM nessie.bronze.yellow_taxi").show()
+# Read data (the session ref selects the layer — switch with `USE REFERENCE`)
+spark.sql("SELECT * FROM nessie.nyc.yellow_taxi").show()
 
 # Time travel
-spark.sql("SELECT * FROM nessie.bronze.yellow_taxi VERSION AS OF 0").show()
+spark.sql("SELECT * FROM nessie.nyc.yellow_taxi VERSION AS OF 0").show()
 ```
 
 ## Dremio SQL Examples
@@ -179,27 +180,28 @@ spark.sql("SELECT * FROM nessie.bronze.yellow_taxi VERSION AS OF 0").show()
 ```sql
 -- Nessie data source configured via Dremio UI
 
--- Query silver table
-SELECT * FROM nessie.silver.yellow_taxi
+-- Query silver table (silver lives on the `silver` branch — qualify with AT BRANCH)
+SELECT * FROM nessie.nyc.yellow_taxi AT BRANCH "silver"
 WHERE tpep_pickup_datetime >= '2019-01-01'
 LIMIT 10;
 
--- Gold trips already include denormalized zone columns (no join needed)
+-- Gold trips already include denormalized zone columns (no join needed).
+-- Gold lives on `main`, Dremio's default branch — no AT BRANCH needed.
 SELECT pickup_datetime, pu_zone, do_zone, fare_amount, trip_duration_minutes
-FROM nessie.gold.yellow_taxi_trips
+FROM nessie.nyc.yellow_taxi_trips
 WHERE pickup_year = 2019
 LIMIT 10;
 
 -- Aggregate by pickup zone (top zones by trip count and avg fare)
 SELECT pu_zone, COUNT(*) AS trip_count, AVG(fare_amount) AS avg_fare
-FROM nessie.gold.yellow_taxi_trips
+FROM nessie.nyc.yellow_taxi_trips
 GROUP BY pu_zone
 ORDER BY trip_count DESC
 LIMIT 20;
 
 -- Hourly demand from the aggregate gold table
 SELECT pu_zone, hour_of_day, SUM(n_pickups) AS total_pickups
-FROM nessie.gold.pickup_demand_zone_hour
+FROM nessie.nyc.pickup_demand_zone_hour
 GROUP BY pu_zone, hour_of_day
 ORDER BY total_pickups DESC
 LIMIT 20;
@@ -208,7 +210,7 @@ LIMIT 20;
 ## MLflow / ML Training
 
 The three ML use cases share the same skeleton via `train_regression(...)` in
-`src/ml/common.py`: pin Spark to `main`, set up MLflow, load a gold table
+`src/ml/ml_common.py`: pin Spark to `main`, set up MLflow, load a gold table
 (optionally pre-filter), do a temporal split (train: 2019-2023, test: 2025),
 build a `StringIndexer → VectorAssembler → GBTRegressor` pipeline, train,
 evaluate, and log params + metrics + model. Each use-case script just declares
@@ -262,23 +264,27 @@ docker exec -it spark-master spark-submit /opt/spark/src/pipelines/gold/build_ye
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/gold/aggregate_demand_zone_hour.py
 ```
 
-### Nessie namespace structure (layer-first medallion)
+### Nessie catalog structure (layer-first medallion)
+
+The medallion layer is the Nessie **branch**; all tables share one namespace `nyc`.
 
 ```
 nessie (catalog)
-├── bronze
-│   ├── yellow_taxi                     (monthly partitioned by tpep_pickup_datetime)
-│   └── taxi_zone_lookup                (unpartitioned, small reference table)
-├── silver
-│   ├── yellow_taxi                     (cleaned, typed, deduplicated)
-│   └── taxi_zone_lookup                (standardized)
-└── gold
-    ├── yellow_taxi_trips               (trip-level: zone denorm + time features, partitioned by month(pickup_datetime))
-    └── pickup_demand_zone_hour         ((zone, hour_bucket) aggregate, partitioned by month(hour_bucket))
+└── nyc (namespace, on every branch)
+    ├── on branch `bronze`
+    │   ├── yellow_taxi                 (monthly partitioned by tpep_pickup_datetime)
+    │   └── taxi_zone_lookup            (unpartitioned, small reference table)
+    ├── on branch `silver`
+    │   ├── yellow_taxi                 (cleaned, typed, deduplicated)
+    │   └── taxi_zone_lookup            (standardized)
+    └── on branch `main` (gold)
+        ├── yellow_taxi_trips           (trip-level: zone denorm + time features, partitioned by month(pickup_datetime))
+        └── pickup_demand_zone_hour     ((zone, hour_bucket) aggregate, partitioned by month(hour_bucket))
 ```
 
-Iceberg manages the physical file layout in MinIO (`s3a://warehouse/`) automatically.
-No manual folder organization — hidden partitioning handles it.
+Each table has an explicit `LOCATION` of `s3a://warehouse/{layer}/nyc/{table}`, so MinIO
+keeps a `bronze/nyc/`, `silver/nyc/`, `gold/nyc/` layout. Within each table folder Iceberg
+manages the physical file layout automatically — no manual folder organization.
 
 ### Nessie branching (WAP)
 

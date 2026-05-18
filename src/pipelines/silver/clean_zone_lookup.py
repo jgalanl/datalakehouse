@@ -1,21 +1,24 @@
 """Silver ETL — clean and conform the NYC TLC taxi zone lookup from bronze.
 
 Small reference table (~265 rows). WAP: branch from silver, read bronze, clean,
-validate, merge to silver. Full refresh (no partitioning, single snapshot).
+validate, merge to silver. Full refresh by overwrite (unpartitioned).
 """
 
 from datetime import date
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, trim
+from pyspark.sql.functions import col, lit, trim
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
 from common.spark_factory import get_spark
 from common.iceberg_schema import schema_to_ddl
 from common import nessie_manager as nessie
 
-SOURCE = "nessie.bronze.taxi_zone_lookup"
-TARGET = "nessie.silver.taxi_zone_lookup"
+# SOURCE and TARGET share an identifier — same table name, different Nessie
+# branch (bronze vs silver). The active ref decides which one a read hits.
+SOURCE = "nessie.nyc.taxi_zone_lookup"
+TARGET = "nessie.nyc.taxi_zone_lookup"
+TARGET_LOCATION = nessie.table_location("silver", "taxi_zone_lookup")
 
 VALID_LOCATION_MIN = 1
 VALID_LOCATION_MAX = 265
@@ -95,20 +98,23 @@ def main() -> None:
             print(f"  After cleaning: {silver_count:,} rows")
 
             nessie.set_spark_branch(spark, branch_name)
-            spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             print(f"  Writing {TARGET}")
-            spark.sql(f"DROP TABLE IF EXISTS {TARGET}")
+            # Full refresh: keep one stable table and overwrite its rows, so
+            # each run is a clean snapshot instead of a dropped+recreated table
+            # that orphans the previous run's files.
             spark.sql(f"""
-                CREATE TABLE {TARGET} (
+                CREATE TABLE IF NOT EXISTS {TARGET} (
                     {schema_to_ddl(SILVER_ZONE_SCHEMA)}
                 ) USING iceberg
+                LOCATION '{TARGET_LOCATION}'
                 TBLPROPERTIES (
                     'format-version' = '2',
                     'write.spark.check-nullability' = 'false'
                 )
             """)
-            silver_df.writeTo(TARGET).append()
+            silver_df.writeTo(TARGET).overwrite(lit(True))
         finally:
             silver_df.unpersist()
 

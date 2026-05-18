@@ -1,22 +1,22 @@
 """ML use case 1 — predict fare_amount from gold trip features.
 
-Reads only nessie.gold.yellow_taxi_trips on main. Three-phase workflow per
+Reads only nessie.nyc.yellow_taxi_trips on main (gold). Three-phase workflow per
 script run, all logged to the same MLflow experiment with `phase` tag:
 
-  Phase 1 — algorithmrithm comparison: LR, RF, GBT with default hyperparameters.
-  Phase 2 — hyperparameter tuning of the algorithmrithm with lowest val RMSE.
+  Phase 1 — algorithm comparison: LR, RF, GBT with default hyperparameters.
+  Phase 2 — hyperparameter tuning of the algorithm with lowest val RMSE.
   Phase 3 — learning curve over cumulative year subsets with the tuned model.
 
 Splits: stratified-by-year random split of TRAIN_YEAR_SUBSETS[-1] into
 train (70 %) / val (15 %) / test_id (15 %), plus test_ood = TEST_YEARS
 (2025) kept whole.
-val drives algorithmrithm + hyperparameter selection; test_id measures the model
+val drives algorithm + hyperparameter selection; test_id measures the model
 in-distribution; test_ood measures behaviour under drift.
 """
 
 import sys
 
-from ml.common import (
+from ml.ml_common import (
     DEFAULT_PARAMS,
     MLFLOW_TRACKING_URI,
     PARAM_GRIDS,
@@ -27,13 +27,14 @@ from ml.common import (
     get_ml_spark,
     make_estimator,
     make_splits,
+    progress,
     register_final_model,
     setup_mlflow,
     train_and_log_run,
 )
 
 EXPERIMENT = "fare_prediction"
-SOURCE = "nessie.gold.yellow_taxi_trips"
+SOURCE = "nessie.nyc.yellow_taxi_trips"
 LABEL_COL = "fare_amount"
 YEAR_COL = "pickup_year"
 
@@ -68,17 +69,26 @@ def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
 
 
 def main() -> None:
+    progress("Starting Spark session...")
     spark = get_ml_spark(app_name="ml-fare-prediction")
     try:
+        progress("Spark ready. Configuring MLflow...")
         setup_mlflow(EXPERIMENT)
 
-        df = spark.table(SOURCE)
+        # Project to just the label + features — the gold table is much wider,
+        # and caching the full row would blow the executor heap.
+        progress(f"Reading {SOURCE} and building stratified splits...")
+        df = spark.table(SOURCE).select(LABEL_COL, *NUMERICAL_COLS, *CATEGORICAL_COLS)
         train, val, test_id, test_ood = make_splits(df, YEAR_COL, TEST_YEARS)
         train, val, test_id, test_ood = (
             train.cache(), val.cache(), test_id.cache(), test_ood.cache(),
         )
         splits = {"train": train, "val": val, "test_id": test_id, "test_ood": test_ood}
-        split_counts = {k: v.count() for k, v in splits.items()}
+        progress("Materializing cached splits (first count triggers the read)...")
+        split_counts = {}
+        for k, v in splits.items():
+            split_counts[k] = v.count()
+            progress(f"  {k} cached: {split_counts[k]:,} rows")
         print("\nSplit sizes:")
         for k, v in split_counts.items():
             print(f"  {k:<10} {v:>12,} rows")
@@ -214,7 +224,7 @@ def main() -> None:
                 f"Spark MLlib regression for {EXPERIMENT}. "
                 f"Source: {SOURCE} (Nessie main). Target: {LABEL_COL}. "
                 f"Each version is the best model from one run of "
-                f"src/ml/fare_prediction.py — algorithmrithm comparison → "
+                f"src/ml/fare_prediction.py — algorithm comparison → "
                 f"hyperparameter tuning → year-subset learning curve. "
                 f"Promotion is Pareto-style: @champion points to the best "
                 f"version so far on val_rmse (primary, strict improvement) "

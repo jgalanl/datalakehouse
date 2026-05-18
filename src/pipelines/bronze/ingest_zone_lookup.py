@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.request import urlretrieve
 from urllib.error import URLError
 
+from pyspark.sql.functions import lit
 from pyspark.sql.types import (
     IntegerType, StringType, StructField, StructType,
 )
@@ -20,7 +21,8 @@ from common.iceberg_schema import schema_to_ddl
 from common import nessie_manager as nessie
 
 ZONE_LOOKUP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
-TABLE = "nessie.bronze.taxi_zone_lookup"
+TABLE = "nessie.nyc.taxi_zone_lookup"
+TABLE_LOCATION = nessie.table_location("bronze", "taxi_zone_lookup")
 DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # shared bind mount
 
 # Bronze stays faithful to source; cleaning happens in silver.
@@ -71,7 +73,7 @@ def main() -> None:
         spark = nessie.set_spark_branch(spark=spark, branch=branch_name)
 
         try:
-            spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
+            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             df = (
                 spark.read.option("header", "true")
@@ -81,17 +83,20 @@ def main() -> None:
             count = df.count()
             print(f"  Records: {count}")
 
-            spark.sql(f"DROP TABLE IF EXISTS {TABLE}")
+            # Full refresh: keep one stable table and overwrite its rows, so
+            # each run is a clean snapshot instead of a dropped+recreated table
+            # that orphans the previous run's files.
             spark.sql(f"""
-                CREATE TABLE {TABLE} (
+                CREATE TABLE IF NOT EXISTS {TABLE} (
                     {schema_to_ddl(BRONZE_ZONE_SCHEMA)}
                 ) USING iceberg
+                LOCATION '{TABLE_LOCATION}'
                 TBLPROPERTIES (
                     'format-version' = '2',
                     'write.spark.check-nullability' = 'false'
                 )
             """)
-            df.writeTo(TABLE).append()
+            df.writeTo(TABLE).overwrite(lit(True))
 
             validate_ingestion(spark=spark, expected_count=count)
 

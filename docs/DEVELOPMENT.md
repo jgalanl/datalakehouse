@@ -59,8 +59,8 @@ src/
 │   └── iceberg_schema.py       # schema_to_ddl(StructType) — generates Iceberg column DDL with NOT NULL
 ├── pipelines/
 │   ├── bronze/                 # Source download + Iceberg ingestion (no separate landing zone)
-│   │   ├── ingest_yellow_taxi.py     # NYC TLC yellow taxi → nessie.bronze.yellow_taxi (WAP per month)
-│   │   └── ingest_zone_lookup.py     # Taxi zone lookup → nessie.bronze.taxi_zone_lookup
+│   │   ├── ingest_yellow_taxi.py     # NYC TLC yellow taxi → nessie.nyc.yellow_taxi (WAP per month)
+│   │   └── ingest_zone_lookup.py     # Taxi zone lookup → nessie.nyc.taxi_zone_lookup
 │   ├── silver/                 # Bronze → Silver (clean, conform, deduplicate)
 │   │   ├── clean_yellow_taxi.py      # WAP per month, audit on drop ratio, quarantine on fail
 │   │   ├── clean_zone_lookup.py      # full refresh, row-count audit
@@ -69,8 +69,9 @@ src/
 │       ├── build_yellow_taxi_trips.py        # trip-level enriched + time features (WAP on main)
 │       └── aggregate_demand_zone_hour.py     # (zone, hour) demand aggregate (WAP on main)
 ├── ml/                         # ML training scripts (Spark MLlib + MLflow), gold-only
-│   ├── common.py                       # Shared helpers + train_regression() — full GBT skeleton (Spark+MLflow setup,
-│   │                                   #   load, optional pre-filter, temporal split, fit, evaluate, log) used by all 3 scripts
+│   ├── ml_common.py                    # Shared helpers + train_regression() — full GBT skeleton (Spark+MLflow setup,
+│   │                                   #   load, optional pre-filter, temporal split, fit, evaluate, log) used by all 3 scripts.
+│   │                                   #   Named ml_common (not common) so it doesn't shadow the top-level common package.
 │   ├── fare_prediction.py              # Use case 1 — config + main(); calls train_regression
 │   ├── trip_duration.py                # Use case 2 — same, with pre_filter to drop trip_duration_minutes <= 0
 │   └── demand_forecast.py              # Use case 3 — same, with year_col="hour_year" for the temporal split

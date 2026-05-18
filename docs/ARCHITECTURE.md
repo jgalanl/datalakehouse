@@ -53,28 +53,36 @@ Data Writers → Iceberg → Nessie (Single Catalog) → MinIO (Storage)
 
 ### Data Model (Layer-First Medallion)
 
-Following Strengholt's centralized medallion pattern, Nessie namespaces represent layers:
+Following Strengholt's centralized medallion pattern, the medallion **layer is the Nessie
+branch** — all tables share one namespace `nyc` (the data domain), so an identifier never
+echoes its layer. The same `nessie.nyc.yellow_taxi` resolves to a different physical table
+on the `bronze` and `silver` branches.
 
 ```
-nessie.bronze.yellow_taxi              — raw ingestion, PARTITIONED BY month(tpep_pickup_datetime)
-nessie.bronze.taxi_zone_lookup         — reference table, unpartitioned (~265 rows)
-nessie.silver.yellow_taxi              — cleaned, typed, deduplicated
-nessie.silver.taxi_zone_lookup         — standardized zone names
-nessie.gold.yellow_taxi_trips          — trip-level: silver enriched with denormalized zones (broadcast left join)
-                                         and derived time features (year/month/week/dow/hour, trip_duration_minutes);
-                                         partitioned by month(pickup_datetime)
-nessie.gold.pickup_demand_zone_hour    — aggregated to (pu_location_id, hour_bucket) where
-                                         hour_bucket = date_trunc('hour', tpep_pickup_datetime);
-                                         partitioned by month(hour_bucket); target dataset for the demand model
+branch   table identifier                       — description
+bronze   nessie.nyc.yellow_taxi                  — raw ingestion, PARTITIONED BY month(tpep_pickup_datetime)
+bronze   nessie.nyc.taxi_zone_lookup             — reference table, unpartitioned (~265 rows)
+silver   nessie.nyc.yellow_taxi                  — cleaned, typed, deduplicated
+silver   nessie.nyc.taxi_zone_lookup             — standardized zone names
+main     nessie.nyc.yellow_taxi_trips            — trip-level: silver enriched with denormalized zones (broadcast left join)
+                                                   and derived time features (year/month/week/dow/hour, trip_duration_minutes);
+                                                   partitioned by month(pickup_datetime)
+main     nessie.nyc.pickup_demand_zone_hour      — aggregated to (pu_location_id, hour_bucket) where
+                                                   hour_bucket = date_trunc('hour', tpep_pickup_datetime);
+                                                   partitioned by month(hour_bucket); target dataset for the demand model
 ```
+
+Each table is created with an explicit `LOCATION` of `s3a://warehouse/{layer}/nyc/{table}`,
+so MinIO keeps a layer-then-domain folder structure even though the namespace is shared.
 
 No separate landing zone: bronze ingestion downloads source data and writes Iceberg tables
 directly. Iceberg hidden partitioning manages the physical file layout in MinIO.
 
 ### Layer Consumption Policy
 
-- **ML pipelines must read only from gold** (`nessie.gold.*` on `main`). Anything under
-  `src/ml/` is restricted to gold tables — silver is internal to the data platform.
+- **ML pipelines must read only from gold** (the `nessie.nyc.*` tables on the `main`
+  branch). Anything under `src/ml/` is restricted to gold tables — silver is internal
+  to the data platform.
 - **Data engineers and data scientists** may read from any layer for ad-hoc exploration,
   EDA or rule justification. Notebooks under `src/notebooks/bronze/` and
   `src/notebooks/silver/` exist for exactly this.
@@ -214,7 +222,7 @@ OpenMetadata Server
 
 ```
 src/ml/{fare_prediction,trip_duration,demand_forecast}.py
-    ↓ (reads only nessie.gold.* on main — strict medallion)
+    ↓ (reads only the gold tables — nessie.nyc.* on main — strict medallion)
 Spark MLlib pipeline (StringIndexer → VectorAssembler → GBTRegressor)
     ↓
 MLflow (Tracking Server, behind the `ml` profile)
@@ -231,11 +239,11 @@ MLflow (Tracking Server, behind the `ml` profile)
 
 | # | Script                  | Target                  | Source table                          | Year split                       |
 |---|-------------------------|-------------------------|---------------------------------------|----------------------------------|
-| 1 | `fare_prediction.py`    | `fare_amount`           | `nessie.gold.yellow_taxi_trips`       | train: 2019/2020/2022/2023; test: 2025 |
-| 2 | `trip_duration.py`      | `trip_duration_minutes` | `nessie.gold.yellow_taxi_trips`       | same                             |
-| 3 | `demand_forecast.py`    | `n_pickups`             | `nessie.gold.pickup_demand_zone_hour` | same (year column: `hour_year`)  |
+| 1 | `fare_prediction.py`    | `fare_amount`           | `nessie.nyc.yellow_taxi_trips` (main) | train: 2019/2020/2022/2023; test: 2025 |
+| 2 | `trip_duration.py`      | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips` (main) | same                             |
+| 3 | `demand_forecast.py`    | `n_pickups`             | `nessie.nyc.pickup_demand_zone_hour` (main) | same (year column: `hour_year`)  |
 
-All three share the `train_regression(...)` helper in `src/ml/common.py`, which
+All three share the `train_regression(...)` helper in `src/ml/ml_common.py`, which
 encapsulates Spark/MLflow setup, optional pre-filter, temporal split, pipeline
 build, fit, evaluate and logging. Each use-case script just declares its
 constants (source, label, feature lists) and calls the helper. Default GBT
@@ -297,11 +305,11 @@ Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 
 ```
 1. Source Data (NYC TLC Parquet/CSV)
-2. Bronze: Spark downloads + writes Iceberg table (nessie.bronze.*)
+2. Bronze: Spark downloads + writes Iceberg table (nessie.nyc.* on the `bronze` branch)
            — WAP branch off `bronze`, audit, merge back, drop branch
-3. Silver: Spark reads bronze, cleans/deduplicates, writes (nessie.silver.*)
+3. Silver: Spark reads bronze, cleans/deduplicates, writes (nessie.nyc.* on `silver`)
            — non-raising audit; failed months → `review/silver-...` quarantine tag
-4. Gold:   Spark reads silver, joins/aggregates, writes (nessie.gold.*)
+4. Gold:   Spark reads silver, joins/aggregates, writes (nessie.nyc.* on `main`)
            — strict audit (row-count parity for trips, pickup conservation for demand)
 5. Dremio Query Layer / ML training
 ```
@@ -309,8 +317,8 @@ Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 ### ML Pipeline Pattern
 
 ```
-1. Read gold (only nessie.gold.* on `main`)        — src/ml/common.py.get_ml_spark
-2. Stratified split into train/val/test_id/test_ood — src/ml/common.py.make_splits
+1. Read gold (only nessie.nyc.* on `main`)         — src/ml/ml_common.py.get_ml_spark
+2. Stratified split into train/val/test_id/test_ood — src/ml/ml_common.py.make_splits
 3. Three-phase workflow                            — algorithm comparison → tuning → year-subset curve
 4. Spark MLlib pipeline                            — StringIndexer (+ optional OHE/Scaler) → VectorAssembler → estimator
 5. Train + evaluate                                — RMSE, MAE, R² on every split

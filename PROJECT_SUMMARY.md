@@ -103,7 +103,7 @@ datalakehouse/
 │   │   ├── bronze/             # ingest_yellow_taxi.py, ingest_zone_lookup.py
 │   │   ├── silver/             # clean_yellow_taxi.py, clean_zone_lookup.py, reset_silver.py
 │   │   └── gold/               # build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py
-│   ├── ml/                     # common.py, fare_prediction.py, trip_duration.py, demand_forecast.py
+│   ├── ml/                     # ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py
 │   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (diagnostics)
 └── docs/                       # Documentation
 ```
@@ -170,27 +170,27 @@ Experiment tracking, model registration, staging, and version management.
 #### `src/pipelines/bronze/` — bronze ingestion
 
 - `ingest_yellow_taxi.py`: downloads NYC TLC parquet (Q1 of 2019/2020/2022/2023/2025),
-  reconciles schema drift, writes `nessie.bronze.yellow_taxi` via WAP per month
-- `ingest_zone_lookup.py`: writes the small reference table `nessie.bronze.taxi_zone_lookup`
+  reconciles schema drift, writes `nessie.nyc.yellow_taxi` via WAP per month
+- `ingest_zone_lookup.py`: writes the small reference table `nessie.nyc.taxi_zone_lookup`
 
 #### `src/pipelines/silver/` — silver cleaning
 
-- `clean_yellow_taxi.py`: WAP per month against `nessie.silver.yellow_taxi`, audit on
-  drop ratio, quarantine to `review/silver-...` tag on failure
-- `clean_zone_lookup.py`: full refresh of `nessie.silver.taxi_zone_lookup`
+- `clean_yellow_taxi.py`: WAP per month against `nessie.nyc.yellow_taxi` on the `silver`
+  branch, audit on drop ratio, quarantine to `review/silver-...` tag on failure
+- `clean_zone_lookup.py`: full refresh of `nessie.nyc.taxi_zone_lookup` on `silver`
 - `reset_silver.py`: drops all silver refs and rebuilds the layer from scratch
 
 #### `src/pipelines/gold/` — gold curation
 
 - `build_yellow_taxi_trips.py`: joins silver trips with the zone lookup, derives time
-  features, writes `nessie.gold.yellow_taxi_trips` (partitioned by month) via WAP on `main`
+  features, writes `nessie.nyc.yellow_taxi_trips` (partitioned by month) via WAP on `main`
 - `aggregate_demand_zone_hour.py`: aggregates silver trips to
-  `(pu_location_id, hour_bucket)` and writes `nessie.gold.pickup_demand_zone_hour`
+  `(pu_location_id, hour_bucket)` and writes `nessie.nyc.pickup_demand_zone_hour`
   (target dataset for the demand model)
 
 #### `src/ml/` — ML training (Spark MLlib + MLflow)
 
-- `common.py`: shared helpers (MLflow setup, gold loaders, temporal split:
+- `ml_common.py`: shared helpers (MLflow setup, gold loaders, temporal split:
   train 2019/2020/2022/2023 vs test 2025, pipeline + evaluation helpers) **plus
   `train_regression()`** — the full GBT training skeleton (Spark/MLflow setup,
   load, optional pre-filter, split, fit, evaluate, log params + metrics + model)

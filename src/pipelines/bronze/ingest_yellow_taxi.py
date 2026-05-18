@@ -26,7 +26,8 @@ from common import nessie_manager as nessie
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
 YEARS = [2019, 2020, 2022, 2023, 2025]
 MONTHS = [1, 2, 3]
-TABLE = "nessie.bronze.yellow_taxi"
+TABLE = "nessie.nyc.yellow_taxi"
+TABLE_LOCATION = nessie.table_location("bronze", "yellow_taxi")
 SCHEMA_REPORT_PATH = Path(__file__).parent / "schema_differences.txt"
 DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # shared bind mount
 
@@ -190,12 +191,13 @@ def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
 
     if not table_exists(spark):
         print(f"  [{label}] Creating table {TABLE}")
-        spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.bronze")
+        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
         spark.sql(f"""
             CREATE TABLE {TABLE} (
                 {schema_to_ddl(BRONZE_SCHEMA)}
             ) USING iceberg
             PARTITIONED BY (months(tpep_pickup_datetime))
+            LOCATION '{TABLE_LOCATION}'
             TBLPROPERTIES (
                 'format-version' = '2',
                 'write.spark.check-nullability' = 'false'

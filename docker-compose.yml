@@ -160,9 +160,9 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1G
+          memory: 2G
         reservations:
-          memory: 512M
+          memory: 1G
     labels:
       service: compute
       component: spark-master
@@ -220,13 +220,13 @@ services:
       dockerfile: Dockerfile
     container_name: spark-worker-1
     hostname: spark-worker-1
-    # 1536m leaves ~500 MB headroom inside the 2 GB container for JVM overhead
+    # 2560m leaves ~500 MB headroom inside the 3 GB container for JVM overhead
     command: >
       spark-class org.apache.spark.deploy.worker.Worker
         spark://spark-master:7077
         --webui-port 8081
         --cores 2
-        --memory 1536m
+        --memory 2560m
     ports:
       - "8081:8081"
     environment:
@@ -248,9 +248,9 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 2G
+          memory: 3G
         reservations:
-          memory: 1G
+          memory: 1536M
     labels:
       service: compute
       component: spark-worker

@@ -23,9 +23,12 @@ from common import nessie_manager as nessie
 
 YEARS = [2019, 2020, 2022, 2023, 2025]
 MONTHS = [1, 2, 3]
-SOURCE_TRIPS = "nessie.silver.yellow_taxi"
-SOURCE_ZONES = "nessie.silver.taxi_zone_lookup"
-TARGET = "nessie.gold.yellow_taxi_trips"
+# SOURCE_* are read on the silver ref; TARGET is written on main. Same
+# namespace throughout — the active Nessie branch selects the layer.
+SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
+SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
+TARGET = "nessie.nyc.yellow_taxi_trips"
+TARGET_LOCATION = nessie.table_location("gold", "yellow_taxi_trips")
 
 # The left join with silver zones must not drop or null-out rows: silver
 # already filters PU/DO IDs to [1, 265] and the lookup covers the full range.
@@ -203,7 +206,7 @@ def wap_build(
                   f"({null_zone_count:,} with NULL zone)")
 
             nessie.set_spark_branch(spark, branch_name)
-            spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
+            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             if not table_exists(spark):
                 print(f"  [{label}] Creating table {TARGET}")
@@ -212,6 +215,7 @@ def wap_build(
                         {schema_to_ddl(GOLD_SCHEMA)}
                     ) USING iceberg
                     PARTITIONED BY (months(pickup_datetime))
+                    LOCATION '{TARGET_LOCATION}'
                     TBLPROPERTIES (
                         'format-version' = '2',
                         'write.spark.check-nullability' = 'false'

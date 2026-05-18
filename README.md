@@ -60,13 +60,13 @@ The platform consists of seven core components organized into logical layers:
     │  - spark-logs (Spark event logs)                              │
     └───────────────────────────────────────────────────────────────┘
 
-    Nessie Namespaces (layer-first medallion):
-    ├── nessie.bronze.yellow_taxi              (raw ingestion, monthly partitioned)
-    ├── nessie.bronze.taxi_zone_lookup         (reference, unpartitioned)
-    ├── nessie.silver.yellow_taxi              (cleaned, typed, deduplicated)
-    ├── nessie.silver.taxi_zone_lookup         (standardized)
-    ├── nessie.gold.yellow_taxi_trips          (trip-level enriched: zone denorm + time features)
-    └── nessie.gold.pickup_demand_zone_hour    (aggregated by pickup zone × hour bucket)
+    Nessie catalog — single namespace `nyc`, layer = branch (layer-first medallion):
+    ├── nessie.nyc.yellow_taxi              on bronze  (raw ingestion, monthly partitioned)
+    ├── nessie.nyc.taxi_zone_lookup         on bronze  (reference, unpartitioned)
+    ├── nessie.nyc.yellow_taxi              on silver  (cleaned, typed, deduplicated)
+    ├── nessie.nyc.taxi_zone_lookup         on silver  (standardized)
+    ├── nessie.nyc.yellow_taxi_trips        on main    (trip-level enriched: zone denorm + time features)
+    └── nessie.nyc.pickup_demand_zone_hour  on main    (aggregated by pickup zone × hour bucket)
 
 Supporting Services:
 ├── PostgreSQL (MLflow tracking DB) — `ml` profile
@@ -293,10 +293,10 @@ is handled via Iceberg `ALTER TABLE ADD COLUMNS` on the WAP branch. Bronze stays
 faithful to the source — every column is `NULLABLE`. Cleaning rules run in silver.
 
 ```bash
-# Yellow taxi: download from TLC, normalize schema, write to nessie.bronze.yellow_taxi
+# Yellow taxi: download from TLC, normalize schema, write to nessie.nyc.yellow_taxi
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/bronze/ingest_yellow_taxi.py
 
-# Zone lookup: small reference table → nessie.bronze.taxi_zone_lookup
+# Zone lookup: small reference table → nessie.nyc.taxi_zone_lookup
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/bronze/ingest_zone_lookup.py
 ```
 
@@ -360,7 +360,7 @@ and `sum(n_pickups)` conservation per month for the demand table.
 
 ```sql
 -- Query through Dremio (Nessie source configured via UI)
-SELECT * FROM nessie.silver.yellow_taxi
+SELECT * FROM nessie.nyc.yellow_taxi AT BRANCH "silver"
 WHERE tpep_pickup_datetime >= '2024-01-01'
 LIMIT 1000;
 ```
@@ -425,7 +425,7 @@ datalakehouse/
 │   │   ├── bronze/          # Download + Iceberg ingestion (ingest_yellow_taxi.py, ingest_zone_lookup.py)
 │   │   ├── silver/          # Bronze → Silver (clean_yellow_taxi.py, clean_zone_lookup.py, reset_silver.py)
 │   │   └── gold/            # Silver → Gold (build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py)
-│   ├── ml/                  # ML training scripts on gold (common.py, fare_prediction.py, trip_duration.py, demand_forecast.py)
+│   ├── ml/                  # ML training scripts on gold (ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py)
 │   └── notebooks/           # Jupyter notebooks, split per medallion layer
 │       ├── bronze/          # explore (pandas, raw parquet first look), preprocess (Spark, silver-rule evidence), verify_iceberg
 │       ├── silver/          # verify_iceberg

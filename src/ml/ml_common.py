@@ -1,14 +1,17 @@
 """Shared utilities for ML training scripts and diagnostic notebooks.
 
-Read-only contract: every ML pipeline consumes nessie.gold.* on main.
+Read-only contract: every ML pipeline consumes the gold tables
+(nessie.nyc.* on the main branch).
 Each use case has its own training script with its own main(); this module
 holds the building blocks they share — Spark/MLflow setup, year-stratified
 splits, the StringIndexer (+ OneHot/Scaler) preprocessing pipeline, the
-regression evaluator, the algorithmrithm/grid catalogue and the single-run MLflow
+regression evaluator, the algorithm/grid catalogue and the single-run MLflow
 logger.
 """
 
 import os
+import time
+from datetime import datetime
 from functools import reduce
 
 # MLflow + MinIO env. spark-master inherits AWS_* from docker-compose but not
@@ -41,6 +44,15 @@ from common import nessie_manager as nessie  # noqa: E402
 
 MLFLOW_TRACKING_URI = os.environ["MLFLOW_TRACKING_URI"]
 
+
+def progress(msg: str) -> None:
+    """Print a timestamped progress line, flushed immediately.
+
+    spark-submit buffers stdout, so long Spark stages (fit, count) otherwise
+    look frozen. Explicit flush makes each step visible as it happens.
+    """
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
 # Year setup. TEST_YEARS is the out-of-distribution drift probe: 2025 holds
 # out the post-COVID + congestion-fee era so we can measure how the model
 # behaves under distribution shift. TRAIN_YEAR_SUBSETS are cumulative slices
@@ -53,6 +65,12 @@ TRAIN_YEAR_SUBSETS: list[list[int]] = [
     [2019, 2020, 2022, 2023],
 ]
 TEST_YEARS = [2025]
+
+# Partition count for the cached split DataFrames. The per-year unionByName in
+# make_splits accumulates many uneven partitions, and the gold tables are large
+# relative to a 1 GB executor heap — repartitioning to a fixed count keeps each
+# cached columnar block small enough to build without an OOM.
+SPLIT_PARTITIONS = 64
 
 
 def get_ml_spark(app_name: str) -> SparkSession:
@@ -73,6 +91,7 @@ def make_splits(
     oos_test_years: list[int],
     weights: tuple[float, float, float] = (0.7, 0.15, 0.15),
     seed: int = 42,
+    n_partitions: int = SPLIT_PARTITIONS,
 ) -> tuple[DataFrame, DataFrame, DataFrame, DataFrame]:
     """Stratified-by-year split into (train, val, test_id, test_ood).
 
@@ -83,6 +102,10 @@ def make_splits(
     out-of-distribution test (test_ood) lets us disambiguate model quality
     from drift: a large test_id↔test_ood gap means drift, a small one means
     the model travels well across years.
+
+    Each split is repartitioned to `n_partitions` before returning so callers
+    can .cache() them on small executors without an OOM in the columnar cache
+    builder — the per-year unionByName otherwise leaves a few oversized partitions.
     """
     in_dist = df.filter(~df[year_col].isin(oos_test_years))
     test_ood = df.filter(df[year_col].isin(oos_test_years))
@@ -96,7 +119,12 @@ def make_splits(
     train = reduce(DataFrame.unionByName, (p[0] for p in parts))
     val = reduce(DataFrame.unionByName, (p[1] for p in parts))
     test_id = reduce(DataFrame.unionByName, (p[2] for p in parts))
-    return train, val, test_id, test_ood
+    return (
+        train.repartition(n_partitions),
+        val.repartition(n_partitions),
+        test_id.repartition(n_partitions),
+        test_ood.repartition(n_partitions),
+    )
 
 
 def build_regression_pipeline(
@@ -149,7 +177,7 @@ def build_regression_pipeline(
     return Pipeline(stages=stages)
 
 
-# Algorithm catalogue. Each script's Phase 1 (algorithmrithm comparison) iterates
+# Algorithm catalogue. Each script's Phase 1 (algorithm comparison) iterates
 # over these three estimators with the DEFAULT_PARAMS shown below; Phase 2
 # (tuning) iterates over PARAM_GRIDS[winner].
 def make_estimator(algorithm: str, **params):
@@ -202,15 +230,23 @@ PARAM_GRIDS: dict[str, list[dict]] = {
 def evaluate_regression(
     model: PipelineModel, df: DataFrame, label_col: str,
 ) -> dict[str, float]:
-    """Return {rmse, mae, r2} on df."""
-    predictions = model.transform(df)
-    metrics: dict[str, float] = {}
-    for metric_name in ("rmse", "mae", "r2"):
-        evaluator = RegressionEvaluator(
-            labelCol=label_col, predictionCol="prediction", metricName=metric_name,
-        )
-        metrics[metric_name] = float(evaluator.evaluate(predictions))
-    return metrics
+    """Return {rmse, mae, r2} on df.
+
+    model.transform is lazy, so each evaluator would otherwise re-run the
+    full preprocessing + prediction. Project to just (label, prediction) and
+    cache once — the three metrics then share a single transform pass.
+    """
+    predictions = model.transform(df).select(label_col, "prediction").cache()
+    try:
+        metrics: dict[str, float] = {}
+        for metric_name in ("rmse", "mae", "r2"):
+            evaluator = RegressionEvaluator(
+                labelCol=label_col, predictionCol="prediction", metricName=metric_name,
+            )
+            metrics[metric_name] = float(evaluator.evaluate(predictions))
+        return metrics
+    finally:
+        predictions.unpersist()
 
 
 def log_split_metrics(metrics: dict[str, float], split: str) -> None:
@@ -231,7 +267,7 @@ def train_and_log_run(
     """Fit `pipeline` on splits["train"], evaluate on every split, log to MLflow.
 
     Returns (run_id, {split_name: {metric_name: value}}). Caller decides the
-    workflow (which algorithmrithm, which grid, which year-subset) — this helper
+    workflow (which algorithm, which grid, which year-subset) — this helper
     only knows how to log one fitted model. The run_id lets the caller hand
     the run to the Model Registry afterwards via `register_final_model`.
     """
@@ -241,15 +277,23 @@ def train_and_log_run(
         if extra_params:
             mlflow.log_params(extra_params)
 
+        progress(f"  [{run_name}] fitting pipeline ({len(pipeline.getStages())} stages)...")
+        t0 = time.perf_counter()
         model = pipeline.fit(splits["train"])
+        progress(f"  [{run_name}] fit done in {time.perf_counter() - t0:.1f}s")
 
         all_metrics: dict[str, dict[str, float]] = {}
         for split_name, split_df in splits.items():
+            t1 = time.perf_counter()
             metrics = evaluate_regression(model, split_df, label_col)
             log_split_metrics(metrics, split_name)
             all_metrics[split_name] = metrics
+            progress(f"  [{run_name}] evaluated {split_name} in {time.perf_counter() - t1:.1f}s")
 
+        progress(f"  [{run_name}] logging model to MLflow...")
+        t2 = time.perf_counter()
         mlflow.spark.log_model(model, artifact_path="model")
+        progress(f"  [{run_name}] model logged in {time.perf_counter() - t2:.1f}s")
     return run_id, all_metrics
 
 

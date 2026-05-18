@@ -23,9 +23,12 @@ from common import nessie_manager as nessie
 
 YEARS = [2019, 2020, 2022, 2023, 2025]
 MONTHS = [1, 2, 3]
-SOURCE_TRIPS = "nessie.silver.yellow_taxi"
-SOURCE_ZONES = "nessie.silver.taxi_zone_lookup"
-TARGET = "nessie.gold.pickup_demand_zone_hour"
+# SOURCE_* are read on the silver ref; TARGET is written on main. Same
+# namespace throughout — the active Nessie branch selects the layer.
+SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
+SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
+TARGET = "nessie.nyc.pickup_demand_zone_hour"
+TARGET_LOCATION = nessie.table_location("gold", "pickup_demand_zone_hour")
 
 # Strict left join with silver zones — silver guarantees PU IDs are in [1, 265]
 # and the lookup covers the full range, so no NULL zone column is acceptable.
@@ -168,7 +171,7 @@ def wap_aggregate(
             )
 
             nessie.set_spark_branch(spark, branch_name)
-            spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
+            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             if not table_exists(spark):
                 print(f"  [{label}] Creating table {TARGET}")
@@ -177,6 +180,7 @@ def wap_aggregate(
                         {schema_to_ddl(GOLD_SCHEMA)}
                     ) USING iceberg
                     PARTITIONED BY (months(hour_bucket))
+                    LOCATION '{TARGET_LOCATION}'
                     TBLPROPERTIES (
                         'format-version' = '2',
                         'write.spark.check-nullability' = 'false'

@@ -7,9 +7,9 @@ Usage:
 from common.spark_factory import get_spark
 from common import nessie_manager as nessie
 
-TABLE = "nessie.silver.yellow_taxi"
-NAMESPACE = "nessie.silver"
-SILVER_DATA_PREFIX = "s3a://warehouse/silver/"
+TABLE = "nessie.nyc.yellow_taxi"
+NAMESPACE = nessie.NAMESPACE
+SILVER_DATA_PREFIX = "s3a://warehouse/silver/"  # whole silver layer (incl. silver/nyc/)
 SILVER_REF_PREFIXES = (
     "wap/silver-",
     "silver-",

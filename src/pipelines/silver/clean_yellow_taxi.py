@@ -17,8 +17,11 @@ from common import nessie_manager as nessie
 
 YEARS = [2019, 2020, 2022, 2023, 2025]
 MONTHS = [1, 2, 3]
-SOURCE = "nessie.bronze.yellow_taxi"
-TARGET = "nessie.silver.yellow_taxi"
+# SOURCE and TARGET share an identifier — same table name, different Nessie
+# branch (bronze vs silver). The active ref decides which one a read hits.
+SOURCE = "nessie.nyc.yellow_taxi"
+TARGET = "nessie.nyc.yellow_taxi"
+TARGET_LOCATION = nessie.table_location("silver", "yellow_taxi")
 
 VALID_LOCATION_MIN = 1
 VALID_LOCATION_MAX = 265  # 264/265 = Unknown/NV, kept intentionally
@@ -141,12 +144,13 @@ def wap_clean(
 
             if not table_exists(spark):
                 print(f"  [{label}] Creating table {TARGET}")
-                spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+                spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
                 spark.sql(f"""
                     CREATE TABLE {TARGET} (
                         {schema_to_ddl(SILVER_SCHEMA)}
                     ) USING iceberg
                     PARTITIONED BY (months(tpep_pickup_datetime))
+                    LOCATION '{TARGET_LOCATION}'
                     TBLPROPERTIES (
                         'format-version' = '2',
                         'write.spark.check-nullability' = 'false'

@@ -1,11 +1,11 @@
 """ML use case 2 — predict trip_duration_minutes from gold trip features.
 
-Reads only nessie.gold.yellow_taxi_trips on main. Post-trip explanatory model
+Reads only nessie.nyc.yellow_taxi_trips on main (gold). Post-trip explanatory model
 (uses measured trip_distance), not a real-time ETA. Three-phase workflow per
 script run, all logged to the same MLflow experiment with `phase` tag:
 
-  Phase 1 — algorithmrithm comparison: LR, RF, GBT with default hyperparameters.
-  Phase 2 — hyperparameter tuning of the algorithmrithm with lowest val RMSE.
+  Phase 1 — algorithm comparison: LR, RF, GBT with default hyperparameters.
+  Phase 2 — hyperparameter tuning of the algorithm with lowest val RMSE.
   Phase 3 — learning curve over cumulative year subsets with the tuned model.
 """
 
@@ -13,7 +13,7 @@ import sys
 
 from pyspark.sql.functions import col
 
-from ml.common import (
+from ml.ml_common import (
     DEFAULT_PARAMS,
     MLFLOW_TRACKING_URI,
     PARAM_GRIDS,
@@ -30,7 +30,7 @@ from ml.common import (
 )
 
 EXPERIMENT = "trip_duration"
-SOURCE = "nessie.gold.yellow_taxi_trips"
+SOURCE = "nessie.nyc.yellow_taxi_trips"
 LABEL_COL = "trip_duration_minutes"
 YEAR_COL = "pickup_year"
 
@@ -70,9 +70,15 @@ def main() -> None:
     try:
         setup_mlflow(EXPERIMENT)
 
+        # Project to just the label + features — the gold table is much wider,
+        # and caching the full row would blow the executor heap.
         # Silver enforces pickup < dropoff but unix_timestamp truncates to the
         # second, so sub-second trips render as duration 0. Drop them.
-        df = spark.table(SOURCE).filter(col(LABEL_COL) > 0)
+        df = (
+            spark.table(SOURCE)
+            .select(LABEL_COL, *NUMERICAL_COLS, *CATEGORICAL_COLS)
+            .filter(col(LABEL_COL) > 0)
+        )
 
         train, val, test_id, test_ood = make_splits(df, YEAR_COL, TEST_YEARS)
         train, val, test_id, test_ood = (
@@ -214,7 +220,7 @@ def main() -> None:
                 f"(rows with duration <= 0 are filtered out — sub-second "
                 f"trips render as 0 due to unix_timestamp truncation). "
                 f"Each version is the best model from one run of "
-                f"src/ml/trip_duration.py — algorithmrithm comparison → "
+                f"src/ml/trip_duration.py — algorithm comparison → "
                 f"hyperparameter tuning → year-subset learning curve. "
                 f"Promotion is Pareto-style: @champion points to the best "
                 f"version so far on val_rmse (primary, strict improvement) "

@@ -1,17 +1,17 @@
 """ML use case 3 — predict n_pickups per (pu_location_id, hour_bucket).
 
-Reads only nessie.gold.pickup_demand_zone_hour on main. Per-bucket regression
+Reads only nessie.nyc.pickup_demand_zone_hour on main (gold). Per-bucket regression
 with calendar + zone features (no lag features). Three-phase workflow per
 script run, all logged to the same MLflow experiment with `phase` tag:
 
-  Phase 1 — algorithmrithm comparison: LR, RF, GBT with default hyperparameters.
-  Phase 2 — hyperparameter tuning of the algorithmrithm with lowest val RMSE.
+  Phase 1 — algorithm comparison: LR, RF, GBT with default hyperparameters.
+  Phase 2 — hyperparameter tuning of the algorithm with lowest val RMSE.
   Phase 3 — learning curve over cumulative year subsets with the tuned model.
 """
 
 import sys
 
-from ml.common import (
+from ml.ml_common import (
     DEFAULT_PARAMS,
     MLFLOW_TRACKING_URI,
     PARAM_GRIDS,
@@ -28,7 +28,7 @@ from ml.common import (
 )
 
 EXPERIMENT = "demand_forecast"
-SOURCE = "nessie.gold.pickup_demand_zone_hour"
+SOURCE = "nessie.nyc.pickup_demand_zone_hour"
 LABEL_COL = "n_pickups"
 YEAR_COL = "hour_year"
 
@@ -66,7 +66,9 @@ def main() -> None:
     try:
         setup_mlflow(EXPERIMENT)
 
-        df = spark.table(SOURCE)
+        # Project to just the label + features — caching only the columns the
+        # model uses keeps the cached split small on a 1 GB executor heap.
+        df = spark.table(SOURCE).select(LABEL_COL, *NUMERICAL_COLS, *CATEGORICAL_COLS)
         train, val, test_id, test_ood = make_splits(df, YEAR_COL, TEST_YEARS)
         train, val, test_id, test_ood = (
             train.cache(), val.cache(), test_id.cache(), test_ood.cache(),
@@ -206,7 +208,7 @@ def main() -> None:
                 f"Source: {SOURCE} (Nessie main). Target: {LABEL_COL} "
                 f"(per-hour pickup count per zone, pre-aggregated upstream). "
                 f"Each version is the best model from one run of "
-                f"src/ml/demand_forecast.py — algorithmrithm comparison → "
+                f"src/ml/demand_forecast.py — algorithm comparison → "
                 f"hyperparameter tuning → year-subset learning curve. "
                 f"Promotion is Pareto-style: @champion points to the best "
                 f"version so far on val_rmse (primary, strict improvement) "
