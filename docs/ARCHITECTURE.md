@@ -100,12 +100,42 @@ from the schema by `src/common/iceberg_schema.py.schema_to_ddl()`. This puts the
 | Layer       | Policy                                                                                       |
 |-------------|----------------------------------------------------------------------------------------------|
 | Bronze      | All columns `NULLABLE` — bronze is faithful to source, including its missing values.         |
-| Silver      | `NOT NULL` on every column the `clean()` function provably filters (datetimes, IDs, amounts checked `>= 0`, fields with `isin`/`between`/`isNotNull`). Surcharges not filtered (`extra`, `mta_tax`, `improvement_surcharge`) and year-dependent fields (`congestion_surcharge`, `airport_fee`, `cbd_congestion_fee`) stay `NULLABLE`. |
+| Silver      | `NOT NULL` on every column the `clean()` function provably filters (datetimes, IDs, `fare_amount` / `total_amount` checked `> 0`, `trip_distance` / `tip_amount` / `tolls_amount` checked `>= 0`, fields with `isin` / `between` / `isNotNull`). Surcharges not filtered (`extra`, `mta_tax`, `improvement_surcharge`) and year-dependent fields (`congestion_surcharge`, `airport_fee`, `cbd_congestion_fee`) stay `NULLABLE`. |
 | Gold        | `NOT NULL` on every column traceable to a silver `NOT NULL` column, on every derived time feature (year/month/week/dow/hour, `trip_duration_minutes`), and on every zone field the audit gate guarantees (`pu_borough`, `pu_zone`, `do_borough`, `do_zone`). `pu_service_zone` and `do_service_zone` stay `NULLABLE` because silver's `taxi_zone_lookup.service_zone` is not filtered. |
 
 **`passenger_count` is `NOT NULL` from silver onward** — the existing
 `between(1, 6)` filter in `clean()` drops `NULL` implicitly (`NULL BETWEEN 1 AND 6 → NULL`).
 Trips with no passenger count never enter silver.
+
+### Data Cleaning & Outlier Policy (silver)
+
+`clean_yellow_taxi.py.clean()` runs in two stages:
+
+1. **Validity filtering** drops rows that are *wrong*: NULL pickup/dropoff
+   timestamps, `pickup >= dropoff`, negative `trip_distance` / `tip_amount` /
+   `tolls_amount`, **non-positive `fare_amount` / `total_amount`** (a 0 fare /
+   total is a recording error, not a real trip), location IDs outside
+   `1..265`, categorical codes off the TLC 2024 dictionary (`VendorID`,
+   `RatecodeID`, `payment_type`, `store_and_fwd_flag`), `passenger_count`
+   outside `1..6`, exact 20-column duplicates.
+2. **IQR outlier removal** then trims **both tails** on `fare_amount`,
+   `total_amount`, `trip_distance` and trip duration using Tukey "far out"
+   fences `[Q1 − 3·IQR, Q3 + 3·IQR]` (`IQR_K = 3.0`). Fences are computed
+   **per `RatecodeID`** (metered, JFK flat, Newark flat, Nassau/Westchester,
+   negotiated, group ride, unknown) because each rate code is a distinct
+   fare population; a single global fence is dominated by `RatecodeID = 1`
+   (~99.5 % of rows) and would clip legitimate airport / negotiated trips.
+   Groups with fewer than 50 rows skip the fence to avoid unstable quartiles.
+   Implementation: one `groupBy("RatecodeID").agg(percentile_approx(...))`
+   aggregation is `.collect()`-ed to Python and the per-code fences are baked
+   into a single `CASE WHEN` per column, so the filter runs in one pass with
+   no join.
+
+The audit gate (`MAX_DROP_RATIO = 0.35`) quarantines any month whose total
+drop ratio exceeds 35 % — raised from the pre-IQR threshold of 20 % to give
+the IQR stage headroom. Quarantined months freeze the WAP snapshot as a
+`review/silver-...` tag and the loop continues; failures are reported in an
+end-of-run summary, not raised.
 
 **Iceberg property `write.spark.check-nullability = false`** is set on every table.
 This disables Spark/Iceberg's planning-time nullability check (which would otherwise
@@ -223,16 +253,20 @@ OpenMetadata Server
 ```
 src/ml/{fare_prediction,trip_duration,demand_forecast}.py
     ↓ (reads only the gold tables — nessie.nyc.* on main — strict medallion)
-Spark MLlib pipeline (StringIndexer → VectorAssembler → GBTRegressor)
+Spark MLlib pipeline (StringIndexer → optional OneHot/Scaler →
+    VectorAssembler → optional VectorIndexer → estimator)
+    estimator ∈ { Ridge (squared loss, pure L2), RandomForest, GBT }
+    (tree models use maxBins=300 for the ~265-level location IDs)
     ↓
 MLflow (Tracking Server, behind the `ml` profile)
-    ├── PostgreSQL (run metadata, params, metrics)
+    ├── PostgreSQL (run metadata, params, metrics, tags)
     └── MinIO S3 (PipelineModel artifacts in mlflow-artifacts bucket)
         ↓
-    Model Registry (MLflow)
+    Model Registry (MLflow) — Pareto champion / challenger
         ↓
-    Diagnostics notebooks load the latest run
-    (predicted vs actual, residuals, feature importance, per-year drift)
+    Diagnostics notebooks load `<model>@champion` from the registry
+    (val ↔ test_id selection-overfitting check, test_id ↔ test_ood drift,
+     predicted vs actual, residuals, feature importance, per-year drift)
 ```
 
 ### ML Use Cases
@@ -243,14 +277,42 @@ MLflow (Tracking Server, behind the `ml` profile)
 | 2 | `trip_duration.py`      | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips` (main) | same                             |
 | 3 | `demand_forecast.py`    | `n_pickups`             | `nessie.nyc.pickup_demand_zone_hour` (main) | same (year column: `hour_year`)  |
 
-All three share the `train_regression(...)` helper in `src/ml/ml_common.py`, which
-encapsulates Spark/MLflow setup, optional pre-filter, temporal split, pipeline
-build, fit, evaluate and logging. Each use-case script just declares its
-constants (source, label, feature lists) and calls the helper. Default GBT
-hyperparameters (`DEFAULT_GBT_PARAMS = {maxIter: 50, maxDepth: 6, stepSize: 0.1,
-seed: 42}`) are baseline-only — overridable per script via `gbt_params`.
+All three use cases share the building blocks in `src/ml/ml_common.py`
+(`make_splits`, `build_regression_pipeline`, `make_estimator`,
+`train_and_log_run`, `register_final_model`) and run the same **three-phase
+workflow** end-to-end:
+
+1. **Algorithm comparison** — train Ridge, RandomForest and GBT with
+   `DEFAULT_PARAMS`; pick the winner by val RMSE.
+2. **Hyperparameter tuning** — grid-search the winner over
+   `PARAM_GRIDS[winner]`; pick the best config by val RMSE.
+3. **Learning curve** — train every algorithm on each `TRAIN_YEAR_SUBSETS`
+   slice (the winner with its Phase-2 best params, the rest with
+   `DEFAULT_PARAMS`).
+
+The winner's largest-subset run is registered into the MLflow Model Registry
+under the use-case name (`fare_prediction`, `trip_duration`,
+`demand_forecast`). The registry applies a Pareto-style champion / challenger
+gate: promote to `@champion` only if `val_rmse` strictly improves on the
+current champion **and** `test_id_rmse` does not degrade beyond 2 % of the
+champion's; otherwise the new version stays as `@challenger`. Version
+description carries source + features + target + algorithm + scores; version
+tags expose algorithm + train years + per-split RMSE/MAE/R² for filtering in
+the registry UI.
+
+The `ridge` estimator uses ordinary squared-error loss (no Huber): silver
+removes upper-tail outliers via the per-`RatecodeID` IQR fences, so the
+squared-error objective is no longer dragged by a few extreme rows and the
+robust loss is unnecessary. Tree models (`rf`, `gbt`) set
+`maxBins = TREE_MAX_BINS = 300` so the ~265-level `pu_location_id` /
+`do_location_id` clear Spark's `buildMetadata` arity check.
 
 Pre-trip / known-at-pickup features only — no leakage from post-trip amounts.
+
+Every script accepts `--fast` (or `ML_FAST_MODE=1`) for smoke tests: samples
+1 % of gold and shrinks grids/year-subsets so the full three-phase workflow +
+a throwaway registry version run in minutes. Metrics are not meaningful in
+fast mode.
 
 ### Trade-offs
 

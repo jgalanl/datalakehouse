@@ -209,23 +209,40 @@ LIMIT 20;
 
 ## MLflow / ML Training
 
-The three ML use cases share the same skeleton via `train_regression(...)` in
-`src/ml/ml_common.py`: pin Spark to `main`, set up MLflow, load a gold table
-(optionally pre-filter), do a temporal split (train: 2019-2023, test: 2025),
-build a `StringIndexer → VectorAssembler → GBTRegressor` pipeline, train,
-evaluate, and log params + metrics + model. Each use-case script just declares
-its source/label/feature lists and calls the helper.
+The three use cases share the building blocks in `src/ml/ml_common.py`:
+`get_ml_spark` / `setup_mlflow`, `make_splits` (stratified 70/15/15 over
+in-distribution years + held-out OOD years), `build_regression_pipeline`
+(StringIndexer → optional OneHot/Scaler → VectorAssembler → optional
+VectorIndexer → estimator), `make_estimator` for three families
+(`ridge`/`rf`/`gbt`), `train_and_log_run`, and `register_final_model`.
+
+Each script runs the same three-phase workflow inside its MLflow experiment:
+
+1. **Phase 1 — algorithm comparison.** Train Ridge + RF + GBT with
+   `DEFAULT_PARAMS`, pick the winner by val RMSE.
+2. **Phase 2 — tuning.** Grid-search the winner over `PARAM_GRIDS[winner]`,
+   pick the best config by val RMSE.
+3. **Phase 3 — learning curve.** Train every algorithm on each
+   `TRAIN_YEAR_SUBSETS` slice (the winner uses its Phase-2 best params, the
+   rest use `DEFAULT_PARAMS`).
+
+The winner's largest-subset run is registered into the MLflow Model Registry
+under the use-case name. Pareto champion/challenger: promote to `@champion`
+only if `val_rmse` strictly improves on the current champion **and**
+`test_id_rmse` does not degrade beyond 2 % of the champion's; otherwise stay
+as `@challenger`.
 
 ```bash
-# Train (one experiment per use case in MLflow)
+# Train (one experiment per use case in MLflow; --fast = smoke test on a 1% sample)
 docker exec -it spark-master spark-submit /opt/spark/src/ml/fare_prediction.py    # fare_prediction
 docker exec -it spark-master spark-submit /opt/spark/src/ml/trip_duration.py       # trip_duration
 docker exec -it spark-master spark-submit /opt/spark/src/ml/demand_forecast.py     # demand_forecast
 ```
 
-Open the MLflow UI at http://localhost:5000 to inspect runs, then open the
-corresponding `src/notebooks/ml/*_diagnostics.ipynb` to plot predicted vs actual,
-residuals, feature importance and per-year drift on the latest run.
+Open the MLflow UI at http://localhost:5000 to inspect runs and the registered
+models (`fare_prediction`, `trip_duration`, `demand_forecast`), then open the
+matching `src/notebooks/ml/*_diagnostics.ipynb` to load `<model>@champion` and
+plot predicted vs actual, residuals, feature importance and per-year drift.
 
 ### Programmatic MLflow access
 
@@ -253,11 +270,13 @@ model = mlflow.spark.load_model(f"runs:/{last_run.info.run_id}/model")
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/bronze/ingest_yellow_taxi.py
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/bronze/ingest_zone_lookup.py
 
-# Silver — clean / conform from bronze, WAP per month with audit + quarantine
+# Silver — clean / conform from bronze, WAP per month with audit + quarantine.
+# clean() = validity filtering (non-positive fare/total, bad timestamps, off-dict
+# codes, ...) + per-RatecodeID IQR outlier removal on
+# fare_amount/total_amount/trip_distance/duration. Months above 35 % drop ratio
+# → review/silver-... tag.
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_yellow_taxi.py
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_zone_lookup.py
-# Reset the silver layer (drops all silver refs, wipes s3a://warehouse/silver/, recreates from main)
-docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/reset_silver.py
 
 # Gold — join + aggregate from silver, WAP per month against `main`
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/gold/build_yellow_taxi_trips.py

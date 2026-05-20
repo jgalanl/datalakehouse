@@ -312,27 +312,39 @@ persistent `silver` branch, writes the cleaned output, audits it, and only merge
 on success. Failing audits are quarantined as immutable `review/` tags and the run
 continues (see `src/pipelines/silver/clean_yellow_taxi.py` and `clean_zone_lookup.py`).
 
-`SILVER_SCHEMA` is declared **per pipeline** with explicit `NOT NULL` on every column
-that the `clean()` function provably filters (datetimes, IDs, amounts, `passenger_count`
-between 1 and 6, etc.). Unfiltered surcharges (`extra`, `mta_tax`, `improvement_surcharge`)
-and year-dependent fields (`congestion_surcharge`, `airport_fee`, `cbd_congestion_fee`)
-remain nullable. Tables are created via `CREATE TABLE ... USING iceberg` SQL DDL so the
+`clean()` runs in two stages: **validity filtering** drops rows that are wrong
+(NULL datetimes, `pickup >= dropoff`, non-positive `fare_amount` / `total_amount`,
+negative `trip_distance` / `tip_amount` / `tolls_amount`, location IDs outside
+`1..265`, categorical codes off the TLC dictionary, `passenger_count` outside
+`1..6`, exact 20-column duplicates), then **IQR outlier removal** trims both tails
+on `fare_amount`, `total_amount`, `trip_distance` and trip duration using Tukey
+"far out" fences `[Q1 − 3·IQR, Q3 + 3·IQR]` **computed per `RatecodeID`** (metered,
+flat-fare JFK/Newark, negotiated, group, unknown — each is a distinct fare
+population). Groups with fewer than 50 rows skip the fence to avoid unstable
+quartiles. The audit gate quarantines any month whose total drop ratio exceeds
+35 %.
+
+`SILVER_SCHEMA` is declared **per pipeline** with explicit `NOT NULL` on every
+column the `clean()` filters provably make non-null (datetimes, IDs, `> 0` /
+`>= 0` amounts, `passenger_count` between 1 and 6, etc.). Unfiltered surcharges
+(`extra`, `mta_tax`, `improvement_surcharge`) and year-dependent fields
+(`congestion_surcharge`, `airport_fee`, `cbd_congestion_fee`) remain nullable.
+Tables are created via `CREATE TABLE ... USING iceberg` SQL DDL so the
 `NOT NULL` constraints land in Iceberg's metadata.
 
 ```bash
-# Yellow taxi (monthly, partitioned, WAP with 20% drop-ratio threshold)
+# Yellow taxi (monthly, partitioned, WAP with validity + per-RatecodeID IQR
+# outlier removal; audit gate at 35% drop ratio)
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_yellow_taxi.py
 
 # Zone lookup (small reference, full refresh)
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_zone_lookup.py
-
-# Reset the silver layer (drops all silver refs, wipes s3a://warehouse/silver/, recreates silver from main)
-docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/reset_silver.py
 ```
 
 Verify the silver layer interactively via `src/notebooks/silver/verify_iceberg.ipynb`
 (Jupyter at http://localhost:8888): Nessie refs, schema, snapshots, yearly growth,
-cleaning-rule assertions, bronze↔silver retention, and zone-lookup orphan detection.
+cleaning-rule assertions (validity + per-month per-`RatecodeID` IQR fence
+verification), bronze↔silver retention, and zone-lookup orphan detection.
 
 ### 3. Gold Build
 
@@ -423,7 +435,7 @@ datalakehouse/
 │   │                        #   Iceberg DDL generator (spark_factory.py, nessie_manager.py, iceberg_schema.py)
 │   ├── pipelines/
 │   │   ├── bronze/          # Download + Iceberg ingestion (ingest_yellow_taxi.py, ingest_zone_lookup.py)
-│   │   ├── silver/          # Bronze → Silver (clean_yellow_taxi.py, clean_zone_lookup.py, reset_silver.py)
+│   │   ├── silver/          # Bronze → Silver (clean_yellow_taxi.py, clean_zone_lookup.py)
 │   │   └── gold/            # Silver → Gold (build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py)
 │   ├── ml/                  # ML training scripts on gold (ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py)
 │   └── notebooks/           # Jupyter notebooks, split per medallion layer

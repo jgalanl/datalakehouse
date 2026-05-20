@@ -63,18 +63,23 @@ src/
 │   │   └── ingest_zone_lookup.py     # Taxi zone lookup → nessie.nyc.taxi_zone_lookup
 │   ├── silver/                 # Bronze → Silver (clean, conform, deduplicate)
 │   │   ├── clean_yellow_taxi.py      # WAP per month, audit on drop ratio, quarantine on fail
-│   │   ├── clean_zone_lookup.py      # full refresh, row-count audit
-│   │   └── reset_silver.py           # drops all silver refs and rebuilds from main
+│   │   └── clean_zone_lookup.py      # full refresh, row-count audit
 │   └── gold/                   # Silver → Gold (join, aggregate, ML features)
 │       ├── build_yellow_taxi_trips.py        # trip-level enriched + time features (WAP on main)
 │       └── aggregate_demand_zone_hour.py     # (zone, hour) demand aggregate (WAP on main)
 ├── ml/                         # ML training scripts (Spark MLlib + MLflow), gold-only
-│   ├── ml_common.py                    # Shared helpers + train_regression() — full GBT skeleton (Spark+MLflow setup,
-│   │                                   #   load, optional pre-filter, temporal split, fit, evaluate, log) used by all 3 scripts.
+│   ├── ml_common.py                    # Shared building blocks: get_ml_spark / setup_mlflow,
+│   │                                   #   make_splits (70/15/15 ID + held-out OOD years),
+│   │                                   #   build_regression_pipeline, make_estimator (ridge/rf/gbt),
+│   │                                   #   DEFAULT_PARAMS / PARAM_GRIDS, train_and_log_run,
+│   │                                   #   register_final_model (Pareto champion/challenger).
 │   │                                   #   Named ml_common (not common) so it doesn't shadow the top-level common package.
-│   ├── fare_prediction.py              # Use case 1 — config + main(); calls train_regression
-│   ├── trip_duration.py                # Use case 2 — same, with pre_filter to drop trip_duration_minutes <= 0
-│   └── demand_forecast.py              # Use case 3 — same, with year_col="hour_year" for the temporal split
+│   ├── fare_prediction.py              # Use case 1 — fare_amount on yellow_taxi_trips. Runs the
+│   │                                   #   3-phase workflow (compare → tune → learning curve) +
+│   │                                   #   registers as MLflow model `fare_prediction`.
+│   ├── trip_duration.py                # Use case 2 — same workflow on trip_duration_minutes
+│   │                                   #   (with filter(LABEL > 0) for sub-second trips).
+│   └── demand_forecast.py              # Use case 3 — same workflow on n_pickups, year_col="hour_year".
 └── notebooks/                  # Jupyter notebooks, split per medallion layer
     ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019),
     │                           # preprocess.ipynb (Spark, full-dataset EDA → silver-rule evidence),

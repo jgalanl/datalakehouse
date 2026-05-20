@@ -38,12 +38,6 @@ docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_
 docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/clean_zone_lookup.py
 ```
 
-> Reset selectivo de la capa silver (drop refs `wap/silver-*`, `silver-*`, `review/silver-*`,
-> wipe `s3a://warehouse/silver/`, recrea `silver` desde `main`):
-> ```bash
-> docker exec -it spark-master spark-submit /opt/spark/src/pipelines/silver/reset_silver.py
-> ```
-
 ## 4. Gold — curación
 
 ```bash

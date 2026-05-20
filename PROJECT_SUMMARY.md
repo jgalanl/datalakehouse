@@ -101,7 +101,7 @@ datalakehouse/
 │   ├── common/                 # spark_factory.py, nessie_manager.py, iceberg_schema.py
 │   ├── pipelines/
 │   │   ├── bronze/             # ingest_yellow_taxi.py, ingest_zone_lookup.py
-│   │   ├── silver/             # clean_yellow_taxi.py, clean_zone_lookup.py, reset_silver.py
+│   │   ├── silver/             # clean_yellow_taxi.py, clean_zone_lookup.py
 │   │   └── gold/               # build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py
 │   ├── ml/                     # ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py
 │   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (diagnostics)
@@ -175,10 +175,16 @@ Experiment tracking, model registration, staging, and version management.
 
 #### `src/pipelines/silver/` — silver cleaning
 
-- `clean_yellow_taxi.py`: WAP per month against `nessie.nyc.yellow_taxi` on the `silver`
-  branch, audit on drop ratio, quarantine to `review/silver-...` tag on failure
+- `clean_yellow_taxi.py`: WAP per month against `nessie.nyc.yellow_taxi` on the
+  `silver` branch. `clean()` runs validity filtering (NULL datetimes,
+  `pickup >= dropoff`, non-positive `fare_amount` / `total_amount`, negative
+  distance / tips / tolls, location IDs outside `1..265`, codes off the TLC
+  dictionary, `passenger_count` outside `1..6`, duplicates) followed by IQR
+  outlier removal — Tukey "far out" fences `[Q1 − 3·IQR, Q3 + 3·IQR]` computed
+  **per `RatecodeID`** on `fare_amount` / `total_amount` / `trip_distance` /
+  trip duration. Audit gate quarantines any month above 35 % drop ratio to a
+  `review/silver-...` tag.
 - `clean_zone_lookup.py`: full refresh of `nessie.nyc.taxi_zone_lookup` on `silver`
-- `reset_silver.py`: drops all silver refs and rebuilds the layer from scratch
 
 #### `src/pipelines/gold/` — gold curation
 
@@ -190,17 +196,38 @@ Experiment tracking, model registration, staging, and version management.
 
 #### `src/ml/` — ML training (Spark MLlib + MLflow)
 
-- `ml_common.py`: shared helpers (MLflow setup, gold loaders, temporal split:
-  train 2019/2020/2022/2023 vs test 2025, pipeline + evaluation helpers) **plus
-  `train_regression()`** — the full GBT training skeleton (Spark/MLflow setup,
-  load, optional pre-filter, split, fit, evaluate, log params + metrics + model)
-  shared by the three use cases. `DEFAULT_GBT_PARAMS` is also defined here.
-- `fare_prediction.py`: use case 1 — declares the source/label/feature lists and
-  calls `train_regression(...)`. Target: `fare_amount`.
-- `trip_duration.py`: use case 2 — same skeleton + `pre_filter` to drop trips
-  with `trip_duration_minutes <= 0` (sub-second trips). Target: `trip_duration_minutes`.
-- `demand_forecast.py`: use case 3 — same skeleton + `year_col="hour_year"` for
-  the temporal split. Target: `n_pickups`.
+- `ml_common.py`: shared building blocks — `get_ml_spark` / `setup_mlflow`,
+  `make_splits` (stratified-by-year 70/15/15 train/val/test_id + held-out OOD
+  years), `build_regression_pipeline` (StringIndexer → optional OneHot →
+  VectorAssembler → optional VectorIndexer → optional StandardScaler →
+  estimator), `make_estimator(algorithm)` + `algorithm_pipeline_config` for
+  three estimator families (`ridge` LinearRegression with squared-error loss
+  pinned to pure L2 — silver's IQR outlier removal lets the squared-error fit
+  stay accurate without robust Huber loss; `rf` RandomForest; `gbt` GBT — tree
+  models get `maxBins = 300` for the ~265-level location IDs), `DEFAULT_PARAMS`
+  and `PARAM_GRIDS` catalogues, `evaluate_regression`, `log_split_metrics`,
+  `train_and_log_run`, `register_final_model` (Pareto champion/challenger).
+  Named `ml_common` so it doesn't shadow the top-level `common` package when
+  spark-submit puts `src/ml/` on `sys.path[0]`.
+- All three use-case scripts follow the same three-phase workflow:
+  **Phase 1** algorithm comparison (Ridge + RF + GBT with `DEFAULT_PARAMS`,
+  pick winner by val RMSE) → **Phase 2** hyperparameter tuning of the winner
+  over `PARAM_GRIDS[winner]` → **Phase 3** learning curve over
+  `TRAIN_YEAR_SUBSETS` for every algorithm. The winner's largest-subset run is
+  registered into the MLflow Model Registry; Pareto champion/challenger gating
+  uses `val_rmse` for promotion plus a `test_id_rmse` degradation guard.
+- `fare_prediction.py`: use case 1 — target `fare_amount` on
+  `nessie.nyc.yellow_taxi_trips`. Registered model `fare_prediction`.
+- `trip_duration.py`: use case 2 — target `trip_duration_minutes` on the same
+  table; adds `filter(col(LABEL) > 0)` for sub-second trips. Registered model
+  `trip_duration`.
+- `demand_forecast.py`: use case 3 — target `n_pickups` on
+  `nessie.nyc.pickup_demand_zone_hour`, year column `hour_year`. Registered
+  model `demand_forecast`.
+- Every script accepts `--fast` (or `ML_FAST_MODE=1`) for smoke tests: samples
+  1 % of gold and shrinks grids/subsets so the full three-phase workflow + a
+  throwaway registry version runs end-to-end in minutes. Metrics are not
+  meaningful in fast mode.
 
 ### Notebooks
 
