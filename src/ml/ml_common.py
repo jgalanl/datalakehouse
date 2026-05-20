@@ -250,19 +250,17 @@ def build_regression_pipeline(
 # Algorithm catalogue. Each script's Phase 1 (algorithm comparison) iterates
 # over these three estimators with the DEFAULT_PARAMS shown below; Phase 2
 # (tuning) iterates over PARAM_GRIDS[winner]. The three are distinct model
-# families: `ridge` is the linear baseline (LinearRegression with Huber loss
-# and the elastic-net mix pinned to pure L2 — regularized because the
+# families: `ridge` is the linear baseline (LinearRegression with the
+# elastic-net mix pinned to pure L2 — regularized because the
 # one-hot-expanded location IDs make plain OLS prone to overfit), `rf` is a
 # bagging ensemble and `gbt` a boosting ensemble.
 def make_estimator(algorithm: str, **params):
     if algorithm == "ridge":
-        # L2-regularized linear model (elastic-net mix fixed at 0). Huber loss
-        # instead of squared error: gold deliberately keeps upper-tail outliers
-        # (negotiated fares, airport runs), and a squared-error fit lets a
-        # handful of extreme rows dominate the objective — Huber caps each
-        # residual's influence past `epsilon`, the standard robust-regression
-        # remedy. Huber loss requires the pure-L2 mix, already pinned here.
-        return LinearRegression(loss="huber", elasticNetParam=0.0, **params)
+        # L2-regularized linear model — squared-error loss, elastic-net mix
+        # fixed at 0 (pure ridge). Silver removes the upper-tail outliers via
+        # IQR fences, so the squared-error objective is no longer dragged by a
+        # few extreme rows and the robust Huber loss is unnecessary.
+        return LinearRegression(elasticNetParam=0.0, **params)
     if algorithm == "rf":
         return RandomForestRegressor(**params)
     if algorithm == "gbt":
@@ -279,7 +277,7 @@ def algorithm_pipeline_config(algorithm: str) -> dict:
 
 
 DEFAULT_PARAMS: dict[str, dict] = {
-    "ridge": {"regParam": 0.1},   # elasticNetParam fixed at 0.0, loss="huber" by make_estimator
+    "ridge": {"regParam": 0.1},   # elasticNetParam fixed at 0.0 by make_estimator
     "rf": {"numTrees": 20, "maxDepth": 8, "maxBins": TREE_MAX_BINS, "seed": 42},
     "gbt": {"maxIter": 50, "maxDepth": 6, "stepSize": 0.1, "maxBins": TREE_MAX_BINS, "seed": 42},
 }
