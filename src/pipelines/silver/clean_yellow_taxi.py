@@ -6,7 +6,10 @@ WAP pattern: branch from silver, read bronze, clean, validate, merge to silver.
 import sys
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, month as spark_month, year as spark_year
+from pyspark.sql.functions import (
+    col, count as spark_count, lit, month as spark_month,
+    percentile_approx, unix_timestamp, when, year as spark_year,
+)
 from pyspark.sql.types import (
     DoubleType, LongType, StringType, StructField, StructType, TimestampNTZType,
 )
@@ -31,7 +34,29 @@ VALID_VENDOR_IDS    = [1, 2, 6, 7]           # Creative Mobile Tech, Curb Mobili
 VALID_RATE_CODES    = [1, 2, 3, 4, 5, 6, 99] # Standard, JFK, Newark, Nassau/Westchester, Negotiated, Group, Null/unknown
 VALID_PAYMENT_TYPES = [0, 1, 2, 3, 4, 5, 6]  # Flex Fare, Credit card, Cash, No charge, Dispute, Unknown, Voided
 
-MAX_DROP_RATIO = 0.20
+# IQR outlier removal. After validity filtering, clean() drops rows whose
+# fare/total/distance/duration fall outside Tukey "far out" fences
+# [Q1 - k*IQR, Q3 + k*IQR], with k=3.0 the conservative "far out" setting.
+# Fences are computed PER RatecodeID: standard meter (1), JFK flat (2),
+# Newark flat (3), Nassau/Westchester (4), negotiated (5), group ride (6),
+# unknown (99) are distinct fare populations. A single global fence is
+# dominated by RatecodeID=1 (~99.5% of rows) and clips legitimate airport /
+# negotiated trips; per-code fences let each population set its own bounds.
+# Each per-month / per-RatecodeID group with fewer than SMALL_GROUP_THRESHOLD
+# rows falls back to validity-only (quartiles are unstable for tiny samples).
+IQR_K = 3.0
+QUANTILE_RELATIVE_ERROR = 0.001
+# percentile_approx's accuracy is the inverse of the relative error.
+QUANTILE_ACCURACY = int(1 / QUANTILE_RELATIVE_ERROR)
+SMALL_GROUP_THRESHOLD = 50
+# Trip duration (seconds) — derived only as the basis for its IQR fence;
+# silver does not store it, so clean() drops the column before the write.
+DURATION_COL = "_trip_duration_s"
+OUTLIER_COLS = ["fare_amount", "total_amount", "trip_distance", DURATION_COL]
+
+# Raised from 0.20: IQR outlier removal drops more rows than validity
+# filtering alone, so the audit gate needs headroom before quarantining.
+MAX_DROP_RATIO = 0.35
 
 # NOT NULL on every column the clean() function provably filters: each filter
 # (isNotNull, between, isin, comparison) treats NULL as falsy and drops the
@@ -61,17 +86,58 @@ SILVER_SCHEMA = StructType([
 ])
 
 
+def remove_outliers(df: DataFrame) -> DataFrame:
+    """Drop rows outside Tukey "far out" fences, computed per RatecodeID.
+
+    Each RatecodeID is a distinct fare population (metered, flat-fare JFK /
+    Newark, negotiated, group, unknown). One groupBy aggregation materialises
+    q1/q3 and the row count per code; the result (<=7 rows) is collected to
+    Python and the fences are baked into a single CASE WHEN per column, so
+    the filter runs in one pass over df with no join. Groups with fewer than
+    SMALL_GROUP_THRESHOLD rows skip the fence (quartiles are unstable for
+    tiny samples). Both tails are trimmed on fare_amount / total_amount /
+    trip_distance / trip duration.
+    """
+    fences = df.groupBy("RatecodeID").agg(
+        spark_count("*").alias("n"),
+        *[percentile_approx(c, [0.25, 0.75], QUANTILE_ACCURACY).alias(c)
+          for c in OUTLIER_COLS],
+    ).collect()
+
+    keep = lit(True)
+    for c in OUTLIER_COLS:
+        col_keep = lit(True)  # default: no fence -> row passes
+        for r in fences:
+            if r["n"] < SMALL_GROUP_THRESHOLD:
+                continue
+            q1, q3 = r[c]
+            iqr = q3 - q1
+            lo, hi = q1 - IQR_K * iqr, q3 + IQR_K * iqr
+            col_keep = when(
+                col("RatecodeID") == r["RatecodeID"],
+                col(c).between(lo, hi),
+            ).otherwise(col_keep)
+        keep = keep & col_keep
+    return df.filter(keep)
+
+
 def clean(df: DataFrame) -> DataFrame:
-    """Apply silver cleaning rules to a bronze DataFrame slice."""
-    return (
+    """Apply silver cleaning rules to a bronze DataFrame slice.
+
+    Two stages: validity filtering drops rows that are wrong (nulls, bad
+    datetime ordering, non-positive money, out-of-range codes/IDs,
+    duplicates); IQR outlier removal then trims statistical outliers on the
+    fare/total/distance/duration columns (see remove_outliers).
+    """
+    valid = (
         df
         .filter(col("tpep_pickup_datetime").isNotNull())
         .filter(col("tpep_dropoff_datetime").isNotNull())
         .filter(col("tpep_pickup_datetime") < col("tpep_dropoff_datetime"))
         .dropDuplicates()
         .filter(col("trip_distance") >= 0)
-        .filter(col("fare_amount") >= 0)
-        .filter(col("total_amount") >= 0)
+        .filter(col("fare_amount") > 0)   # a 0 fare is a recording error, not a trip
+        .filter(col("total_amount") > 0)  # likewise a 0 total
         .filter(col("tip_amount") >= 0)
         .filter(col("tolls_amount") >= 0)
         .filter(col("PULocationID").between(VALID_LOCATION_MIN, VALID_LOCATION_MAX))
@@ -83,6 +149,13 @@ def clean(df: DataFrame) -> DataFrame:
         .filter(col("store_and_fwd_flag").isin("Y", "N"))
         .filter(col("passenger_count").between(1, 6))
     )
+    # Derive trip duration (seconds) as the basis for its IQR fence only —
+    # silver does not store it, so it is dropped after outlier removal.
+    valid = valid.withColumn(
+        DURATION_COL,
+        unix_timestamp("tpep_dropoff_datetime") - unix_timestamp("tpep_pickup_datetime"),
+    )
+    return remove_outliers(valid).drop(DURATION_COL)
 
 
 def table_exists(spark: SparkSession) -> bool:
