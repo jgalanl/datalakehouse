@@ -117,6 +117,38 @@ def review_tag_name(layer: str, table: str, year: int, month: int) -> str:
     return f"review/{layer}-{table}-{year}-{month:02d}"
 
 
+def current_ref_hash(spark: SparkSession, ref: str = "main") -> str | None:
+    """Latest commit hash on `ref` (branch or tag). None if the ref is unknown.
+
+    Used by downstream consumers (ML training, audit notebooks) to pin the
+    Nessie state at run-time as an immutable identifier — the full hash
+    locates every table on every branch as of that moment.
+    """
+    rows = (
+        spark.sql("LIST REFERENCES IN nessie")
+        .filter(f"name = '{ref}'")
+        .collect()
+    )
+    if not rows:
+        return None
+    return rows[0]["hash"]
+
+
+def latest_snapshot_id(spark: SparkSession, table: str) -> int | None:
+    """Latest Iceberg snapshot ID for `table` on the current Nessie ref.
+
+    Reads the `<table>.snapshots` metadata table and returns the most recently
+    committed snapshot. None if the table has no snapshots yet (just created).
+    """
+    rows = spark.sql(
+        f"SELECT snapshot_id FROM {table}.snapshots "
+        f"ORDER BY committed_at DESC LIMIT 1"
+    ).collect()
+    if not rows:
+        return None
+    return int(rows[0]["snapshot_id"])
+
+
 def print_references(spark: SparkSession) -> None:
     refs_df = spark.sql("LIST REFERENCES IN nessie")
     rows = refs_df.collect()
