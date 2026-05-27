@@ -4,7 +4,7 @@
 # Dremio connects to Nessie as a data source (configured via the Dremio UI).
 # Both services work on the same underlying data files.
 #
-# Estimated steady-state memory: ~15 GB. Allocate at least 18 GB and 6 CPUs
+# Estimated steady-state memory: ~18 GB. Allocate at least 21 GB and 8 CPUs
 # in Docker Desktop.
 
 services:
@@ -143,6 +143,7 @@ services:
       - spark_data:/home/spark
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./config/spark/hadoop-metrics2.properties:/opt/spark/conf/hadoop-metrics2.properties:ro
       - ./src:/opt/spark/src
     depends_on:
       minio:
@@ -196,6 +197,7 @@ services:
       - spark_data:/home/spark
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./config/spark/hadoop-metrics2.properties:/opt/spark/conf/hadoop-metrics2.properties:ro
       - ./src:/opt/spark/src
     depends_on:
       spark-master:
@@ -214,6 +216,9 @@ services:
       service: compute
       component: spark-notebook
 
+  # Two identical workers give the cluster 2 executor JVMs × 2 cores = 4 cores total.
+  # Required so MLlib CrossValidator can fit two models in parallel (parallelism=2 in
+  # src/ml/tracking.py): each fit lands on its own executor instead of sharing memory.
   spark-worker-1:
     build:
       context: ./docker/spark
@@ -237,6 +242,48 @@ services:
     volumes:
       - spark_worker_1_data:/home/spark
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./config/spark/hadoop-metrics2.properties:/opt/spark/conf/hadoop-metrics2.properties:ro
+      - ./src:/opt/spark/src:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+        reservations:
+          memory: 1536M
+    labels:
+      service: compute
+      component: spark-worker
+
+  spark-worker-2:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+        spark://spark-master:7077
+        --webui-port 8082
+        --cores 2
+        --memory 2560m
+    ports:
+      - "8082:8082"
+    environment:
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      PYTHONPATH: "/opt/spark/src"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - spark_worker_2_data:/home/spark
+      - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./config/spark/hadoop-metrics2.properties:/opt/spark/conf/hadoop-metrics2.properties:ro
       - ./src:/opt/spark/src:ro
     depends_on:
       spark-master:
@@ -588,6 +635,8 @@ volumes:
   spark_data:
     driver: local
   spark_worker_1_data:
+    driver: local
+  spark_worker_2_data:
     driver: local
   dremio_data:      # Dremio uses embedded RocksDB, so no separate postgres volume needed
     driver: local
