@@ -103,8 +103,9 @@ datalakehouse/
 │   │   ├── bronze/             # ingest_yellow_taxi.py, ingest_zone_lookup.py
 │   │   ├── silver/             # clean_yellow_taxi.py, clean_zone_lookup.py
 │   │   └── gold/               # build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py
-│   ├── ml/                     # ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py
-│   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (diagnostics)
+│   ├── ml/                     # train.py (single entry point, dispatched by use case),
+│   │                           #   splits.py / pipelines.py / algorithms.py / tracking.py (shared building blocks)
+│   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (unified model_diagnostics)
 └── docs/                       # Documentation
 ```
 
@@ -196,38 +197,101 @@ Experiment tracking, model registration, staging, and version management.
 
 #### `src/ml/` — ML training (Spark MLlib + MLflow)
 
-- `ml_common.py`: shared building blocks — `get_ml_spark` / `setup_mlflow`,
-  `make_splits` (stratified-by-year 70/15/15 train/val/test_id + held-out OOD
-  years), `build_regression_pipeline` (StringIndexer → optional OneHot →
-  VectorAssembler → optional VectorIndexer → optional StandardScaler →
-  estimator), `make_estimator(algorithm)` + `algorithm_pipeline_config` for
-  three estimator families (`ridge` LinearRegression with squared-error loss
-  pinned to pure L2 — silver's IQR outlier removal lets the squared-error fit
-  stay accurate without robust Huber loss; `rf` RandomForest; `gbt` GBT — tree
-  models get `maxBins = 300` for the ~265-level location IDs), `DEFAULT_PARAMS`
-  and `PARAM_GRIDS` catalogues, `evaluate_regression`, `log_split_metrics`,
-  `train_and_log_run`, `register_final_model` (Pareto champion/challenger).
-  Named `ml_common` so it doesn't shadow the top-level `common` package when
-  spark-submit puts `src/ml/` on `sys.path[0]`.
-- All three use-case scripts follow the same three-phase workflow:
-  **Phase 1** algorithm comparison (Ridge + RF + GBT with `DEFAULT_PARAMS`,
-  pick winner by val RMSE) → **Phase 2** hyperparameter tuning of the winner
-  over `PARAM_GRIDS[winner]` → **Phase 3** learning curve over
-  `TRAIN_YEAR_SUBSETS` for every algorithm. The winner's largest-subset run is
-  registered into the MLflow Model Registry; Pareto champion/challenger gating
-  uses `val_rmse` for promotion plus a `test_id_rmse` degradation guard.
-- `fare_prediction.py`: use case 1 — target `fare_amount` on
-  `nessie.nyc.yellow_taxi_trips`. Registered model `fare_prediction`.
-- `trip_duration.py`: use case 2 — target `trip_duration_minutes` on the same
-  table; adds `filter(col(LABEL) > 0)` for sub-second trips. Registered model
-  `trip_duration`.
-- `demand_forecast.py`: use case 3 — target `n_pickups` on
-  `nessie.nyc.pickup_demand_zone_hour`, year column `hour_year`. Registered
-  model `demand_forecast`.
-- Every script accepts `--fast` (or `ML_FAST_MODE=1`) for smoke tests: samples
-  1 % of gold and shrinks grids/subsets so the full three-phase workflow + a
-  throwaway registry version runs end-to-end in minutes. Metrics are not
-  meaningful in fast mode.
+One **unified `train.py`** dispatches by use case (`fare` / `duration` /
+`demand`); shared building blocks are split across four focused modules.
+All ML code reads only from the gold tables on `main` (strict medallion).
+
+- `splits.py`: data preparation — `make_splits` is a **last-year holdout**:
+  `common_test` is every row of `TEST_YEAR = 2025` (fully held out), and
+  `train` / `val` are a stratified-by-year random split of `TRAIN_VAL_YEARS
+  = [2019, 2020, 2022, 2023]` at `val_frac = 0.15` per year. The model is
+  never exposed to any `TEST_YEAR` row during training or selection, so
+  `common_test_rmse` is an unbiased out-of-time generalization estimate.
+  Cyclical encoding for hour/dow (sin/cos for GLR; trees keep the
+  integer columns). Constants: `TEST_YEAR`, `TRAIN_VAL_YEARS`,
+  `SUBSET_A_YEARS = [2019, 2020]` (Phase 2 A — half the training pool;
+  B = all of `TRAIN_VAL_YEARS`, reused as the Phase-1 winner).
+- `pipelines.py`: `build_regression_pipeline` (StringIndexer → optional
+  OneHot → numerical scaling → VectorAssembler → optional VectorIndexer →
+  estimator). Tree constants `TREE_MAX_BINS = 300` so the ~265-level
+  location IDs clear Spark's `buildMetadata` arity check.
+- `algorithms.py`: three regression estimators — `glr`
+  (`GeneralizedLinearRegression` with family/link supplied per use case via
+  `GLR_FAMILY_PRESETS`: gamma/log for fare and duration, poisson/log for
+  `n_pickups`), `gbt` (`GBTRegressor`, bias-reducing boosting tree ensemble),
+  `rfr` (`RandomForestRegressor`, variance-reducing bagging tree ensemble —
+  same tree preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}`
+  exposes the tree set so `splits.resolve_numerical_cols` knows to skip
+  cyclical encoding. Single grid set `FULL_PARAM_GRIDS` consumed per
+  algorithm in Phase 1 Training (5-pt GLR, 8-pt GBT, 7-pt RFR — GBT
+  explores depth + shrinkage + stochastic-GBM regularizers per Friedman
+  2002; RFR explores forest size, depth, row subsampling and
+  column-subset strategy per Breiman 2001) plus fast-mode variants.
+  Each algorithm is CV-tuned over its full grid in one pass — the old
+  Phase-1 screening + Phase-2 winner-only optimization were collapsed
+  into a single training step. `fast_mode_enabled()` parses `--fast` /
+  `ML_FAST_MODE=1`.
+- `tracking.py`: MLflow side — `get_ml_spark` (pins the session to
+  `main`/gold), `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point
+  estimates), `train_and_log_run` / `tune_with_cv` (Spark
+  `CrossValidator(numFolds=3, parallelism=2)`),
+  `compute_baseline_metrics` + `log_baseline_run`,
+  `register_candidates` (registers every candidate from one training
+  invocation as a new Model Registry version; the within-run winner gets
+  `@champion` only if its `val_rmse` is strictly below the previous
+  champion's `val_rmse` — point-estimate improvement — otherwise it stays
+  `validation_status="challenger"`; all other candidates always get
+  `validation_status="challenger"`; `@challenger` alias → best non-champion
+  of the run; every version carries the per-split point metrics
+  (`val_rmse`, `common_test_{rmse,mae,r2}`, `baseline_common_test_rmse`)
+  plus the reproducibility pins `nessie_main_hash` + `source_snapshot_id`;
+  the new @champion also gets `inference_latency_*` tags from a 1000-row
+  `common_test` sample; the registry is pruned to the top
+  `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end of the
+  call). `common_test` is held out — its metrics are logged but never
+  drive selection or promotion.
+- `train.py`: single entry point — `spark-submit train.py {fare|duration|demand} [--fast]`.
+  The `USE_CASES` dict at the top carries the per-use-case knobs
+  (`source` / `label_col` / `year_col` / `numerical_cols` / `categorical_cols` /
+  `glr_family` / `baseline_group_cols` / `redundant_categoricals`). Workflow:
+  **Phase 0** drop the `redundant_categoricals` from `categorical_cols`
+  (borough is derivable from location_id, so it carries no extra information
+  given the IDs) → **baseline** (mean(label) per group on `common_test` —
+  mean is the RMSE-optimal constant-per-group predictor,
+  floor reference) → **Phase 1 Training** (one CV(k=3) per algorithm over
+  its `FULL_PARAM_GRIDS` entry — 5-pt GLR, 8-pt GBT, 7-pt RFR — winner
+  is whichever algorithm's CV bestModel scores lowest on `val_rmse`;
+  collapses the old Phase-1 screening + Phase-2 winner-only optimization
+  into one step) → **Phase 2 More-data** (winner refit on
+  `SUBSET_A_YEARS` — the two earliest training years; B is the Phase-1
+  winner trained on all of `TRAIN_VAL_YEARS` and reused without refit;
+  both score on the same `common_test = TEST_YEAR` so neither sees the
+  held-out year) → **Phase 3 Registration**: every candidate (4 per
+  run: 3 training + 1 more-data-A) becomes a new MLflow Model
+  Registry version under the experiment name (`fare_prediction`,
+  `trip_duration`, `demand_forecast`). The within-run winner (lowest
+  `val_rmse`) gets `@champion` only if its `val_rmse` is strictly below
+  the previous champion's `val_rmse` (strict point-estimate improvement);
+  otherwise it is tagged `validation_status="challenger"`. All other
+  candidates always get `validation_status="challenger"`; the `@challenger`
+  alias points to the best non-champion version from the run. `common_test`
+  is held out and never used to rank candidates — the test metrics on every
+  version are an unbiased generalization estimate, not a selection signal.
+  Every version is also pinned to the data state at training time
+  via `nessie_main_hash` + `source_snapshot_id` tags so the exact
+  training input is reproducible later; the new @champion picks up
+  `inference_latency_*` tags from a 1000-row `common_test` sample so
+  between-champion cost regressions are visible at a glance; the
+  registry is pruned to `REGISTRY_MAX_VERSIONS = 20` non-aliased
+  versions at the end of the run (aliased versions are always kept).
+  `--fast` runs a 1 %-sampled smoke test with tiny grids and CV k=2 —
+  completes in minutes; metrics not meaningful.
+- **No PCA.** An earlier dim-reduction probe ran PCA on the
+  numerical block and was removed: wrong feature-count regime (~7-9
+  numericals), interpretability cost ("PC1" replaces named features in
+  coefficient/importance reports), no measurable benefit. The drop-redundant-
+  categoricals step survives as Phase 0 because the redundancy is provable
+  from the schema, not empirical.
 
 ### Notebooks
 
@@ -235,9 +299,14 @@ Experiment tracking, model registration, staging, and version management.
 - `bronze/preprocess.ipynb`: Spark EDA on the full dataset; quantitatively justifies
   the silver cleaning rules
 - `bronze|silver|gold/verify_iceberg.ipynb`: layer-specific Iceberg + Nessie audits
-- `ml/*_diagnostics.ipynb`: one diagnostics notebook per ML use case — loads the
-  latest MLflow run, plots predicted vs actual, residuals, feature importance and
-  per-year drift; **does not re-train**
+- `ml/model_diagnostics.ipynb`: **unified** diagnostic notebook for the three use
+  cases — set `USE_CASE = "fare" | "duration" | "demand"` in cell 1 and rerun.
+  Loads `<experiment>@champion` from the MLflow Registry, reconstructs the splits,
+  plots the per-year breakdown across `TRAIN_VAL_YEARS` (in-sample-ish) and
+  `TEST_YEAR` (held out — the drift signal), predicted vs actual, residuals,
+  feature importance, the Phase 2 more-data comparison (both arms scored on
+  `common_test = TEST_YEAR`), and the baseline-vs-champion gap. **Does not
+  re-train.**
 
 ## Technology Stack
 
@@ -407,11 +476,11 @@ This project demonstrates:
 - **Documentation**: 5 comprehensive guides + inline
 - **ETL pipelines**: 7 scripts across bronze (2), silver (3), gold (2) — all WAP
 - **ML pipelines**: 3 use cases (fare regression, duration regression, demand forecast)
-- **Notebooks**: 8 interactive notebooks
+- **Notebooks**: 6 interactive notebooks
   - bronze: `explore`, `preprocess`, `verify_iceberg`
   - silver: `verify_iceberg`
   - gold: `verify_iceberg`
-  - ml: `fare_prediction_diagnostics`, `trip_duration_diagnostics`, `demand_forecast_diagnostics`
+  - ml: `model_diagnostics` (unified — set `USE_CASE` in cell 1, rerun for each use case)
 - **Configuration Files**: 10+ service configurations
 
 ## Support & Maintenance

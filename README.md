@@ -379,25 +379,81 @@ LIMIT 1000;
 
 ### 5. ML Training and Diagnostics
 
-ML pipelines read **only from gold on `main`** (strict medallion). All three scripts
-use the same temporal split — train on Q1 of 2019/2020/2022/2023, hold out Q1 2025
-as a drift test set — and log to MLflow.
+ML pipelines read **only from gold on `main`** (strict medallion). A single
+unified `train.py` dispatches by use case (`fare` / `duration` / `demand`)
+and runs the same workflow end-to-end inside one MLflow experiment per use
+case. The split is a **last-year holdout**: `common_test` is every row of
+`TEST_YEAR = 2025` (fully held out — the model never sees any 2025 row
+during training or selection), while `train` / `val` are a
+stratified-by-year random split of `TRAIN_VAL_YEARS = [2019, 2020, 2022,
+2023]` at `val_frac = 0.15` per year. The metric on `common_test` is
+therefore an unbiased generalization estimate to a future year, and the
+diagnostic notebook tells the drift story by comparing the per-year
+breakdown of TRAIN_VAL_YEARS (in-sample-ish) to TEST_YEAR (held out).
 
 ```bash
-# Use case 1 — fare regression (target: fare_amount)
-docker exec -it spark-master spark-submit /opt/spark/src/ml/fare_prediction.py
+# Use case 1 — fare regression (target: fare_amount on yellow_taxi_trips)
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py fare
 
-# Use case 2 — duration regression (target: trip_duration_minutes)
-docker exec -it spark-master spark-submit /opt/spark/src/ml/trip_duration.py
+# Use case 2 — duration regression (target: trip_duration_minutes on yellow_taxi_trips)
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py duration
 
-# Use case 3 — demand forecast (target: n_pickups per zone × hour)
-docker exec -it spark-master spark-submit /opt/spark/src/ml/demand_forecast.py
+# Use case 3 — demand forecast (target: n_pickups on pickup_demand_zone_hour)
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py demand
+
+# Smoke test (1 % sample, tiny grids, CV k=2 — runs in minutes):
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py fare --fast
 ```
 
-Each run logs parameters, train/test metrics (RMSE, MAE, R²) and the trained
-`PipelineModel` to MLflow at http://localhost:5000. Diagnostic notebooks under
-`src/notebooks/ml/` load the latest run from MLflow, plot predicted vs actual,
-residuals, feature importance and per-year drift.
+Each invocation runs five phases plus a baseline:
+
+- **Phase 0 — drop redundant categoricals.** `borough` (and `pu_service_zone`
+  for demand) are derivable from `pu_location_id` via the silver zone lookup,
+  so they're dropped up-front for every algorithm/phase.
+- **Baseline.** Mean-of-label per `(group_cols)` on `common_test`. Floor
+  reference; the per-group mean is the RMSE-optimal constant-per-group
+  predictor — the previous median version was MAE-optimal, wrong loss for
+  our reported metric.
+- **Phase 1 — Training.** One `CV(k=3)` per algorithm over its
+  `FULL_PARAM_GRIDS` entry (5-pt GLR, 8-pt GBT, 7-pt RFR). The within-run
+  winner is whichever algorithm's CV bestModel scores lowest on `val_rmse`.
+  Each algorithm gets its fairly-tuned best registered — the previous
+  design (Phase 1 screening with 3-pt grids + Phase 2 winner-only
+  optimization) was collapsed into a single training step.
+- **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS`
+  (the two earliest training years); subset B is the Phase-1 winner trained
+  on all of `TRAIN_VAL_YEARS` and reused without refit. Both score on the
+  same `common_test = TEST_YEAR`, so neither sees the held-out year — the
+  contrast isolates "does more training data help generalize to a future
+  year?".
+- **Phase 3 — Registration.** Every candidate trained in this invocation
+  (4 per run: 3 training + 1 more-data-A) becomes a new MLflow Model Registry version under the
+  experiment name (`fare_prediction`, `trip_duration`, `demand_forecast`).
+  The within-run winner (lowest `val_rmse`) gets `@champion` **only if its
+  `val_rmse` is strictly below the previous registry champion's
+  `val_rmse`** (strict point-estimate improvement); otherwise it is tagged
+  `validation_status="challenger"`. Every other candidate is always tagged
+  `validation_status="challenger"`. The `@challenger` alias points to the
+  best non-champion version from this run. **`common_test` is held out and
+  never used to rank candidates** — the test metrics on each registered
+  version are an unbiased generalization estimate, not a selection signal.
+  Every version is also pinned to the data state at training time via
+  `nessie_main_hash`
+  and `source_snapshot_id` tags (reproducibility — the model card alone
+  is enough to rebuild the exact training input). On promotion the new
+  `@champion` gets three latency tags from a 1000-row `common_test`
+  sample (`inference_latency_ms_per_row` / `..._sample_n` /
+  `..._total_s`) — a between-champion cost regression check, not a
+  production SLO. The registry is pruned to the top
+  `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end of every
+  run; `@champion` / `@challenger` aliased versions are always kept.
+
+Open MLflow at http://localhost:5000 and the unified diagnostic notebook
+[src/notebooks/ml/model_diagnostics.ipynb](src/notebooks/ml/model_diagnostics.ipynb)
+— set `USE_CASE` in cell 1 to `"fare"` / `"duration"` / `"demand"` and rerun
+to load `<experiment>@champion` from the registry and plot the per-year
+breakdown of `common_test`, predicted vs actual, residuals, feature
+importance and the Phase 2 more-data comparison.
 
 ### 6. Data Governance with OpenMetadata
 
@@ -437,12 +493,14 @@ datalakehouse/
 │   │   ├── bronze/          # Download + Iceberg ingestion (ingest_yellow_taxi.py, ingest_zone_lookup.py)
 │   │   ├── silver/          # Bronze → Silver (clean_yellow_taxi.py, clean_zone_lookup.py)
 │   │   └── gold/            # Silver → Gold (build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py)
-│   ├── ml/                  # ML training scripts on gold (ml_common.py, fare_prediction.py, trip_duration.py, demand_forecast.py)
+│   ├── ml/                  # ML training on gold — one unified train.py dispatched by use case
+│   │                        #   (train.py {fare|duration|demand} [--fast]); shared building blocks
+│   │                        #   split across splits.py / pipelines.py / algorithms.py / tracking.py
 │   └── notebooks/           # Jupyter notebooks, split per medallion layer
 │       ├── bronze/          # explore (pandas, raw parquet first look), preprocess (Spark, silver-rule evidence), verify_iceberg
 │       ├── silver/          # verify_iceberg
 │       ├── gold/            # verify_iceberg (trips + demand audits)
-│       └── ml/              # *_diagnostics.ipynb (one per ML use case, loads latest MLflow run)
+│       └── ml/              # model_diagnostics.ipynb — unified, set USE_CASE in cell 1 and rerun; loads <experiment>@champion
 ├── RUNBOOK.md               # End-to-end execution sequence (bronze → silver → gold → ML)
 └── docs/                    # Architecture / development / quick reference
 ```

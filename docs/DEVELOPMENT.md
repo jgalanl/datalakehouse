@@ -67,26 +67,64 @@ src/
 │   └── gold/                   # Silver → Gold (join, aggregate, ML features)
 │       ├── build_yellow_taxi_trips.py        # trip-level enriched + time features (WAP on main)
 │       └── aggregate_demand_zone_hour.py     # (zone, hour) demand aggregate (WAP on main)
-├── ml/                         # ML training scripts (Spark MLlib + MLflow), gold-only
-│   ├── ml_common.py                    # Shared building blocks: get_ml_spark / setup_mlflow,
-│   │                                   #   make_splits (70/15/15 ID + held-out OOD years),
-│   │                                   #   build_regression_pipeline, make_estimator (ridge/rf/gbt),
-│   │                                   #   DEFAULT_PARAMS / PARAM_GRIDS, train_and_log_run,
-│   │                                   #   register_final_model (Pareto champion/challenger).
-│   │                                   #   Named ml_common (not common) so it doesn't shadow the top-level common package.
-│   ├── fare_prediction.py              # Use case 1 — fare_amount on yellow_taxi_trips. Runs the
-│   │                                   #   3-phase workflow (compare → tune → learning curve) +
-│   │                                   #   registers as MLflow model `fare_prediction`.
-│   ├── trip_duration.py                # Use case 2 — same workflow on trip_duration_minutes
-│   │                                   #   (with filter(LABEL > 0) for sub-second trips).
-│   └── demand_forecast.py              # Use case 3 — same workflow on n_pickups, year_col="hour_year".
+├── ml/                         # ML training (Spark MLlib + MLflow), gold-only.
+│   │                           # One unified train.py dispatched by use case;
+│   │                           # the shared building blocks are split into four focused modules.
+│   ├── splits.py                       # Data preparation: last-year holdout split
+│   │                                   #   (make_splits → common_test = every TEST_YEAR row, fully
+│   │                                   #   held out; train / val = stratified random split of
+│   │                                   #   TRAIN_VAL_YEARS), cyclical encoding for hour/dow
+│   │                                   #   (sin/cos for GLR; trees keep the integer columns).
+│   │                                   #   Exports TEST_YEAR, TRAIN_VAL_YEARS, SUBSET_A_YEARS.
+│   ├── pipelines.py                    # Spark ML preprocessing factory: build_regression_pipeline
+│   │                                   #   (StringIndexer → optional OneHot → numerical scaling →
+│   │                                   #   VectorAssembler → optional VectorIndexer → estimator).
+│   │                                   #   Tree constants TREE_MAX_CATEGORIES / TREE_MAX_BINS.
+│   ├── algorithms.py                   # Algorithm catalogue + hyperparameter grids: glr (GLR with
+│   │                                   #   per-use-case family/link), gbt (GBTRegressor, boosting),
+│   │                                   #   rfr (RandomForestRegressor, bagging). TREE_ALGORITHMS
+│   │                                   #   exposes the tree set. Single FULL_PARAM_GRIDS consumed
+│   │                                   #   per-algorithm in Phase 1 Training + fast-mode variants.
+│   │                                   #   fast_mode_enabled().
+│   ├── tracking.py                     # MLflow side: get_ml_spark / setup_mlflow,
+│   │                                   #   evaluate_regression (rmse/mae/r2 point estimates),
+│   │                                   #   train_and_log_run, tune_with_cv (Spark CrossValidator)
+│   │                                   #   — return the in-memory PipelineModel alongside metrics;
+│   │                                   #   compute_baseline_metrics + log_baseline_run,
+│   │                                   #   measure_inference_latency (1000-row sample, warm-up +
+│   │                                   #   one timed collect),
+│   │                                   #   prune_old_versions (top-N retention; aliased always kept),
+│   │                                   #   register_candidates (every candidate carries
+│   │                                   #   nessie_main_hash / source_snapshot_id reproducibility
+│   │                                   #   pins; @champion only if contender's val_rmse is strictly
+│   │                                   #   below the previous champion's val_rmse; new @champion
+│   │                                   #   also gets inference_latency_* tags; registry pruned to
+│   │                                   #   REGISTRY_MAX_VERSIONS=20 at the end; common_test held
+│   │                                   #   out — non-champions tagged challenger).
+│   └── train.py                        # Single entry point — `spark-submit train.py {fare|duration|demand} [--fast]`.
+│                                       #   USE_CASES dict carries the per-use-case knobs
+│                                       #   (source / label / year_col / numerical_cols /
+│                                       #   categorical_cols / glr_family / redundant_categoricals).
+│                                       #   Captures nessie main hash + source iceberg snapshot_id
+│                                       #   at startup (propagated to every version tag).
+│                                       #   Runs Phase 0 (drop redundant categoricals) → baseline →
+│                                       #   Phase 1 Training (CV(k=3) per algo over full grid) →
+│                                       #   Phase 2 More-data → Phase 3 Registration: registers
+│                                       #   every candidate as an MLflow model version, best gets
+│                                       #   @champion only if val_rmse is strictly below the prev
+│                                       #   champion's val_rmse; on promotion the new @champion
+│                                       #   gets inference_latency_* tags; registry pruned to
+│                                       #   top 20 non-aliased; rest tagged challenger.
 └── notebooks/                  # Jupyter notebooks, split per medallion layer
     ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019),
     │                           # preprocess.ipynb (Spark, full-dataset EDA → silver-rule evidence),
     │                           # verify_iceberg.ipynb
     ├── silver/                 # verify_iceberg.ipynb
     ├── gold/                   # verify_iceberg.ipynb (trips + demand audits)
-    └── ml/                     # *_diagnostics.ipynb (one per ML use case, loads latest MLflow run)
+    └── ml/                     # model_diagnostics.ipynb — unified notebook, set USE_CASE in cell 1
+                                #   and rerun. Loads `<experiment>@champion` from MLflow Registry;
+                                #   per-year scoring of champion (TRAIN_VAL_YEARS in-sample-ish vs
+                                #   TEST_YEAR held out) shows the drift signal.
 ```
 
 ### Code Style

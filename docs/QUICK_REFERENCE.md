@@ -209,40 +209,40 @@ LIMIT 20;
 
 ## MLflow / ML Training
 
-The three use cases share the building blocks in `src/ml/ml_common.py`:
-`get_ml_spark` / `setup_mlflow`, `make_splits` (stratified 70/15/15 over
-in-distribution years + held-out OOD years), `build_regression_pipeline`
-(StringIndexer → optional OneHot/Scaler → VectorAssembler → optional
-VectorIndexer → estimator), `make_estimator` for three families
-(`ridge`/`rf`/`gbt`), `train_and_log_run`, and `register_final_model`.
+The three use cases share four focused modules under `src/ml/`:
 
-Each script runs the same three-phase workflow inside its MLflow experiment:
+- `splits.py` — **last-year holdout** (`make_splits` → `common_test` = every row of `TEST_YEAR=2025` (fully held out); `train` / `val` = stratified-by-year random split of `TRAIN_VAL_YEARS=[2019, 2020, 2022, 2023]` at `val_frac=0.15`). The model is never exposed to any `TEST_YEAR` row during training or selection. Cyclical encoding for hour/dow.
+- `pipelines.py` — `build_regression_pipeline` (StringIndexer → optional OneHot → numerical scaling → assemble → optional VectorIndexer → estimator).
+- `algorithms.py` — `glr` (`GeneralizedLinearRegression` with use-case family/link — gamma/log for fare and duration, poisson/log for `n_pickups`), `gbt` (`GBTRegressor`, bias-reducing boosting), `rfr` (`RandomForestRegressor`, variance-reducing bagging — same tree preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}` exposes the tree set. Single grid set `FULL_PARAM_GRIDS` (5-pt GLR, 8-pt GBT, 7-pt RFR) + fast-mode variants. Each algorithm is CV-tuned over its full grid in one pass (collapses the previous Phase-1 screening + Phase-2 winner-only optimization into a single training step).
+- `tracking.py` — `get_ml_spark` / `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point estimates), `train_and_log_run`, `tune_with_cv` (Spark `CrossValidator(numFolds=3, parallelism=2)`) — return the in-memory `PipelineModel` alongside run/metrics; `compute_baseline_metrics` / `log_baseline_run`, `measure_inference_latency(model, df)` (1000-row sample, one warm-up + one timed `transform.collect()`), `prune_old_versions(client, name, keep_recent=REGISTRY_MAX_VERSIONS)` (always retains aliased versions), `register_candidates` (registers every candidate from one run; strict `@champion` promotion — contender's `val_rmse` must be strictly below the previous champion's `val_rmse`; on promotion the new @champion gets the `inference_latency_*` tags; all non-champion candidates tagged `validation_status="challenger"`; `@challenger` alias = best non-champion of the run; every version carries the per-split point metrics + the reproducibility pins `nessie_main_hash` / `source_snapshot_id`; the registry is pruned to `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end). `common_test` is held out — its metrics are logged but never used to rank candidates.
 
-1. **Phase 1 — algorithm comparison.** Train Ridge + RF + GBT with
-   `DEFAULT_PARAMS`, pick the winner by val RMSE.
-2. **Phase 2 — tuning.** Grid-search the winner over `PARAM_GRIDS[winner]`,
-   pick the best config by val RMSE.
-3. **Phase 3 — learning curve.** Train every algorithm on each
-   `TRAIN_YEAR_SUBSETS` slice (the winner uses its Phase-2 best params, the
-   rest use `DEFAULT_PARAMS`).
+One unified `train.py` dispatches by use case and runs the same workflow inside one MLflow experiment per use case:
 
-The winner's largest-subset run is registered into the MLflow Model Registry
-under the use-case name. Pareto champion/challenger: promote to `@champion`
-only if `val_rmse` strictly improves on the current champion **and**
-`test_id_rmse` does not degrade beyond 2 % of the champion's; otherwise stay
-as `@challenger`.
+0. **Phase 0 — drop redundant categoricals.** `borough` (and `pu_service_zone` for demand) are derivable from `pu_location_id` via the silver zone lookup, so they're dropped up-front for every algorithm/phase.
+1. **Baseline.** Mean-of-label per `(group_cols)` on `common_test`. Floor reference; the per-group mean is the RMSE-optimal constant-per-group predictor (median would be MAE-optimal — wrong loss for our metric).
+2. **Phase 1 — Training.** One `CV(k=3)` per algorithm over `FULL_PARAM_GRIDS[algo]` (5-pt GLR, 8-pt GBT, 7-pt RFR). The within-run winner is whichever algorithm's CV bestModel scores lowest on `val_rmse`. Each algorithm gets a fairly-tuned best registered (not a 3-pt screening point like the old Phase 1 design).
+3. **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS` (the two earliest training years); subset B is the Phase-1 winner trained on all of `TRAIN_VAL_YEARS` and reused without refit. Both score on the same `common_test = TEST_YEAR`, so neither sees the held-out year — the contrast isolates "does more training data help?".
+4. **Phase 3 — Registration.** Every candidate (4 per run: 3 training + 1 more-data-A) is registered as a new MLflow Model Registry version under the use-case name. The within-run winner (lowest `val_rmse`) becomes `@champion` only if its `val_rmse` is **strictly below the previous champion's `val_rmse`** (strict point-estimate improvement). Otherwise it stays `validation_status="challenger"`. Every other candidate is always tagged `validation_status="challenger"`. The `@challenger` alias points to the best non-champion version from this run. Every version carries the `nessie_main_hash` + `source_snapshot_id` pins so the exact training input is reproducible. On promotion the new `@champion` also gets `inference_latency_*` tags from a 1000-row `common_test` sample. The registry is finally pruned to the top `REGISTRY_MAX_VERSIONS = 20` non-aliased versions (aliased ones always kept). **`common_test` is held out** — its metrics are logged on every version and shown in the diagnostic notebook as the unbiased generalization estimate, but never used to rank candidates.
+
+No PCA. PCA on ~7-9 numericals was considered (an earlier dim-reduction probe) and removed — wrong feature-count regime, interpretability cost, no measurable benefit.
 
 ```bash
 # Train (one experiment per use case in MLflow; --fast = smoke test on a 1% sample)
-docker exec -it spark-master spark-submit /opt/spark/src/ml/fare_prediction.py    # fare_prediction
-docker exec -it spark-master spark-submit /opt/spark/src/ml/trip_duration.py       # trip_duration
-docker exec -it spark-master spark-submit /opt/spark/src/ml/demand_forecast.py     # demand_forecast
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py fare
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py duration
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py demand
+
+# Smoke test (1% sample, tiny grids, CV k=2) — runs in minutes:
+docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py fare --fast
 ```
 
 Open the MLflow UI at http://localhost:5000 to inspect runs and the registered
-models (`fare_prediction`, `trip_duration`, `demand_forecast`), then open the
-matching `src/notebooks/ml/*_diagnostics.ipynb` to load `<model>@champion` and
-plot predicted vs actual, residuals, feature importance and per-year drift.
+models (`fare_prediction`, `trip_duration`, `demand_forecast`), then open
+[src/notebooks/ml/model_diagnostics.ipynb](../src/notebooks/ml/model_diagnostics.ipynb)
+— set `USE_CASE = "fare"` / `"duration"` / `"demand"` in the first cell and
+rerun to load `<experiment>@champion`, the per-year breakdown of
+`common_test`, predicted vs actual, residuals, feature importance and the
+Phase 2 more-data comparison.
 
 ### Programmatic MLflow access
 

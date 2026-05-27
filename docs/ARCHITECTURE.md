@@ -251,68 +251,188 @@ OpenMetadata Server
 ### Pipeline Integration
 
 ```
-src/ml/{fare_prediction,trip_duration,demand_forecast}.py
+src/ml/train.py {fare | duration | demand} [--fast]
     ↓ (reads only the gold tables — nessie.nyc.* on main — strict medallion)
-Spark MLlib pipeline (StringIndexer → optional OneHot/Scaler →
+Phase 0 — drop redundant categoricals (borough derivable from location_id)
+    ↓
+Last-year holdout split (common_test = TEST_YEAR; train / val from TRAIN_VAL_YEARS)
+    ↓
+Spark MLlib pipeline (StringIndexer → optional OneHot → numerical scaling →
     VectorAssembler → optional VectorIndexer → estimator)
-    estimator ∈ { Ridge (squared loss, pure L2), RandomForest, GBT }
+    estimator ∈ { GLR (GLM with use-case family/link),
+                  GBT (gradient-boosted trees),
+                  RFR (random forest) }
     (tree models use maxBins=300 for the ~265-level location IDs)
     ↓
 MLflow (Tracking Server, behind the `ml` profile)
     ├── PostgreSQL (run metadata, params, metrics, tags)
     └── MinIO S3 (PipelineModel artifacts in mlflow-artifacts bucket)
         ↓
-    Model Registry (MLflow) — Pareto champion / challenger
+    Model Registry (MLflow) — single-metric champion / challenger on val_rmse
+                              (common_test held out — reported, never used to select)
         ↓
-    Diagnostics notebooks load `<model>@champion` from the registry
-    (val ↔ test_id selection-overfitting check, test_id ↔ test_ood drift,
-     predicted vs actual, residuals, feature importance, per-year drift)
+    Diagnostics notebook (model_diagnostics.ipynb, set USE_CASE in cell 1)
+    loads `<experiment>@champion` and scores it per year — TRAIN_VAL_YEARS
+    are in-sample-ish, TEST_YEAR is the held-out drift signal.
 ```
 
 ### ML Use Cases
 
-| # | Script                  | Target                  | Source table                          | Year split                       |
-|---|-------------------------|-------------------------|---------------------------------------|----------------------------------|
-| 1 | `fare_prediction.py`    | `fare_amount`           | `nessie.nyc.yellow_taxi_trips` (main) | train: 2019/2020/2022/2023; test: 2025 |
-| 2 | `trip_duration.py`      | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips` (main) | same                             |
-| 3 | `demand_forecast.py`    | `n_pickups`             | `nessie.nyc.pickup_demand_zone_hour` (main) | same (year column: `hour_year`)  |
+| # | Use case   | Target                  | Source table                                | GLR family/link | Year column   |
+|---|------------|-------------------------|---------------------------------------------|-----------------|---------------|
+| 1 | `fare`     | `fare_amount`           | `nessie.nyc.yellow_taxi_trips` (main)       | gamma / log     | `pickup_year` |
+| 2 | `duration` | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips` (main)       | gamma / log     | `pickup_year` |
+| 3 | `demand`   | `n_pickups`             | `nessie.nyc.pickup_demand_zone_hour` (main) | poisson / log   | `hour_year`   |
 
-All three use cases share the building blocks in `src/ml/ml_common.py`
-(`make_splits`, `build_regression_pipeline`, `make_estimator`,
-`train_and_log_run`, `register_final_model`) and run the same **three-phase
-workflow** end-to-end:
+All three use cases share four focused modules under `src/ml/` (split from
+the old monolithic `ml_common.py`):
 
-1. **Algorithm comparison** — train Ridge, RandomForest and GBT with
-   `DEFAULT_PARAMS`; pick the winner by val RMSE.
-2. **Hyperparameter tuning** — grid-search the winner over
-   `PARAM_GRIDS[winner]`; pick the best config by val RMSE.
-3. **Learning curve** — train every algorithm on each `TRAIN_YEAR_SUBSETS`
-   slice (the winner with its Phase-2 best params, the rest with
-   `DEFAULT_PARAMS`).
+- **`splits.py`** — `make_splits` is a **last-year holdout**: `common_test`
+  is every row of `TEST_YEAR = 2025` (fully held out — the model is never
+  exposed to any TEST_YEAR row during training or selection), and `train`
+  / `val` are a stratified-by-year random split of `TRAIN_VAL_YEARS =
+  [2019, 2020, 2022, 2023]` at `val_frac = 0.15` per year. Cyclical
+  encoding for hour/dow (sin/cos for GLR; trees keep the integer
+  columns). Constants: `TEST_YEAR`, `TRAIN_VAL_YEARS`, `SUBSET_A_YEARS =
+  [2019, 2020]` (Phase 2 A — half the training pool; B = all of
+  `TRAIN_VAL_YEARS`, reused as the Phase-1 winner).
+- **`pipelines.py`** — `build_regression_pipeline` (StringIndexer → optional
+  OneHot → numerical scaling → VectorAssembler → optional VectorIndexer →
+  estimator). Tree constants `TREE_MAX_BINS = 300` so the ~265-level
+  `pu_location_id` / `do_location_id` clear Spark's `buildMetadata` arity
+  check.
+- **`algorithms.py`** — three estimators covering a GLM plus two
+  complementary tree ensembles: `glr` (`GeneralizedLinearRegression`
+  with family/link supplied per use case via `GLR_FAMILY_PRESETS`),
+  `gbt` (`GBTRegressor`, bias-reducing boosting), `rfr`
+  (`RandomForestRegressor`, variance-reducing bagging — same tree
+  preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}` exposes the
+  tree set so `splits.resolve_numerical_cols` knows to skip cyclical
+  encoding. Single grid set: `FULL_PARAM_GRIDS` (5-pt GLR, 8-pt GBT,
+  7-pt RFR — GBT explores depth + shrinkage + stochastic-GBM
+  `subsamplingRate` / `featureSubsetStrategy` per Friedman 2002; RFR
+  explores forest size, depth, row subsampling and column-subset
+  strategy per Breiman 2001). Each algorithm is CV-tuned over its full
+  grid in one pass — the old Phase-1 screening + Phase-2 winner-only
+  optimization were collapsed into a single training step. Fast-mode
+  variants for `--fast` smoke tests (1 % sample, tiny grids, CV k=2).
+- **`tracking.py`** — `get_ml_spark` (pins the session to `main`/gold),
+  `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point estimates),
+  `train_and_log_run` and `tune_with_cv` (Spark
+  `CrossValidator(numFolds=3, parallelism=2)`),
+  `compute_baseline_metrics` + `log_baseline_run`, `register_candidates`
+  (multi-version registry helper — registers every candidate of one run,
+  picks `@champion` on strict point-estimate improvement over the previous
+  champion's `val_rmse`, tags the rest `validation_status="challenger"`).
 
-The winner's largest-subset run is registered into the MLflow Model Registry
-under the use-case name (`fare_prediction`, `trip_duration`,
-`demand_forecast`). The registry applies a Pareto-style champion / challenger
-gate: promote to `@champion` only if `val_rmse` strictly improves on the
-current champion **and** `test_id_rmse` does not degrade beyond 2 % of the
-champion's; otherwise the new version stays as `@challenger`. Version
-description carries source + features + target + algorithm + scores; version
-tags expose algorithm + train years + per-split RMSE/MAE/R² for filtering in
-the registry UI.
+A single unified `train.py` dispatches by use case and runs **four
+stages** end-to-end inside one MLflow experiment per use case:
 
-The `ridge` estimator uses ordinary squared-error loss (no Huber): silver
-removes upper-tail outliers via the per-`RatecodeID` IQR fences, so the
-squared-error objective is no longer dragged by a few extreme rows and the
-robust loss is unnecessary. Tree models (`rf`, `gbt`) set
-`maxBins = TREE_MAX_BINS = 300` so the ~265-level `pu_location_id` /
-`do_location_id` clear Spark's `buildMetadata` arity check.
+0. **Phase 0 — drop redundant categoricals.** `borough` (and
+   `pu_service_zone` for demand) are derivable from `pu_location_id` via the
+   silver `taxi_zone_lookup`, so they're dropped up-front for every
+   algorithm/phase. Not an A/B probe — the redundancy is provable from the
+   zone lookup, not empirical.
+1. **Baseline.** Mean-of-label per `(group_cols)` on `common_test`. Floor
+   reference; the per-group mean is the RMSE-optimal constant-per-group
+   predictor (median would be MAE-optimal — wrong loss for our metric).
+   Any trained model that doesn't beat this on RMSE isn't learning anything
+   beyond per-group averages.
+2. **Phase 1 — Training.** One `CV(k=3)` per algorithm over its
+   `FULL_PARAM_GRIDS` entry (5-pt GLR, 8-pt GBT, 7-pt RFR). The
+   within-run winner is whichever algorithm's CV bestModel scores lowest
+   on `val_rmse`. Each algorithm is registered with its fairly-tuned
+   best, so the "losing" algorithms still appear in the registry as
+   challengers (not as 3-pt screening points like the old Phase 1
+   design). Collapses the previous Phase 1 (screening) + Phase 2
+   (winner-only optimization) into a single training step.
+3. **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS`
+   (the two earliest training years: 2019 / 2020). Subset B is the
+   Phase-1 winner trained on all of `TRAIN_VAL_YEARS`
+   (2019/2020/2022/2023) and reused without refit. Both score on the
+   same `common_test = TEST_YEAR`, so neither sees the held-out year —
+   the contrast isolates "does more training data help generalize to a
+   future year?".
+4. **Phase 3 — Registration.** Every candidate trained in this
+   invocation (4 per run: 3 Phase-1 Training + 1 Phase-2 more-data-A)
+   is registered as a new MLflow Model Registry version under the
+   experiment name (`fare_prediction`, `trip_duration`,
+   `demand_forecast`). The within-run winner (lowest `val_rmse`) gets
+   `@champion` **only if its `val_rmse` is strictly below the previous
+   registry champion's `val_rmse`** (point-estimate improvement, see
+   *Promotion policy*); otherwise it is tagged
+   `validation_status="challenger"`. Every other candidate is always
+   tagged `validation_status="challenger"`. The `@challenger` alias
+   points to the best non-champion version from this run. Version tags
+   expose algorithm, phase, run_name, per-split RMSE/MAE/R² and (where
+   applicable) `more_data_subset` for filtering in the registry UI.
+
+**Metric policy.** `val_rmse` drives every selection decision (Phase 1
+within-run winner, within-run @champion, cross-run @champion promotion). `common_test`
+is held out — its metrics are logged on every version and shown in the
+diagnostic notebook as the unbiased generalization estimate, but never
+used to rank candidates. Ranking on `common_test` would turn it into a
+*selection* set and bias the reported test numbers — the single most
+likely methodological objection in a thesis defense.
+
+**Split policy.** Last-year holdout: `common_test` is every row of
+`TEST_YEAR = 2025` (fully out-of-time — the model never sees any 2025 row
+during training or hyperparameter selection); `train` / `val` are a
+stratified-by-year random split of `TRAIN_VAL_YEARS`. Reason: a
+per-year random three-way split leaks within-year temporal autocorrelation
+— two trips minutes apart in the same zone share weather, demand regime,
+and traffic, but a random split routes them to opposite sides of the
+train/test boundary. For a model meant to predict *future* trips the
+honest evaluation is a chronological out-of-time test, and the last-year
+holdout gives that cleanly with zero overlap.
+
+**Promotion policy.** Strict @champion promotion on `val_rmse`: the
+within-run contender becomes `@champion` only if its `val_rmse` is
+strictly below the previous champion's `val_rmse`. Implemented in
+`register_candidates`. An earlier iteration used a bootstrap-CI noise
+floor on this comparison; it was removed as over-engineering for a
+thesis-scale project. The trade-off is intentional: any improvement —
+however small — swaps the alias.
+
+**Reproducibility policy.** Every registered model version carries two
+pin tags taken at training time: `nessie_main_hash` (the full Nessie
+`main` commit hash, via `nessie_manager.current_ref_hash`) and
+`source_snapshot_id` (the latest Iceberg snapshot id of the source gold
+table, via `nessie_manager.latest_snapshot_id`). The Nessie hash pins
+every table on every branch as of that moment, so a future reader can
+`USE REFERENCE <hash> IN nessie` and rebuild the identical training
+input — even after gold has rolled forward. The snapshot id is the
+finer-grained per-table pin for spot-checks.
+
+**Latency policy.** When promotion fires, the new @champion gets three
+tags from a 1000-row sample of `common_test`:
+`inference_latency_ms_per_row`, `inference_latency_sample_n`,
+`inference_latency_total_s`. Measured by `measure_inference_latency`
+with one warm-up pass + a single timed
+`transform.select("prediction").collect()`. Numbers are Spark-cluster
+latency (full distributed roundtrip), not a production-serving SLO —
+they're a regression check between champions ("did v40 suddenly take
+5× longer than v39?"). Measured only on promotion, not every candidate.
+
+**Registry retention policy.** At the end of every `register_candidates`
+the registry is pruned to `REGISTRY_MAX_VERSIONS = 20` non-aliased
+versions; any version carrying `@champion` or `@challenger` is always
+kept. Caps the linear growth (~5 versions per `train.py` run) without
+losing the audit trail to the current aliases.
+
+**No PCA**. An earlier "dim-reduction" probe (the original Phase 4) ran PCA
+on the numerical block but was removed: ~7-9 numericals is the wrong
+feature-count regime for PCA; interpretability cost ("PC1" replaces named
+features in coefficient/importance reports); no measurable benefit. The
+drop-redundant-categoricals step survives as Phase 0 because the redundancy
+is provable from the schema, not empirical.
 
 Pre-trip / known-at-pickup features only — no leakage from post-trip amounts.
 
-Every script accepts `--fast` (or `ML_FAST_MODE=1`) for smoke tests: samples
-1 % of gold and shrinks grids/year-subsets so the full three-phase workflow +
-a throwaway registry version run in minutes. Metrics are not meaningful in
-fast mode.
+`--fast` (or `ML_FAST_MODE=1`) runs a smoke test: 1 % sample of gold, tiny
+grids, CV k=2 — the full Phase-0 + baseline + Phase-1 Training +
+Phase-2 More-data + Phase-3 Registration workflow (with throwaway model
+versions) completes in minutes. Metrics are not meaningful in fast mode.
 
 ### Trade-offs
 
@@ -379,14 +499,22 @@ Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 ### ML Pipeline Pattern
 
 ```
-1. Read gold (only nessie.nyc.* on `main`)         — src/ml/ml_common.py.get_ml_spark
-2. Stratified split into train/val/test_id/test_ood — src/ml/ml_common.py.make_splits
-3. Three-phase workflow                            — algorithm comparison → tuning → year-subset curve
-4. Spark MLlib pipeline                            — StringIndexer (+ optional OHE/Scaler) → VectorAssembler → estimator
-5. Train + evaluate                                — RMSE, MAE, R² on every split
-6. Log to MLflow                                   — params, metrics, PipelineModel artifact per run
-7. Register the final model                        — Pareto champion/challenger (val_rmse + test_id_rmse guard)
-8. Diagnostics notebook                            — load via models:/{name}@champion, drift analysis
+1. Read gold (only nessie.nyc.* on `main`)              — src/ml/tracking.py.get_ml_spark
+2. Phase 0 — drop redundant categoricals                — train.py applies cfg["redundant_categoricals"]
+3. Last-year holdout: common_test = TEST_YEAR (2025);
+   train+val = stratified random split of TRAIN_VAL_YEARS  — src/ml/splits.py.make_splits
+4. Baseline (mean(label) per group_cols — RMSE-optimal) — src/ml/tracking.py.compute_baseline_metrics
+5. Phase 1 Training: GLR + GBT + RFR — CV(k=3) per algo over its FULL_PARAM_GRIDS,
+                                          winner by val_rmse on CV bestModel
+6. Phase 2 More-data: refit Phase-1 winner on SUBSET_A_YEARS — B is the Phase-1 winner reused
+7. Log every run to MLflow                              — params, metrics (val_* + common_test_*), PipelineModel artifact
+8. Phase 3 Register every candidate as a model version  — best val_rmse → @champion only if it is strictly
+                                                          below the previous champion's val_rmse;
+                                                          rest tagged validation_status="challenger";
+                                                          common_test held out, reported but not used to rank
+10. Diagnostics notebook                                — model_diagnostics.ipynb loads <experiment>@champion,
+                                                          per-year scoring (TRAIN_VAL = in-sample-ish vs
+                                                          TEST_YEAR = held out) = drift signal
 ```
 
 ### Query Pattern
