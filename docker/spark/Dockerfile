@@ -27,7 +27,20 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    libgomp1 \
+    libgfortran5 \
+    libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Native BLAS/LAPACK for Spark MLlib via dev.ludovic.netlib JNIBLAS — without
+# these symlinks the loader can't find libblas.so.3 / liblapack.so.3 and Spark
+# falls back to F2jBLAS (pure Java). libopenblas-dev installs the .so.0 binary
+# but not the SONAMEs the netlib shim probes for; alternatives points them
+# at OpenBLAS.
+RUN update-alternatives --install /usr/lib/x86_64-linux-gnu/libblas.so.3 \
+        libblas.so.3-x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/libopenblas.so.0 100 && \
+    update-alternatives --install /usr/lib/x86_64-linux-gnu/liblapack.so.3 \
+        liblapack.so.3-x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/libopenblas.so.0 100
 
 # All Python versions pinned for reproducibility
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
