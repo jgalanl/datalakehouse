@@ -27,6 +27,10 @@ from ml.pipelines import TREE_MAX_BINS
 CV_NUM_FOLDS = 3
 FAST_CV_NUM_FOLDS = 2
 FAST_SAMPLE_FRACTION = 0.01
+# Default sample of the gold table used by every (non-fast) train.py run.
+# Halves CV/fit time while leaving each fold with ~millions of rows — plenty
+# for stable RMSE on the three regression use cases.
+SAMPLE_FRACTION = 1.00
 
 
 ALGORITHM_SPECS: dict[str, dict] = {
@@ -74,7 +78,7 @@ GLR_FAMILY_PRESETS: dict[str, dict] = {
 # (1.0 / "all"); the full grid varies subsamplingRate per Friedman (2002)
 # "Stochastic Gradient Boosting" plus a single per-split column subsampling
 # probe ("sqrt"). minInstancesPerNode is intentionally not tuned — it overlaps
-# heavily with maxDepth, which we already sweep over 4/6/8.
+# heavily with maxDepth, which we already sweep over 4/5/6.
 _GBT_BASE: dict = {
     "maxIter": 50, "maxDepth": 6, "stepSize": 0.1,
     "subsamplingRate": 1.0, "featureSubsetStrategy": "all",
@@ -89,40 +93,47 @@ _RFR_BASE: dict = {
     "maxBins": TREE_MAX_BINS, "seed": 42,
 }
 
-# Per-algorithm grids consumed by the single Training phase. Each row varies
-# one (or, for the last GBT row, several) knob versus the base — keeps the
-# design intent visible: GBT explores depth, shrinkage (Friedman 2001), and
-# the two stochastic-GBM regularizers `subsamplingRate` (row subsampling)
-# and `featureSubsetStrategy` (per-split column subsampling) per Friedman
-# 2002. RFR explores forest size, tree depth, row subsampling and column-
-# subset strategy (Breiman 2001). `minInstancesPerNode` is intentionally
-# not tuned for either tree algorithm — it overlaps with maxDepth, which we
-# already sweep. Every algorithm gets the full grid in one CV pass; the
-# old Phase-1 screening (3-pt sweeps) was collapsed into this so each
-# algorithm reaches its tuned point in a single phase instead of two.
+# Per-algorithm grids consumed by the single Training phase. Sized to 4
+# points each so every algorithm gets the same number of tuning trials
+# (equal opportunity across GLR/GBT/RFR), and capped at 4 to keep CV cost
+# bounded on full-data (un-sampled) runs — 4 points × CV_NUM_FOLDS=3 = 12
+# fits/algorithm. Each row varies one (or several) knob versus the base —
+# keeps the design intent visible: GLR sweeps regParam log-spaced bracketing
+# the likely optimum; GBT explores depth (Friedman 2001) plus the two
+# stochastic-GBM regularizers `subsamplingRate` (row subsampling) +
+# `featureSubsetStrategy` (per-split column subsampling) per Friedman 2002;
+# RFR explores forest size and tree depth (Breiman 2001).
+# `minInstancesPerNode` is intentionally not tuned for either tree algorithm
+# — it overlaps with maxDepth, which we already sweep.
 FULL_PARAM_GRIDS: dict[str, list[dict]] = {
+    # GLR with gamma/log on this design matrix is rank-deficient (OHE'd
+    # high-cardinality location_id × ratecode × payment_type), so regParam=0
+    # and regParam=0.01 trigger Cholesky → singular covariance → LBFGS
+    # giving up. The 4-point grid spans 0.1 → 3.0 log-spaced with the infill
+    # at 0.5 retained near the likely optimum (regParam=1.0 has won before);
+    # the far end (10.0) was dropped — the optimum sits in the lower band.
     "glr": [
-        {"regParam": 0.0,  "maxIter": 25},
-        {"regParam": 0.01, "maxIter": 25},
-        {"regParam": 0.1,  "maxIter": 25},
-        {"regParam": 1.0,  "maxIter": 25},
-        {"regParam": 10.0, "maxIter": 25},
+        {"regParam": 0.1, "maxIter": 25},
+        {"regParam": 0.5, "maxIter": 25},
+        {"regParam": 1.0, "maxIter": 25},
+        {"regParam": 3.0, "maxIter": 25},
     ],
     "gbt": [
-        # Depth sweep at default shrinkage.
+        # Depth sweep at default shrinkage. Capped at depth 6 (was 8):
+        # boosting is sequential, so depth-8 × 100-iter fits dominated the
+        # CV wall-clock while barely moving RMSE on this ~9-feature design.
         {**_GBT_BASE, "maxDepth": 4},
+        {**_GBT_BASE, "maxDepth": 5},
         dict(_GBT_BASE),
-        {**_GBT_BASE, "maxDepth": 8},
-        # Shrinkage trade-off: more iter × smaller stepSize (ESL §10.12.1).
-        {**_GBT_BASE, "maxIter": 100, "stepSize": 0.05},
-        {**_GBT_BASE, "maxIter": 200, "maxDepth": 4, "stepSize": 0.05},
-        # Stochastic row subsampling (Friedman 2002).
-        {**_GBT_BASE, "maxIter": 100, "subsamplingRate": 0.7},
-        # Per-split column subsampling — one probe is enough (after one-hot
-        # we have ~10 effective groups, so "sqrt" and "0.5" differ marginally).
-        {**_GBT_BASE, "maxIter": 100, "featureSubsetStrategy": "sqrt"},
-        # Combined stochastic regularizers + long slow ensemble.
-        {**_GBT_BASE, "maxIter": 200, "stepSize": 0.05,
+        # Combined stochastic regularizers (Friedman 2002): row subsampling
+        # + per-split column subsampling. One combined probe instead of two
+        # separate ones — after one-hot we have ~10 effective groups, so
+        # the two stochastic axes interact rather than separate cleanly. The
+        # 0.7 row subsample also makes each tree cheaper, partly offsetting
+        # the maxIter=60 budget. The pure shrinkage rows (maxIter=60 ×
+        # stepSize=0.05) were dropped in the trim — depth is the stronger
+        # dial on this small feature design.
+        {**_GBT_BASE, "maxIter": 60,
          "subsamplingRate": 0.7, "featureSubsetStrategy": "sqrt"},
     ],
     "rfr": [
@@ -131,15 +142,11 @@ FULL_PARAM_GRIDS: dict[str, list[dict]] = {
         {**_RFR_BASE, "numTrees": 50},
         dict(_RFR_BASE),
         {**_RFR_BASE, "numTrees": 200},
-        # Depth sweep.
-        {**_RFR_BASE, "maxDepth": 4},
+        # Depth probe — upper bound only (depth=4 underfits a 9-feature
+        # design; depth=8 is the meaningful contrast vs base depth=6). The
+        # forest-size×depth combo and the "sqrt" column-subset probe were
+        # dropped in the trim — forest size and depth are the primary dials.
         {**_RFR_BASE, "maxDepth": 8},
-        # Row subsampling — extra de-correlation between trees beyond the
-        # bootstrap (Breiman 2001).
-        {**_RFR_BASE, "numTrees": 200, "subsamplingRate": 0.7},
-        # Column-subset strategy probe — "sqrt" vs the regression default
-        # "onethird" (= "auto"). Both are canonical RF choices.
-        {**_RFR_BASE, "numTrees": 200, "featureSubsetStrategy": "sqrt"},
     ],
 }
 

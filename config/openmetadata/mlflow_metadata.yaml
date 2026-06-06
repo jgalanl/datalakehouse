@@ -1,0 +1,25 @@
+# OpenMetadata ingestion — ML MODELS via MLflow.
+# Pulls registered models (e.g. fare_prediction + versions/champion) from the MLflow
+# tracking + registry into OpenMetadata as ML Model entities.
+# __OM_JWT__ is injected at run time by run_ingestion.sh from .om-token.
+source:
+  type: mlflow
+  serviceName: mlflow_registry
+  serviceConnection:
+    config:
+      type: Mlflow
+      trackingUri: "http://mlflow:5000"
+      registryUri: "http://mlflow:5000"
+  sourceConfig:
+    config:
+      type: MlModelMetadata
+sink:
+  type: metadata-rest
+  config: {}
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "http://openmetadata:8585/api"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "__OM_JWT__"

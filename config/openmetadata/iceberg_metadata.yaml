@@ -1,0 +1,47 @@
+# OpenMetadata ingestion — lakehouse DATA via the native Iceberg connector,
+# pointed at Nessie's integrated Iceberg-REST catalog (http://nessie:19120/iceberg).
+# This preserves real Iceberg table semantics (schemas, columns) and reads the same
+# Nessie store Spark writes to. OM 1.12.1 OSS has no Dremio connector (Collate-only),
+# so the Iceberg REST catalog is the OSS-native path to these tables.
+# Secrets (__MINIO_KEY__, __MINIO_SECRET__, __OM_JWT__) are injected at run time by
+# run_ingestion.sh from .env / .om-token.
+source:
+  type: iceberg
+  serviceName: iceberg_lakehouse
+  serviceConnection:
+    config:
+      type: Iceberg
+      catalog:
+        name: nessie
+        databaseName: nessie            # logical DB name surfaced in OpenMetadata
+        connection:
+          uri: http://nessie:19120/iceberg          # Nessie Iceberg-REST base (prefix=main via /config)
+          # OM's catalog.connection is a non-discriminated union [Hive, Rest, ...] and
+          # both Hive and Rest only require `uri`, so {uri, fileSystem} alone resolves to
+          # Hive (→ a hung Thrift metastore call). A Rest-only field disambiguates it to
+          # RestCatalogConnection. Nessie's REST catalog has no auth, so it ignores this
+          # bearer token — it exists purely to select the REST connection type.
+          token: nessie-no-auth
+          fileSystem:
+            type:
+              awsAccessKeyId: "__MINIO_KEY__"
+              awsSecretAccessKey: "__MINIO_SECRET__"
+              awsRegion: us-east-1
+              endPointURL: http://minio:9000
+  sourceConfig:
+    config:
+      type: DatabaseMetadata
+      schemaFilterPattern:
+        includes:
+          - "nyc"
+      markDeletedTables: false
+sink:
+  type: metadata-rest
+  config: {}
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "http://openmetadata:8585/api"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "__OM_JWT__"
