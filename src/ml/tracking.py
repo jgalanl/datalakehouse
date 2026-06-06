@@ -8,7 +8,9 @@ and the multi-candidate registry helper (`register_candidates`).
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import reduce
 from typing import Callable
 
 # MLflow + MinIO env. spark-master inherits AWS_* from docker-compose but not
@@ -23,7 +25,6 @@ from mlflow import MlflowClient  # noqa: E402
 from mlflow.exceptions import MlflowException  # noqa: E402
 from pyspark.ml import Pipeline  # noqa: E402
 from pyspark.ml.evaluation import RegressionEvaluator  # noqa: E402
-from pyspark.ml.tuning import CrossValidator  # noqa: E402
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql.functions import broadcast, col, lit, mean as spark_mean, when  # noqa: E402
 from pyspark.sql.types import DoubleType  # noqa: E402
@@ -32,6 +33,12 @@ from common.spark_factory import get_spark  # noqa: E402
 from common import nessie_manager as nessie  # noqa: E402
 
 MLFLOW_TRACKING_URI = os.environ["MLFLOW_TRACKING_URI"]
+
+# Per-experiment artifact root. Without this, MLflow lays artifacts out under
+# the numeric experiment id (`s3://mlflow-artifacts/1/`, `2/`, ...), which is
+# opaque in the MinIO browser. Passing this prefix at experiment creation time
+# yields `s3://mlflow-artifacts/{experiment_name}/{run_id}/...` instead.
+MLFLOW_ARTIFACT_ROOT = "s3://mlflow-artifacts"
 
 # Explicit env spec for logged models. MLflow's automatic pip-requirements
 # inference fails inside the spark-master container (no usable conda env to
@@ -56,6 +63,11 @@ def get_ml_spark(app_name: str) -> SparkSession:
 def setup_mlflow(experiment_name: str) -> None:
     """Point MLflow at the tracking server and activate `experiment_name`.
 
+    On first creation, set `artifact_location` so artifacts land under
+    `s3://mlflow-artifacts/{experiment_name}/` instead of the opaque numeric
+    experiment id. This is immutable per experiment — pre-existing experiments
+    keep their original layout.
+
     If the experiment was soft-deleted in the UI, mlflow.set_experiment would
     raise — MLflow won't reuse a deleted name. Restore it so the script
     survives a half-done cleanup; delete individual runs in the UI if needed.
@@ -63,7 +75,13 @@ def setup_mlflow(experiment_name: str) -> None:
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = MlflowClient()
     exp = client.get_experiment_by_name(experiment_name)
-    if exp is not None and exp.lifecycle_stage == "deleted":
+    if exp is None:
+        artifact_location = f"{MLFLOW_ARTIFACT_ROOT}/{experiment_name}"
+        client.create_experiment(experiment_name, artifact_location=artifact_location)
+        progress(
+            f"Created MLflow experiment '{experiment_name}' at {artifact_location}."
+        )
+    elif exp.lifecycle_stage == "deleted":
         client.restore_experiment(exp.experiment_id)
         progress(f"Restored soft-deleted MLflow experiment '{experiment_name}'.")
     mlflow.set_experiment(experiment_name)
@@ -72,6 +90,12 @@ def setup_mlflow(experiment_name: str) -> None:
 # ----- Evaluation -----------------------------------------------------------
 
 REGRESSION_METRICS: tuple[str, ...] = ("rmse", "mae", "r2")
+
+# Concurrent estimator fits inside one fold's grid search. Mirrors the old
+# CrossValidator(parallelism=2): the cluster has 2 worker JVMs, so 2 fits can
+# run at once, each feeding off the one cached per-fold feature set. Going
+# higher just queues fits on the same executors and contends for that cache.
+CV_PARALLELISM: int = 2
 
 # How many rows of common_test to score when timing the @champion's inference
 # latency. 1000 is enough for a stable ms/row figure across runs without
@@ -116,6 +140,22 @@ def log_split_metrics(metrics: dict[str, float], split: str) -> None:
         mlflow.log_metric(f"{split}_{name}", value)
 
 
+# A dataset input is a (mlflow Dataset, context) pair. `context` is the free
+# text shown in the MLflow UI's "Datasets used" column ("training"/"validation"/
+# "testing"). Logging the same set on every run is what makes the dataset field
+# uniformly populated instead of empty.
+DatasetInput = tuple["mlflow.data.dataset.Dataset", str]
+
+
+def log_input_datasets(input_datasets: list[DatasetInput] | None) -> None:
+    """Attach each (dataset, context) to the active run via mlflow.log_input.
+
+    Called inside an open run by every run-logging helper so the train / val /
+    test inputs show up on the run's Datasets field. No-op when None."""
+    for dataset, context in input_datasets or []:
+        mlflow.log_input(dataset, context=context)
+
+
 # ----- Training helpers -----------------------------------------------------
 
 def train_and_log_run(
@@ -126,6 +166,7 @@ def train_and_log_run(
     run_name: str,
     tags: dict,
     extra_params: dict | None = None,
+    input_datasets: list[DatasetInput] | None = None,
 ) -> tuple[str, dict[str, dict[str, float]], object]:
     """Fit pipeline on splits['train'], evaluate on every split, log to MLflow.
 
@@ -136,6 +177,7 @@ def train_and_log_run(
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
         mlflow.set_tags(tags)
+        log_input_datasets(input_datasets)
         if extra_params:
             mlflow.log_params(extra_params)
 
@@ -150,7 +192,11 @@ def train_and_log_run(
             metrics = evaluate_regression(model, split_df, label_col)
             log_split_metrics(metrics, split_name)
             all_metrics[split_name] = metrics
-            progress(f"  [{run_name}] {split_name} in {time.perf_counter() - t1:.1f}s")
+            progress(
+                f"  [{run_name}] {split_name}: rmse={metrics['rmse']:.4f} "
+                f"mae={metrics['mae']:.4f} r2={metrics['r2']:.4f} "
+                f"({time.perf_counter() - t1:.1f}s)"
+            )
 
         progress(f"  [{run_name}] logging model...")
         t2 = time.perf_counter()
@@ -173,47 +219,42 @@ def tune_with_cv(
     run_name: str,
     tags: dict,
     extra_params: dict,
+    input_datasets: list[DatasetInput] | None = None,
 ) -> tuple[str, dict, dict[str, dict[str, float]], object]:
-    """CrossValidator search over `param_list` for one algorithm.
+    """K-fold CV search over `param_list` for one algorithm.
 
-    The CV is built once with the first param dict as a base pipeline, then
-    each dict becomes an explicit ParamMap targeting the estimator stage.
-    bestModel is the pipeline refit on the full train_df with the winning
-    params — we evaluate it on every entry in `eval_splits` (val,
-    common_test, ...) and log it to MLflow.
+    Unlike Spark's CrossValidator — which refits the *entire* pipeline,
+    including the shared StringIndexer/OneHot/scaler stages, once per
+    (fold × grid point) — this fits the feature stages **once per fold** on
+    that fold's training rows, caches the transformed (train_fold, val_fold)
+    feature vectors, and reuses them across every grid point. The grid only
+    varies the estimator, so its preprocessing is identical across points;
+    doing it once per fold instead of once per (fold × point) drops that
+    redundant work. Preprocessing is still fit per fold on the fold's own
+    training rows (no cross-fold scaler/indexer leakage), so the CV stays
+    honest.
+
+    bestModel is the full pipeline refit on all of train_df with the winning
+    params — we evaluate it on every entry in `eval_splits` and log it.
 
     Returns (run_id, best_params, {split: {metric: value}}, bestModel) — the
     in-memory PipelineModel is returned alongside its run/metrics so callers
     don't have to reload it from MLflow when measuring inference latency.
     """
+    # Split the pipeline: shared feature stages + the (tunable) estimator.
     sample_pipeline = pipeline_factory(algorithm, param_list[0])
-    estimator = sample_pipeline.getStages()[-1]
-
-    param_maps = []
-    for params in param_list:
-        pm = {estimator.getParam(k): v for k, v in params.items()}
-        param_maps.append(pm)
+    stages = sample_pipeline.getStages()
+    feature_stages, estimator = stages[:-1], stages[-1]
+    features_col = estimator.getFeaturesCol()
 
     evaluator = RegressionEvaluator(
         labelCol=label_col, predictionCol="prediction", metricName="rmse",
-    )
-    cv = CrossValidator(
-        estimator=sample_pipeline,
-        estimatorParamMaps=param_maps,
-        evaluator=evaluator,
-        numFolds=num_folds,
-        seed=42,
-        # The cluster has 2 worker JVMs (spark-worker-1, spark-worker-2), so the
-        # driver can submit 2 fits concurrently and each lands on its own executor.
-        # Going higher than 2 just queues fits on the same executors and contends
-        # for the cached splits' memory.
-        parallelism=2,
-        collectSubModels=False,
     )
 
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
         mlflow.set_tags(tags)
+        log_input_datasets(input_datasets)
         mlflow.log_params(extra_params)
         mlflow.log_param("cv_num_folds", num_folds)
         mlflow.log_param("cv_num_grid_points", len(param_list))
@@ -223,12 +264,81 @@ def tune_with_cv(
             f"= {len(param_list) * num_folds} fits..."
         )
         t0 = time.perf_counter()
-        cv_model = cv.fit(train_df)
-        progress(f"  [{run_name}] CV done in {time.perf_counter() - t0:.1f}s")
 
-        avg_metrics = cv_model.avgMetrics
+        # k equal folds. train_df is cached upstream, so the randomSplit is
+        # stable across the re-evaluations below.
+        folds = train_df.randomSplit([1.0] * num_folds, seed=42)
+        rmse_sums = [0.0] * len(param_list)
+
+        for i in range(num_folds):
+            fold_t = time.perf_counter()
+            progress(
+                f"  [{run_name}] fold {i + 1}/{num_folds}: fitting feature "
+                f"stages + caching fold features..."
+            )
+            val_fold = folds[i]
+            train_fold = reduce(
+                DataFrame.unionByName,
+                (folds[j] for j in range(num_folds) if j != i),
+            )
+
+            # Fit + apply the shared preprocessing ONCE for this fold, then
+            # cache the assembled feature vectors for every grid point to read.
+            feat_model = Pipeline(stages=feature_stages).fit(train_fold)
+            train_feat = feat_model.transform(train_fold) \
+                .select(features_col, label_col).cache()
+            val_feat = feat_model.transform(val_fold) \
+                .select(features_col, label_col).cache()
+            try:
+                tr_n = train_feat.count()  # materialize before the grid loop
+                vl_n = val_feat.count()
+                progress(
+                    f"  [{run_name}] fold {i + 1}/{num_folds}: features ready "
+                    f"(train {tr_n:,} / val {vl_n:,} rows); training "
+                    f"{len(param_list)} grid point(s), {CV_PARALLELISM} at a time..."
+                )
+
+                def _fit_eval(item):
+                    idx, params = item
+                    progress(
+                        f"    [{run_name}] fold {i + 1} · grid "
+                        f"{idx + 1}/{len(param_list)}: training start {params}"
+                    )
+                    pt = time.perf_counter()
+                    pm = {estimator.getParam(k): v for k, v in params.items()}
+                    model = estimator.copy(pm).fit(train_feat)
+                    rmse = evaluator.evaluate(model.transform(val_feat))
+                    progress(
+                        f"    [{run_name}] fold {i + 1} · grid "
+                        f"{idx + 1}/{len(param_list)}: done val_rmse={rmse:.4f} "
+                        f"({time.perf_counter() - pt:.1f}s)"
+                    )
+                    return idx, rmse
+
+                # 2 estimator fits run concurrently (see CV_PARALLELISM), both
+                # reading the one cached per-fold feature set. pool.map blocks
+                # inside the `with`, so rmse_sums is only touched here on the
+                # main thread.
+                with ThreadPoolExecutor(max_workers=CV_PARALLELISM) as pool:
+                    for idx, rmse in pool.map(_fit_eval, enumerate(param_list)):
+                        rmse_sums[idx] += rmse
+            finally:
+                train_feat.unpersist()
+                val_feat.unpersist()
+            progress(
+                f"  [{run_name}] fold {i + 1}/{num_folds} done "
+                f"({time.perf_counter() - fold_t:.1f}s)"
+            )
+
+        avg_metrics = [s / num_folds for s in rmse_sums]
         best_idx = min(range(len(avg_metrics)), key=lambda i: avg_metrics[i])
         best_params = param_list[best_idx]
+        progress(
+            f"  [{run_name}] CV done in {time.perf_counter() - t0:.1f}s — "
+            f"winner grid {best_idx + 1}/{len(param_list)} "
+            f"avg_val_rmse={avg_metrics[best_idx]:.4f} {best_params}"
+        )
+
         for i, avg in enumerate(avg_metrics):
             mlflow.log_metric(f"cv_avg_rmse_grid_{i}", float(avg))
         mlflow.log_metric("cv_best_avg_rmse", float(avg_metrics[best_idx]))
@@ -236,22 +346,77 @@ def tune_with_cv(
         for k, v in best_params.items():
             mlflow.log_param(f"best_{k}", v)
 
+        # bestModel: full pipeline refit on ALL of train_df with best params.
+        progress(f"  [{run_name}] refitting bestModel on full train...")
+        refit_t = time.perf_counter()
+        best_model = pipeline_factory(algorithm, best_params).fit(train_df)
+        progress(
+            f"  [{run_name}] bestModel refit in {time.perf_counter() - refit_t:.1f}s; "
+            f"evaluating on {len(eval_splits)} split(s)..."
+        )
+
         all_metrics: dict[str, dict[str, float]] = {}
         for split_name, split_df in eval_splits.items():
-            metrics = evaluate_regression(cv_model.bestModel, split_df, label_col)
+            metrics = evaluate_regression(best_model, split_df, label_col)
             log_split_metrics(metrics, split_name)
             all_metrics[split_name] = metrics
+            progress(
+                f"  [{run_name}] {split_name}: "
+                f"rmse={metrics['rmse']:.4f} mae={metrics['mae']:.4f} "
+                f"r2={metrics['r2']:.4f}"
+            )
 
         progress(f"  [{run_name}] logging best model...")
         mlflow.spark.log_model(
-            cv_model.bestModel, artifact_path="model",
+            best_model, artifact_path="model",
             pip_requirements=MODEL_PIP_REQUIREMENTS,
         )
 
-    return run_id, best_params, all_metrics, cv_model.bestModel
+    return run_id, best_params, all_metrics, best_model
 
 
 # ----- Baseline -------------------------------------------------------------
+
+def _fit_baseline_predictor(
+    train_df: DataFrame, label_col: str, group_cols: list[str],
+) -> tuple[DataFrame, float]:
+    """Per-group mean predictor: returns (group_means_df, global_mean). The
+    global mean is the fallback for groups unseen at scoring time."""
+    group_means = (
+        train_df
+        .groupBy(*group_cols)
+        .agg(spark_mean(col(label_col)).alias("baseline_pred"))
+    )
+    global_mean = float(
+        train_df.agg(
+            spark_mean(col(label_col)).alias("global_mean")
+        ).collect()[0]["global_mean"]
+    )
+    return group_means, global_mean
+
+
+def _score_baseline(
+    df: DataFrame, group_means: DataFrame, global_mean: float,
+    label_col: str, group_cols: list[str],
+) -> dict[str, float]:
+    """Score the per-group-mean predictor on `df` — returns {rmse, mae, r2}."""
+    predictions = (
+        df
+        .join(broadcast(group_means), on=group_cols, how="left")
+        .withColumn(
+            "prediction",
+            when(col("baseline_pred").isNull(), lit(global_mean))
+            .otherwise(col("baseline_pred"))
+            .cast(DoubleType()),
+        )
+        .select(label_col, "prediction")
+        .cache()
+    )
+    try:
+        return evaluate_predictions(predictions, label_col)
+    finally:
+        predictions.unpersist()
+
 
 def compute_baseline_metrics(
     *,
@@ -273,58 +438,54 @@ def compute_baseline_metrics(
     A floor reference: any trained model that doesn't beat this on RMSE
     isn't learning anything beyond per-group averages.
     """
-    group_means = (
-        train_df
-        .groupBy(*group_cols)
-        .agg(spark_mean(col(label_col)).alias("baseline_pred"))
+    group_means, global_mean = _fit_baseline_predictor(
+        train_df, label_col, group_cols,
     )
-    global_mean = float(
-        train_df.agg(
-            spark_mean(col(label_col)).alias("global_mean")
-        ).collect()[0]["global_mean"]
-    )
-    predictions = (
-        test_df
-        .join(broadcast(group_means), on=group_cols, how="left")
-        .withColumn(
-            "prediction",
-            when(col("baseline_pred").isNull(), lit(global_mean))
-            .otherwise(col("baseline_pred"))
-            .cast(DoubleType()),
-        )
-        .select(label_col, "prediction")
-        .cache()
-    )
-    try:
-        return evaluate_predictions(predictions, label_col)
-    finally:
-        predictions.unpersist()
+    return _score_baseline(test_df, group_means, global_mean, label_col, group_cols)
 
 
 def log_baseline_run(
     *,
     train_df: DataFrame,
-    test_df: DataFrame,
+    eval_splits: dict[str, DataFrame],
     label_col: str,
     group_cols: list[str],
     tags: dict,
     extra_params: dict,
+    input_datasets: list[DatasetInput] | None = None,
 ) -> dict[str, float]:
-    """Compute the mean-per-group baseline on `test_df` and log it as a
-    `baseline` MLflow run. Returns {rmse, mae, r2}."""
-    metrics = compute_baseline_metrics(
-        train_df=train_df, test_df=test_df,
-        label_col=label_col, group_cols=group_cols,
+    """Fit the mean-per-group baseline on `train_df`, score every split in
+    `eval_splits`, and log `{split}_{metric}` for each — so the baseline run
+    carries the same per-split metric set (train/val/common_test) as the model
+    runs instead of only common_test. Returns the common_test metrics (the
+    value used downstream for the baseline_common_test_rmse tag)."""
+    progress(f"  [baseline] fitting mean-per-group predictor on {group_cols}...")
+    group_means, global_mean = _fit_baseline_predictor(
+        train_df, label_col, group_cols,
     )
-    with mlflow.start_run(run_name="baseline"):
-        mlflow.set_tags(tags)
-        mlflow.log_params({
-            **extra_params,
-            "baseline_group_cols": ",".join(group_cols),
-        })
-        for metric_name, value in metrics.items():
-            mlflow.log_metric(f"common_test_{metric_name}", value)
-    return metrics
+    group_means = group_means.cache()  # reused across every split
+    try:
+        per_split: dict[str, dict[str, float]] = {}
+        with mlflow.start_run(run_name="baseline"):
+            mlflow.set_tags(tags)
+            log_input_datasets(input_datasets)
+            mlflow.log_params({
+                **extra_params,
+                "baseline_group_cols": ",".join(group_cols),
+            })
+            for split_name, split_df in eval_splits.items():
+                metrics = _score_baseline(
+                    split_df, group_means, global_mean, label_col, group_cols,
+                )
+                log_split_metrics(metrics, split_name)
+                per_split[split_name] = metrics
+                progress(
+                    f"  [baseline] {split_name}: rmse={metrics['rmse']:.4f} "
+                    f"mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}"
+                )
+    finally:
+        group_means.unpersist()
+    return per_split.get("common_test", next(iter(per_split.values())))
 
 
 # ----- Inference latency ----------------------------------------------------
@@ -474,7 +635,12 @@ def register_candidates(
     # Register each candidate. mlflow.register_model waits until READY
     # (default await_registration_for=300s).
     registered: dict[str, "mlflow.entities.model_registry.ModelVersion"] = {}
-    for c in candidates:
+    for n, c in enumerate(candidates, start=1):
+        progress(
+            f"  Registering candidate {n}/{len(candidates)} "
+            f"({c.get('run_name', c['run_id'])}) as a new version of {name} "
+            f"(waiting for READY)..."
+        )
         mv = mlflow.register_model(
             model_uri=f"runs:/{c['run_id']}/model",
             name=name,
@@ -493,6 +659,7 @@ def register_candidates(
                 name=name, version=mv.version, key=k, value=str(v),
             )
         registered[c["run_id"]] = mv
+        progress(f"  Candidate {n}/{len(candidates)} registered as v{mv.version}.")
 
     def _set_status(version: str, status: str) -> None:
         client.set_model_version_tag(

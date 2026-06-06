@@ -17,13 +17,13 @@ from pyspark.sql.types import DoubleType
 # single year (TEST_YEAR), so the diagnostic notebook tells the drift story
 # by comparing TEST_YEAR's metric to the per-TRAIN_VAL_YEAR breakdown instead.
 TEST_YEAR: int = 2025
-TRAIN_VAL_YEARS: list[int] = [2019, 2020, 2022, 2023]
+TRAIN_VAL_YEARS: list[int] = [2023, 2024]
 
 # Phase 2 (more-data) compares two training-pool sizes, BOTH evaluated on
 # common_test = TEST_YEAR — so neither A nor B ever sees the test year and
-# the comparison is fair. A = the two earliest years (half the pool); B = all
+# the comparison is fair. A = the earliest year (half the pool); B = all
 # of TRAIN_VAL_YEARS, reused as the Phase-1 winner (no refit needed).
-SUBSET_A_YEARS: list[int] = [2019, 2020]
+SUBSET_A_YEARS: list[int] = [2023]
 
 # Partition count for the cached split DataFrames. The per-year unionByName in
 # make_splits accumulates many uneven partitions; repartitioning keeps each
@@ -54,6 +54,15 @@ def make_splits(
     """
     train_val_years = train_val_years or TRAIN_VAL_YEARS
     test_year = test_year if test_year is not None else TEST_YEAR
+
+    # randomSplit assigns rows by (partition index, position within partition),
+    # so it's only deterministic if the parent yields the same rows in the same
+    # partitions every time it's evaluated. df is lazy here, and train/val are
+    # counted in separate actions that would recompute df independently -> a row
+    # could land in both splits (overlap) or neither (drop), and counts drift
+    # run-to-run. Materializing df once pins the layout so the split is a true,
+    # reproducible partition. (common_test is a plain filter and never overlaps.)
+    df = df.cache()
 
     common_test = df.filter(col(year_col) == test_year)
 

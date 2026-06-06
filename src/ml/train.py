@@ -13,14 +13,15 @@ Phases (run end-to-end per invocation, all logged to one MLflow experiment):
                   the RMSE-optimal constant-per-group predictor (median
                   would be MAE-optimal — wrong loss for our metric).
   Phase 1 — Training      : one CV(k=3) per algorithm over its full grid
-                            (5-pt for GLR, 8-pt for GBT, 7-pt for RFR). The
-                            within-run winner is the algorithm whose
+                            (6 points per algorithm — equal tuning budget
+                            across GLR/GBT/RFR). The within-run winner is
+                            the algorithm whose
                             CV-bestModel scores lowest on val_rmse. Every
                             algorithm gets registered with its full-grid
                             best, so the "losing" algorithms still appear
                             in the registry as fairly-tuned challengers.
   Phase 2 — More-data     : winner refit on subset A (SUBSET_A_YEARS — the
-                            two earliest training years) vs subset B (all
+                            earliest training year) vs subset B (all
                             of TRAIN_VAL_YEARS, reused as the Phase-1
                             winner without refit). Both scored on the same
                             common_test = TEST_YEAR, so neither sees the
@@ -44,7 +45,7 @@ generalization estimate.
 Split policy: last-year holdout. common_test is every row of TEST_YEAR
 (2025) — the model has never seen any of it during training or selection.
 train + val are stratified-by-year random split of TRAIN_VAL_YEARS
-(2019/2020/2022/2023). This closes the within-year temporal-autocorrelation
+(2023/2024). This closes the within-year temporal-autocorrelation
 leak of a per-year random split: no two trips minutes apart end up across
 the train/test boundary.
 
@@ -70,6 +71,7 @@ losing the audit trail to whatever the current aliases point at.
 
 import sys
 
+import mlflow
 from mlflow import MlflowClient
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col
@@ -83,6 +85,7 @@ from ml.algorithms import (
     FAST_SAMPLE_FRACTION,
     FULL_PARAM_GRIDS,
     GLR_FAMILY_PRESETS,
+    SAMPLE_FRACTION,
     algorithm_pipeline_config,
     fast_mode_enabled,
     make_estimator,
@@ -218,6 +221,25 @@ def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
         print(f"  {split:<12} {parts}")
 
 
+def _make_dataset(df: DataFrame, name: str, cfg: dict):
+    """Wrap a split DataFrame as an MLflow Dataset for the run's Datasets field.
+
+    Source is recorded as the gold Iceberg table, `targets` marks the label
+    column, and the digest comes from the DataFrame's logical-plan semantic
+    hash (no data scan), so it fingerprints the exact read + sample + split.
+    The same object is logged on every run so the Datasets field is populated
+    uniformly across baseline / training / more-data runs. The snapshot pin is
+    not passed as `version` (that path is Delta-only and rejects Iceberg
+    tables) — it already travels on every run as the `source_snapshot_id`
+    param/tag."""
+    return mlflow.data.from_spark(
+        df,
+        table_name=cfg["source"],
+        name=name,
+        targets=cfg["label_col"],
+    )
+
+
 def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
     tags = {
         "source_table": cfg["source"],
@@ -226,6 +248,14 @@ def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
         "phase": phase,
         "project_name": cfg["project_name"],
         "created_by": CREATED_BY,
+        # Present on every run so the column is never sparse. Only the Phase-2
+        # A/B comparison overrides it ("A" for more-data-A, "B" for the reused
+        # Phase-1 winner); every other run stays "none".
+        "more_data_subset": "none",
+        # The training-pool years, as a tag on every run (the diagnostic
+        # notebook reads it as a tag). more-data-A overrides it to its subset;
+        # logged as a tag, not a param, to avoid the param/tag duplication.
+        "training_data": str(TRAIN_VAL_YEARS),
     }
     if extra:
         tags.update(extra)
@@ -235,7 +265,7 @@ def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
 def main() -> None:
     use_case, fast = _parse_cli(sys.argv[1:])
     cfg = USE_CASES[use_case]
-    sample_fraction = FAST_SAMPLE_FRACTION if fast else None
+    sample_fraction = FAST_SAMPLE_FRACTION if fast else SAMPLE_FRACTION
     full_grids = FAST_FULL_PARAM_GRIDS if fast else FULL_PARAM_GRIDS
     cv_folds = FAST_CV_NUM_FOLDS if fast else CV_NUM_FOLDS
 
@@ -248,6 +278,11 @@ def main() -> None:
             progress(
                 f"FAST MODE — sampling {FAST_SAMPLE_FRACTION:.0%} of gold, "
                 "tiny grids/folds. Smoke test only; metrics not meaningful."
+            )
+        else:
+            progress(
+                f"Sampling {SAMPLE_FRACTION:.0%} of gold for training "
+                "(keeps CV cost bounded; per-fold rows still in the millions)."
             )
 
         # ---- Phase 0: drop redundant categoricals ------------------------
@@ -297,26 +332,38 @@ def main() -> None:
             print("Empty train or val. Is gold populated?")
             sys.exit(1)
 
+        # Build the input Dataset objects once and reuse them across every run
+        # so the MLflow "Datasets used" field is populated uniformly. The
+        # digest is the DataFrame's logical-plan semantic hash, so each object
+        # is cheap and the val/test pair is shared verbatim by all runs.
+        ds_train = _make_dataset(train, f"{use_case}_train", cfg)
+        ds_val = _make_dataset(val, f"{use_case}_val", cfg)
+        ds_common_test = _make_dataset(common_test, f"{use_case}_common_test", cfg)
+        full_inputs = [(ds_train, "training"), (ds_val, "validation"),
+                       (ds_common_test, "testing")]
+
         common_params = {
             **{f"{k}_count": v for k, v in split_counts.items()},
             "numerical_cols": ",".join(cfg["numerical_cols"]),
             "categorical_cols": ",".join(cfg["categorical_cols"]),
             "phase0_dropped_categoricals": ",".join(redundant),
-            "training_data": str(TRAIN_VAL_YEARS),
+            "sample_fraction": sample_fraction,
             "nessie_main_hash": nessie_main_hash,
             "source_snapshot_id": str(source_snapshot_id),
         }
 
         # ---- Baseline -----------------------------------------------------
         print("\n=== Baseline: mean(label) per group ===")
+        progress("Baseline: scoring mean-per-group floor on every split...")
         baseline_metrics = log_baseline_run(
             train_df=train,
-            test_df=common_test,
+            eval_splits=splits,
             label_col=cfg["label_col"],
             group_cols=cfg["baseline_group_cols"],
             tags=_common_tags(cfg, phase="baseline",
                               extra={"algorithm": "mean-per-group"}),
             extra_params=common_params,
+            input_datasets=full_inputs,
         )
         print(f"  Baseline on common_test: {baseline_metrics}")
 
@@ -347,14 +394,22 @@ def main() -> None:
         # design). Collapses the previous Phase 1 (screening) + Phase 2
         # (winner-only optimization) into a single training step.
         print(f"\n=== Phase 1: Training — CV(k={cv_folds}) per algorithm ===")
-        for algorithm in ALGORITHMS:
+        progress(
+            f"Phase 1: tuning {len(ALGORITHMS)} algorithm(s) "
+            f"({', '.join(ALGORITHMS)}) with CV(k={cv_folds})."
+        )
+        for idx, algorithm in enumerate(ALGORITHMS, start=1):
             grid = full_grids[algorithm]
             run_name = f"train-{algorithm}"
             print(f"\n--- {run_name} ({len(grid)} points) ---")
+            progress(
+                f"Phase 1 [{idx}/{len(ALGORITHMS)}]: starting tuning for "
+                f"'{algorithm}' over {len(grid)} grid point(s) × {cv_folds} folds."
+            )
             run_id, best_params, metrics, model = tune_with_cv(
                 algorithm=algorithm,
                 train_df=train,
-                eval_splits=eval_splits,
+                eval_splits=splits,
                 label_col=cfg["label_col"],
                 pipeline_factory=lambda a, p: _build_pipeline(a, p, cfg),
                 param_list=grid,
@@ -363,6 +418,7 @@ def main() -> None:
                 tags=_common_tags(cfg, phase="training",
                                   extra={"algorithm": algorithm}),
                 extra_params=common_params,
+                input_datasets=full_inputs,
             )
             record(run_id, run_name, algorithm, "training", best_params,
                    metrics, model)
@@ -377,13 +433,17 @@ def main() -> None:
         winner_params = training_winner_candidate["params"]
         winner_run_id = training_winner_candidate["run_id"]
         winner_metrics = training_winner_candidate["metrics"]
+        progress(
+            f"Phase 1 done. Winner by val_rmse: '{winner}' "
+            f"(val_rmse={winner_metrics['val']['rmse']:.4f})."
+        )
         print(f"\n>>> Phase 1 winner (val_rmse): {winner} "
               f"(val_rmse={winner_metrics['val']['rmse']:.4f}, "
               f"common_test_rmse={winner_metrics['common_test']['rmse']:.4f})")
         print(f"    best params: {winner_params}")
 
         # ---- Phase 2: More-data — A vs (Phase 1 winner as B) -------------
-        # A = SUBSET_A_YEARS (the two earliest training years); B = the full
+        # A = SUBSET_A_YEARS (the earliest training year); B = the full
         # TRAIN_VAL_YEARS pool, reused as the Phase-1 winner (which already
         # trained on it). Both are scored on the same common_test = TEST_YEAR,
         # so neither sees the test year — the comparison is fair and isolates
@@ -401,6 +461,11 @@ def main() -> None:
         if sub_count == 0:
             print("  Skipping A: empty.")
         else:
+            progress(
+                f"Phase 2: starting more-data-A — refitting '{winner}' on "
+                f"years={SUBSET_A_YEARS} ({sub_count:,} rows)."
+            )
+            ds_train_a = _make_dataset(sub_train, f"{use_case}_train_subsetA", cfg)
             run_id, metrics, model_a = train_and_log_run(
                 splits={"train": sub_train, **eval_splits},
                 label_col=cfg["label_col"],
@@ -408,19 +473,19 @@ def main() -> None:
                 run_name=run_name,
                 tags=_common_tags(cfg, phase="more_data",
                                   extra={"algorithm": winner,
-                                         "subset": "A",
                                          "more_data_subset": "A",
                                          "training_data": str(SUBSET_A_YEARS)}),
                 extra_params={**common_params, **winner_params,
                               "subset": "A",
                               "subset_train_count": sub_count,
-                              "n_train_years": len(SUBSET_A_YEARS),
-                              "training_data": str(SUBSET_A_YEARS)},
+                              "n_train_years": len(SUBSET_A_YEARS)},
+                input_datasets=[(ds_train_a, "training"),
+                                (ds_val, "validation"),
+                                (ds_common_test, "testing")],
             )
             record(run_id, run_name, winner, "more_data",
                    winner_params, metrics, model_a,
-                   extra_tags={"subset": "A",
-                               "more_data_subset": "A",
+                   extra_tags={"more_data_subset": "A",
                                "training_data": str(SUBSET_A_YEARS)})
             _print_metrics(metrics)
 
@@ -498,9 +563,8 @@ def main() -> None:
                 "nessie_main_hash":   nessie_main_hash,
                 "source_snapshot_id": str(source_snapshot_id),
             }
-            for k in ("more_data_subset", "subset"):
-                if k in c["extra_tags"]:
-                    tags[k] = c["extra_tags"][k]
+            if "more_data_subset" in c["extra_tags"]:
+                tags["more_data_subset"] = c["extra_tags"]["more_data_subset"]
             return tags
 
         model_description = (
