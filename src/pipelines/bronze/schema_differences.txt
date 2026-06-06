@@ -1,10 +1,10 @@
 ================================================================================
 NYC TLC Yellow Taxi — Schema Comparison Report
-Generated: 2026-05-20T08:05:01.070844
-Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
+Generated: 2026-05-31T16:41:03.821219
+Reference: yellow_tripdata_2023-01.parquet  |  Files compared: 9
 ================================================================================
 
---- Reference schema (yellow_tripdata_2019-01.parquet) ---
+--- Reference schema (yellow_tripdata_2023-01.parquet) ---
    1. VendorID                            int64
    2. tpep_pickup_datetime                timestamp[us]
    3. tpep_dropoff_datetime               timestamp[us]
@@ -23,23 +23,11 @@ Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
   16. improvement_surcharge               double
   17. total_amount                        double
   18. congestion_surcharge                double
-  19. airport_fee                         null
+  19. airport_fee                         double
 
---- yellow_tripdata_2022-01.parquet vs yellow_tripdata_2019-01.parquet ---
-  ~ airport_fee                         null -> double
-
---- yellow_tripdata_2022-02.parquet vs yellow_tripdata_2019-01.parquet ---
-  ~ airport_fee                         null -> double
-
---- yellow_tripdata_2022-03.parquet vs yellow_tripdata_2019-01.parquet ---
-  ~ airport_fee                         null -> double
-
---- yellow_tripdata_2023-01.parquet vs yellow_tripdata_2019-01.parquet ---
-  ~ airport_fee                         null -> double
-
---- yellow_tripdata_2023-02.parquet vs yellow_tripdata_2019-01.parquet ---
+--- yellow_tripdata_2023-02.parquet vs yellow_tripdata_2023-01.parquet ---
   + Airport_fee                         double
-  - airport_fee                         null
+  - airport_fee                         double
   ~ DOLocationID                        int64 -> int32
   ~ PULocationID                        int64 -> int32
   ~ RatecodeID                          double -> int64
@@ -47,9 +35,9 @@ Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
   ~ passenger_count                     double -> int64
   ~ store_and_fwd_flag                  string -> large_string
 
---- yellow_tripdata_2023-03.parquet vs yellow_tripdata_2019-01.parquet ---
+--- yellow_tripdata_2023-03.parquet vs yellow_tripdata_2023-01.parquet ---
   + Airport_fee                         double
-  - airport_fee                         null
+  - airport_fee                         double
   ~ DOLocationID                        int64 -> int32
   ~ PULocationID                        int64 -> int32
   ~ RatecodeID                          double -> int64
@@ -57,10 +45,40 @@ Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
   ~ passenger_count                     double -> int64
   ~ store_and_fwd_flag                  string -> large_string
 
---- yellow_tripdata_2025-01.parquet vs yellow_tripdata_2019-01.parquet ---
+--- yellow_tripdata_2024-01.parquet vs yellow_tripdata_2023-01.parquet ---
+  + Airport_fee                         double
+  - airport_fee                         double
+  ~ DOLocationID                        int64 -> int32
+  ~ PULocationID                        int64 -> int32
+  ~ RatecodeID                          double -> int64
+  ~ VendorID                            int64 -> int32
+  ~ passenger_count                     double -> int64
+  ~ store_and_fwd_flag                  string -> large_string
+
+--- yellow_tripdata_2024-02.parquet vs yellow_tripdata_2023-01.parquet ---
+  + Airport_fee                         double
+  - airport_fee                         double
+  ~ DOLocationID                        int64 -> int32
+  ~ PULocationID                        int64 -> int32
+  ~ RatecodeID                          double -> int64
+  ~ VendorID                            int64 -> int32
+  ~ passenger_count                     double -> int64
+  ~ store_and_fwd_flag                  string -> large_string
+
+--- yellow_tripdata_2024-03.parquet vs yellow_tripdata_2023-01.parquet ---
+  + Airport_fee                         double
+  - airport_fee                         double
+  ~ DOLocationID                        int64 -> int32
+  ~ PULocationID                        int64 -> int32
+  ~ RatecodeID                          double -> int64
+  ~ VendorID                            int64 -> int32
+  ~ passenger_count                     double -> int64
+  ~ store_and_fwd_flag                  string -> large_string
+
+--- yellow_tripdata_2025-01.parquet vs yellow_tripdata_2023-01.parquet ---
   + Airport_fee                         double
   + cbd_congestion_fee                  double
-  - airport_fee                         null
+  - airport_fee                         double
   ~ DOLocationID                        int64 -> int32
   ~ PULocationID                        int64 -> int32
   ~ RatecodeID                          double -> int64
@@ -68,10 +86,10 @@ Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
   ~ passenger_count                     double -> int64
   ~ store_and_fwd_flag                  string -> large_string
 
---- yellow_tripdata_2025-02.parquet vs yellow_tripdata_2019-01.parquet ---
+--- yellow_tripdata_2025-02.parquet vs yellow_tripdata_2023-01.parquet ---
   + Airport_fee                         double
   + cbd_congestion_fee                  double
-  - airport_fee                         null
+  - airport_fee                         double
   ~ DOLocationID                        int64 -> int32
   ~ PULocationID                        int64 -> int32
   ~ RatecodeID                          double -> int64
@@ -79,10 +97,10 @@ Reference: yellow_tripdata_2019-01.parquet  |  Files compared: 15
   ~ passenger_count                     double -> int64
   ~ store_and_fwd_flag                  string -> large_string
 
---- yellow_tripdata_2025-03.parquet vs yellow_tripdata_2019-01.parquet ---
+--- yellow_tripdata_2025-03.parquet vs yellow_tripdata_2023-01.parquet ---
   + Airport_fee                         double
   + cbd_congestion_fee                  double
-  - airport_fee                         null
+  - airport_fee                         double
   ~ DOLocationID                        int64 -> int32
   ~ PULocationID                        int64 -> int32
   ~ RatecodeID                          double -> int64

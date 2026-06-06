@@ -18,7 +18,7 @@ from common.spark_factory import get_spark
 from common.iceberg_schema import schema_to_ddl
 from common import nessie_manager as nessie
 
-YEARS = [2019, 2020, 2022, 2023, 2025]
+YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
 # SOURCE and TARGET share an identifier — same table name, different Nessie
 # branch (bronze vs silver). The active ref decides which one a read hits.

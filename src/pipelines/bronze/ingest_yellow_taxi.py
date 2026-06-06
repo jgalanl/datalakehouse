@@ -24,7 +24,7 @@ from common.iceberg_schema import schema_to_ddl
 from common import nessie_manager as nessie
 
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
-YEARS = [2019, 2020, 2022, 2023, 2025]
+YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
 TABLE = "nessie.nyc.yellow_taxi"
 TABLE_LOCATION = nessie.table_location("bronze", "yellow_taxi")
