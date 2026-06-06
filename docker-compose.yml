@@ -4,8 +4,17 @@
 # Dremio connects to Nessie as a data source (configured via the Dremio UI).
 # Both services work on the same underlying data files.
 #
-# Estimated steady-state memory: ~18 GB. Allocate at least 21 GB and 8 CPUs
-# in Docker Desktop.
+# Tuned for a 12 GiB WSL2 / Docker Desktop VM (set via %USERPROFILE%\.wslconfig).
+# Hot-path during ML training (`ml` profile, dremio idle):
+#   spark-master 3.5G + 2 × spark-worker 4G + minio/nessie/mlflow ~1.5G ≈ ~12 GiB.
+# Sum of `limits` exceeds 12 GiB on purpose — notebook and dremio are idle while
+# spark-submit drives the cluster, so they don't claim their full limit at once.
+#
+# Profiles (minio, minio-init, nessie are profile-less — always the base layer):
+#   ingest      → + spark (master/notebook/workers), dremio
+#   ml          → + spark, dremio, mlflow (+postgres)
+#   governance  → + mlflow (+postgres), openmetadata (+postgres/es/migrate)
+# A bare `docker compose up` brings up only the core; pass --profile for the rest.
 
 services:
 
@@ -37,9 +46,9 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 512M
+          memory: 768M
         reservations:
-          memory: 256M
+          memory: 384M
     labels:
       service: storage
       component: minio
@@ -93,8 +102,17 @@ services:
       QUARKUS_LOG_LEVEL: INFO
       NESSIE_VERSION_STORE_TYPE: ROCKSDB
       NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /nessie/data
+      # Iceberg REST catalog (Nessie's own integrated /iceberg endpoint) is configured
+      # in config/nessie/application.properties. NOT a second catalog: same RocksDB
+      # store exposed over the Iceberg REST protocol so read-only clients
+      # (OpenMetadata's iceberg connector) can list the tables Spark wrote.
+      # MinIO creds are passed here so the properties file can ${}-expand them
+      # without committing secrets.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - ./nessie-data:/nessie/data
+      - ./config/nessie/application.properties:/deployments/config/application.properties:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
       interval: 30s
@@ -127,6 +145,7 @@ services:
       dockerfile: Dockerfile
     container_name: spark-master
     hostname: spark-master
+    profiles: ["ingest", "ml"]
     ports:
       - "8080:8080"   # Master Web UI
       - "7077:7077"   # Master RPC
@@ -160,10 +179,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 2G
+          cpus: "2.0"
+          memory: 3584M
         reservations:
-          memory: 1G
+          memory: 2G
     labels:
       service: compute
       component: spark-master
@@ -175,6 +194,7 @@ services:
       dockerfile: Dockerfile
     container_name: spark-notebook
     hostname: spark-notebook
+    profiles: ["ingest", "ml"]
     command: >
       jupyter notebook
         --ip=0.0.0.0
@@ -208,30 +228,34 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 4G
+          cpus: "1.0"
+          memory: 1G
         reservations:
-          memory: 2G
+          memory: 512M
     labels:
       service: compute
       component: spark-notebook
 
-  # Two identical workers give the cluster 2 executor JVMs × 2 cores = 4 cores total.
+  # Two identical workers give the cluster 2 executor JVMs × 4 cores = 8 cores total.
   # Required so MLlib CrossValidator can fit two models in parallel (parallelism=2 in
   # src/ml/tracking.py): each fit lands on its own executor instead of sharing memory.
+  # 4 cores/worker (not 3) converts otherwise-idle host CPUs into task parallelism —
+  # the VM is CPU-rich, so extra cores cost no executor memory.
   spark-worker-1:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
     container_name: spark-worker-1
     hostname: spark-worker-1
-    # 2560m leaves ~500 MB headroom inside the 3 GB container for JVM overhead
+    profiles: ["ingest", "ml"]
+    # 3072m advertises 3 GB to the master; the 4 GB container absorbs Spark's
+    # ~10 % executor memory overhead + the worker JVM itself.
     command: >
       spark-class org.apache.spark.deploy.worker.Worker
         spark://spark-master:7077
         --webui-port 8081
-        --cores 2
-        --memory 2560m
+        --cores 4
+        --memory 3072m
     ports:
       - "8081:8081"
     environment:
@@ -253,10 +277,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 3G
+          cpus: "4.0"
+          memory: 4G
         reservations:
-          memory: 1536M
+          memory: 2G
     labels:
       service: compute
       component: spark-worker
@@ -267,12 +291,13 @@ services:
       dockerfile: Dockerfile
     container_name: spark-worker-2
     hostname: spark-worker-2
+    profiles: ["ingest", "ml"]
     command: >
       spark-class org.apache.spark.deploy.worker.Worker
         spark://spark-master:7077
         --webui-port 8082
-        --cores 2
-        --memory 2560m
+        --cores 4
+        --memory 3072m
     ports:
       - "8082:8082"
     environment:
@@ -294,10 +319,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 3G
+          cpus: "4.0"
+          memory: 4G
         reservations:
-          memory: 1536M
+          memory: 2G
     labels:
       service: compute
       component: spark-worker
@@ -310,6 +335,7 @@ services:
     image: dremio/dremio-oss:25.2.0
     container_name: dremio
     hostname: dremio
+    profiles: ["ingest", "ml"]
     ports:
       - "9047:9047"    # Web Console
       - "31010:31010"  # Arrow Flight (JDBC/ODBC)
@@ -319,8 +345,8 @@ services:
       DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
         -Dpaths.dist=file:///var/lib/dremio/dist
         -Dpaths.spilling=[/var/lib/dremio/spill]
-        -Xmx1536m
-        -XX:MaxDirectMemorySize=1g
+        -Xmx1g
+        -XX:MaxDirectMemorySize=384m
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -341,10 +367,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 2G
+          cpus: "1.0"
+          memory: 1536M
         reservations:
-          memory: 1G
+          memory: 768M
     labels:
       service: query_engine
       component: dremio
@@ -389,7 +415,7 @@ services:
   openmetadata-elasticsearch:
     profiles: ["governance"]
     container_name: openmetadata-es
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.4
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
     environment:
       - discovery.type=single-node
       - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
@@ -559,7 +585,7 @@ services:
   # --- ML operations ---
 
   mlflow-postgres:
-    profiles: ["ml"]
+    profiles: ["ml", "governance", "api"]
     image: postgres:16-alpine
     container_name: mlflow-postgres
     hostname: mlflow-postgres
@@ -592,7 +618,7 @@ services:
       component: mlflow-postgres
 
   mlflow:
-    profiles: ["ml"]
+    profiles: ["ml", "governance", "api"]
     build:
       context: ./docker/mlflow
       dockerfile: Dockerfile
@@ -630,6 +656,64 @@ services:
     labels:
       service: ml_operations
       component: mlflow
+
+  # --- Model serving (REST API) ---
+  # Serves a registered MLflow model as a REST endpoint (POST /invocations).
+  # Reuses the Spark image because the models are Spark MLlib PipelineModels:
+  # loading one needs a SparkSession. It runs local[*] (driver == executor), so
+  # the model's staged sparkml/ dir is visible to the "cluster" — the distributed
+  # "executors can't read the driver's /tmp" gotcha doesn't apply.
+  # Gated behind the `api` profile (NOT ml/core): it must start AFTER a model is
+  # trained and registered, or it restart-loops on a missing alias. Bring it up
+  # with `docker compose --profile api up -d` once a champion exists.
+  # Which model is served is set in .env: SERVE_MODEL / SERVE_ALIAS.
+  model-server:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: model-server
+    hostname: model-server
+    profiles: ["api"]
+    command: >
+      mlflow models serve
+        -m models:/${SERVE_MODEL:-fare_prediction}@${SERVE_ALIAS:-champion}
+        -h 0.0.0.0
+        -p 5001
+        --env-manager local
+    ports:
+      - "5001:5001"   # POST /invocations — see src/ml/api/README.md
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      SPARK_CLASSPATH: "/opt/spark/jars/*"
+      PYTHONPATH: "/opt/spark/src"
+    volumes:
+      - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s   # cold Spark session + model download from MinIO
+    networks:
+      - datalakehouse
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+        reservations:
+          memory: 1500M
+    labels:
+      service: ml_operations
+      component: model-server
 
 volumes:
   spark_data:

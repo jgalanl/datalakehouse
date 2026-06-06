@@ -1,8 +1,12 @@
 ﻿# Data Lakehouse Platform - Project Summary
 
-## Executive Summary
+## Overview
 
-This project delivers a comprehensive, production-ready data lakehouse platform designed for master's degree final project requirements. The platform integrates seven industry-leading open-source components to create a complete data stack suitable for proof-of-concept testing and advanced analytics.
+A local, batch-oriented data lakehouse built for a master's thesis (TFM). It wires
+together seven open-source components — MinIO, Iceberg, Nessie, Spark, Dremio,
+OpenMetadata and MLflow — into a medallion (bronze/silver/gold) pipeline over the
+NYC TLC yellow-taxi dataset, ending in three Spark MLlib models. Everything runs
+under Docker Compose; nothing is deployed to a cloud or a cluster.
 
 ## Architecture Components
 
@@ -33,10 +37,9 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 
 ### 5. **Data Governance: OpenMetadata**
 
-- Metadata extraction and cataloging
-- Data lineage tracking
-- Team collaboration features
-- Data quality monitoring
+- Metadata extraction and cataloging (data tables via Nessie's Iceberg-REST endpoint,
+  models via the MLflow connector)
+- Search/Explore backed by Elasticsearch
 
 ### 6. **ML Operations: MLflow**
 
@@ -46,9 +49,11 @@ This project delivers a comprehensive, production-ready data lakehouse platform 
 
 ### 7. **Supporting Infrastructure**
 
-- PostgreSQL for MLflow tracking (`ml` profile)
+- PostgreSQL for MLflow tracking (`ml` + `governance` profiles)
 - PostgreSQL + Elasticsearch for OpenMetadata (`governance` profile)
-- Docker Compose orchestration with Compose profiles to opt in/out of ML and governance stacks
+- Docker Compose orchestration with four profiles — `ingest`, `ml`, `governance`, `api` — over a
+  profile-less core (MinIO, minio-init, Nessie); each profile opts into the compute/services it needs
+  (`api` runs the `model-server` that serves a registered model over REST)
 
 ## Technical Highlights
 
@@ -105,53 +110,24 @@ datalakehouse/
 │   │   └── gold/               # build_yellow_taxi_trips.py, aggregate_demand_zone_hour.py
 │   ├── ml/                     # train.py (single entry point, dispatched by use case),
 │   │                           #   splits.py / pipelines.py / algorithms.py / tracking.py (shared building blocks)
-│   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml (unified model_diagnostics)
+│   │   └── api/                # REST serving — client.py + example payloads + README (model-server, `api` profile)
+│   └── notebooks/              # bronze (explore + preprocess + verify), silver (verify), gold (verify), ml ({fare,duration,demand}_diagnostics)
 └── docs/                       # Documentation
 ```
 
-## Key Features
+## What the platform does
 
-### ✅ Core Capabilities
-
-- Data ingestion from multiple formats (CSV, Parquet)
-- Distributed batch processing with Spark
-- ACID-compliant table operations
-- Time travel and version control
-- SQL analytics with Dremio
-- ML experiment tracking
-
-### ✅ Enterprise Features
-
-- Data governance and cataloging
-- Data lineage tracking
-- Quality assertions and monitoring
-- Model registry with lifecycle stages
-- Team collaboration features
-
-### ✅ Development Features
-
-- Interactive notebooks for exploration and per-layer verification
-- ETL and ML pipelines with strict per-layer Iceberg schemas
-- WAP audit gates (drop-ratio, row-count parity, pickup conservation)
-- Type hints and concise inline documentation
-
-## Proof-of-Concept Scenarios
-
-### Scenario 1: Multi-Table Atomic Operations
-
-Demonstrates ACID transactions across multiple Iceberg tables with rollback capability.
-
-### Scenario 2: Data Versioning & Time Travel
-
-Shows Git-like versioning with Nessie, branch management, and historical queries.
-
-### Scenario 3: Complete ETL Pipeline
-
-End-to-end data flow: ingestion → transformation → analytics → governance.
-
-### Scenario 4: ML Model Lifecycle
-
-Experiment tracking, model registration, staging, and version management.
+- Ingests NYC TLC parquet (Q1 of 2023/2024/2025) and the taxi-zone CSV into bronze
+- Cleans and conforms it into silver (validity filtering + per-`RatecodeID` IQR outlier
+  removal), then curates two gold tables (trip-level and demand-per-zone-per-hour)
+- Versions every layer with Nessie branches/tags under a Write-Audit-Publish flow;
+  audits are non-raising and quarantine failing months as `review/` tags
+- Trains three Spark MLlib regression models (fare, trip duration, demand) with MLflow
+  tracking and a Model Registry champion/challenger workflow
+- Serves a registered model over REST (`mlflow models serve`, the `model-server` service
+  in the `api` profile) — POST feature rows to `:5001/invocations`, get predictions
+- Catalogs the gold tables and registered models in OpenMetadata
+- Ships per-layer verification notebooks and one diagnostic notebook per ML use case
 
 ## Development Workflow
 
@@ -170,7 +146,7 @@ Experiment tracking, model registration, staging, and version management.
 
 #### `src/pipelines/bronze/` — bronze ingestion
 
-- `ingest_yellow_taxi.py`: downloads NYC TLC parquet (Q1 of 2019/2020/2022/2023/2025),
+- `ingest_yellow_taxi.py`: downloads NYC TLC parquet (Q1 of 2023/2024/2025),
   reconciles schema drift, writes `nessie.nyc.yellow_taxi` via WAP per month
 - `ingest_zone_lookup.py`: writes the small reference table `nessie.nyc.taxi_zone_lookup`
 
@@ -204,12 +180,12 @@ All ML code reads only from the gold tables on `main` (strict medallion).
 - `splits.py`: data preparation — `make_splits` is a **last-year holdout**:
   `common_test` is every row of `TEST_YEAR = 2025` (fully held out), and
   `train` / `val` are a stratified-by-year random split of `TRAIN_VAL_YEARS
-  = [2019, 2020, 2022, 2023]` at `val_frac = 0.15` per year. The model is
+  = [2023, 2024]` at `val_frac = 0.15` per year. The model is
   never exposed to any `TEST_YEAR` row during training or selection, so
   `common_test_rmse` is an unbiased out-of-time generalization estimate.
   Cyclical encoding for hour/dow (sin/cos for GLR; trees keep the
   integer columns). Constants: `TEST_YEAR`, `TRAIN_VAL_YEARS`,
-  `SUBSET_A_YEARS = [2019, 2020]` (Phase 2 A — half the training pool;
+  `SUBSET_A_YEARS = [2023]` (Phase 2 A — half the training pool;
   B = all of `TRAIN_VAL_YEARS`, reused as the Phase-1 winner).
 - `pipelines.py`: `build_regression_pipeline` (StringIndexer → optional
   OneHot → numerical scaling → VectorAssembler → optional VectorIndexer →
@@ -223,19 +199,27 @@ All ML code reads only from the gold tables on `main` (strict medallion).
   same tree preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}`
   exposes the tree set so `splits.resolve_numerical_cols` knows to skip
   cyclical encoding. Single grid set `FULL_PARAM_GRIDS` consumed per
-  algorithm in Phase 1 Training (5-pt GLR, 8-pt GBT, 7-pt RFR — GBT
-  explores depth + shrinkage + stochastic-GBM regularizers per Friedman
-  2002; RFR explores forest size, depth, row subsampling and
-  column-subset strategy per Breiman 2001) plus fast-mode variants.
+  algorithm in Phase 1 Training (4-pt GLR, 4-pt GBT, 4-pt RFR — 4 ×
+  `CV_NUM_FOLDS=3` = 12 fits/algorithm; GBT explores depth + one
+  stochastic-GBM regularizer probe per Friedman 2002; RFR explores forest
+  size + a depth probe per Breiman 2001) plus fast-mode variants.
   Each algorithm is CV-tuned over its full grid in one pass — the old
   Phase-1 screening + Phase-2 winner-only optimization were collapsed
   into a single training step. `fast_mode_enabled()` parses `--fast` /
   `ML_FAST_MODE=1`.
 - `tracking.py`: MLflow side — `get_ml_spark` (pins the session to
   `main`/gold), `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point
-  estimates), `train_and_log_run` / `tune_with_cv` (Spark
-  `CrossValidator(numFolds=3, parallelism=2)`),
-  `compute_baseline_metrics` + `log_baseline_run`,
+  estimates), `train_and_log_run` / `tune_with_cv` (hand-rolled k-fold
+  CV, `CV_NUM_FOLDS=3` — feature stages fit once per fold, transformed
+  vectors cached and reused across grid points at `CV_PARALLELISM=2`;
+  avoids `CrossValidator`'s redundant per-(fold × point) preprocessing
+  with no cross-fold leakage),
+  `compute_baseline_metrics` (single-split helper, still used by the
+  diagnostic notebook) + `log_baseline_run` (fits the per-group means on
+  `train`, scores **every** split in `eval_splits`, logs `{split}_{metric}`
+  so the baseline carries the same train/val/common_test metric set as the
+  model runs), `log_input_datasets` (logs the train/val/test MLflow
+  `Dataset`s onto each run so the *Datasets used* field is populated),
   `register_candidates` (registers every candidate from one training
   invocation as a new Model Registry version; the within-run winner gets
   `@champion` only if its `val_rmse` is strictly below the previous
@@ -256,14 +240,16 @@ All ML code reads only from the gold tables on `main` (strict medallion).
   `glr_family` / `baseline_group_cols` / `redundant_categoricals`). Workflow:
   **Phase 0** drop the `redundant_categoricals` from `categorical_cols`
   (borough is derivable from location_id, so it carries no extra information
-  given the IDs) → **baseline** (mean(label) per group on `common_test` —
-  mean is the RMSE-optimal constant-per-group predictor,
-  floor reference) → **Phase 1 Training** (one CV(k=3) per algorithm over
-  its `FULL_PARAM_GRIDS` entry — 5-pt GLR, 8-pt GBT, 7-pt RFR — winner
+  given the IDs) → build one MLflow `Dataset` per split (`from_spark`,
+  reused across runs, logged as `training`/`validation`/`testing` inputs on
+  every run) → **baseline** (mean(label) per group, scored on
+  `train`/`val`/`common_test` like the model runs — mean is the RMSE-optimal
+  constant-per-group predictor, floor reference) → **Phase 1 Training** (one CV(k=3) per algorithm over
+  its `FULL_PARAM_GRIDS` entry — 4-pt GLR, 4-pt GBT, 4-pt RFR (12 fits/algorithm) — winner
   is whichever algorithm's CV bestModel scores lowest on `val_rmse`;
   collapses the old Phase-1 screening + Phase-2 winner-only optimization
   into one step) → **Phase 2 More-data** (winner refit on
-  `SUBSET_A_YEARS` — the two earliest training years; B is the Phase-1
+  `SUBSET_A_YEARS` — the earliest training year; B is the Phase-1
   winner trained on all of `TRAIN_VAL_YEARS` and reused without refit;
   both score on the same `common_test = TEST_YEAR` so neither sees the
   held-out year) → **Phase 3 Registration**: every candidate (4 per
@@ -299,8 +285,8 @@ All ML code reads only from the gold tables on `main` (strict medallion).
 - `bronze/preprocess.ipynb`: Spark EDA on the full dataset; quantitatively justifies
   the silver cleaning rules
 - `bronze|silver|gold/verify_iceberg.ipynb`: layer-specific Iceberg + Nessie audits
-- `ml/model_diagnostics.ipynb`: **unified** diagnostic notebook for the three use
-  cases — set `USE_CASE = "fare" | "duration" | "demand"` in cell 1 and rerun.
+- `ml/{fare,duration,demand}_diagnostics.ipynb`: **one diagnostic notebook per use
+  case** — each pins `USE_CASE` (analysis body identical across the three).
   Loads `<experiment>@champion` from the MLflow Registry, reconstructs the splits,
   plots the per-year breakdown across `TRAIN_VAL_YEARS` (in-sample-ish) and
   `TEST_YEAR` (held out — the drift signal), predicted vs actual, residuals,
@@ -319,7 +305,7 @@ All ML code reads only from the gold tables on `main` (strict medallion).
 | Query      | Dremio OSS                                   | 25.2.0        |
 | Governance | OpenMetadata                                 | 1.12.1        |
 | ML Ops     | MLflow                                       | 2.20.3        |
-| Databases  | PostgreSQL 15 / Elasticsearch 8.11.4         | -             |
+| Databases  | PostgreSQL 16 / Elasticsearch 9.3.0          | -             |
 | Container  | Docker & Docker Compose                      | 20.10+ / 2.0+ |
 
 ## Installation & Setup
@@ -338,7 +324,8 @@ All ML code reads only from the gold tables on `main` (strict medallion).
 git clone <repository>
 cd datalakehouse
 
-# Bring up the full stack (ML profile enables MLflow)
+# Bring up core + Spark + Dremio + MLflow (the `ml` profile);
+# use `--profile governance` for the OpenMetadata stack, `--profile api` to serve a model.
 docker compose --profile ml up -d
 
 # Access services
@@ -346,6 +333,7 @@ docker compose --profile ml up -d
 # Spark: http://localhost:8080
 # Dremio: http://localhost:9047
 # MLflow: http://localhost:5000
+# Model REST API (with `--profile api`): http://localhost:5001
 ```
 
 End-to-end execution sequence (bronze → silver → gold → ML) is documented in
@@ -358,102 +346,29 @@ End-to-end execution sequence (bronze → silver → gold → ML) is documented 
 1. **[README.md](README.md)** — Complete project guide
 2. **[RUNBOOK.md](RUNBOOK.md)** — End-to-end execution sequence
 3. **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** — Command cheatsheet
-4. **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Technical deep dive
+4. **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Architecture decisions and rationale
 5. **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** — Developer guide
 6. **[CLAUDE.md](CLAUDE.md)** — Codebase conventions for Claude Code (also useful as a quick architectural reference)
 
-### Interactive Resources
+## Code Quality
 
-- **Jupyter Notebooks**: Interactive tutorials and examples
-- **Example Scripts**: Real-world usage patterns
+- Type annotations on the shared helpers (`src/common`, `src/ml`)
+- Comments explain *why*, not *what*; module docstrings kept to 2–3 lines
+- Pipeline progress printed at every WAP step
+- Audits are non-raising: a failed gate quarantines the month as a `review/` tag and the
+  run continues, reporting failures in an end-of-run summary
+- Per-layer verification notebooks under `src/notebooks/*/verify_iceberg.ipynb`
 
-## Code Quality & Best Practices
+## Limitations
 
-### Implementation Standards
+A single-node proof of concept, not a production deployment:
 
-- **Type Hints**: Full type annotations on shared helpers
-- **Documentation**: Concise comments — explain *why*, not *what*
-- **Logging**: Pipeline progress printed at every WAP step
-- **Error Handling**: Non-raising audits + quarantine tags (failures don't crash the run)
-- **Verification**: Per-layer notebooks under `src/notebooks/*/verify_iceberg.ipynb`
+- Single MinIO node; standalone Spark cluster (two workers on one host)
+- No Kubernetes, no high availability, no TLS
+- Default development credentials; internal Docker network only
+- Tuned for a 12 GiB WSL2 / Docker Desktop VM
 
-### Architecture Principles
-
-- **Modularity**: Separate concerns into focused modules
-- **Abstraction**: Clean APIs hiding complexity
-- **Configuration**: Environment-driven setup
-- **Documentation**: Self-documenting code with examples
-- **Scalability**: Designed for horizontal scaling
-
-## Performance Characteristics
-
-### Storage
-
-- MinIO: Sub-second access for small files, optimized for analytics
-- Iceberg: Efficient partition pruning and data skipping
-
-### Compute
-
-- Spark: 2GB per worker, configurable
-- Parallelism: 4 default, tunable
-
-### Query Engine
-
-- Dremio: In-memory caching and reflection policies
-- Predicate pushdown to reduce data movement
-
-## Security Considerations
-
-### Current (Development)
-
-- Default credentials for all services
-- No TLS/encryption
-- Internal Docker network
-- Suitable for PoC and testing only
-
-### Production (Future)
-
-- Strong, unique credentials
-- TLS 1.3 for all communications
-- Authentication and authorization
-- Audit logging
-- Secrets management
-- Network isolation
-
-## Limitations & Future Enhancements
-
-### Current Limitations
-
-- Single MinIO node (not distributed)
-- Standalone Spark cluster
-- No Kubernetes orchestration
-- Manual service management
-- Development credentials
-
-### Future Enhancements
-
-- Kubernetes deployment
-- High-availability setup
-- Multi-region support
-- Advanced monitoring
-- Production security hardening
-
-## Educational Value
-
-This project demonstrates:
-
-- **Lakehouse Architecture**: Combining lake and warehouse benefits
-- **ACID on Data Lakes**: Transaction guarantees with Iceberg
-- **Data Versioning**: Git-like workflows for data
-- **Distributed Systems**: Orchestration and coordination
-- **Analytics Platforms**: Query optimization and semantic layers
-- **ML Operations**: End-to-end model lifecycle
-- **Infrastructure as Code**: Docker Compose orchestration
-- **Enterprise Data Stack**: Integration of multiple technologies
-
-## References & Resources
-
-### Official Documentation
+## References
 
 - Apache Iceberg: https://iceberg.apache.org/
 - Project Nessie: https://projectnessie.org/
@@ -462,61 +377,3 @@ This project demonstrates:
 - MLflow: https://mlflow.org/docs/
 - OpenMetadata: https://docs.open-metadata.org/
 - MinIO: https://min.io/docs/
-
-### Academic Papers
-
-- "Iceberg: Efficient Iceberg Table Format for Analytics"
-- "Nessie: Versioning and Branching for Data Lake Tables"
-- "Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores"
-
-## Project Metrics
-
-- **Components**: 7 major services
-- **Code**: ~2500+ lines (Python, YAML, Dockerfiles)
-- **Documentation**: 5 comprehensive guides + inline
-- **ETL pipelines**: 7 scripts across bronze (2), silver (3), gold (2) — all WAP
-- **ML pipelines**: 3 use cases (fare regression, duration regression, demand forecast)
-- **Notebooks**: 6 interactive notebooks
-  - bronze: `explore`, `preprocess`, `verify_iceberg`
-  - silver: `verify_iceberg`
-  - gold: `verify_iceberg`
-  - ml: `model_diagnostics` (unified — set `USE_CASE` in cell 1, rerun for each use case)
-- **Configuration Files**: 10+ service configurations
-
-## Support & Maintenance
-
-### Troubleshooting
-
-- See DEVELOPMENT.md troubleshooting section
-- Check QUICK_REFERENCE.md for diagnostics
-- Review Docker logs for service issues
-
-### Community Resources
-
-- Check official documentation links
-- Review example code and notebooks
-- Consult architecture documentation
-
-## Conclusion
-
-This data lakehouse platform successfully integrates industry-leading open-source technologies to create a comprehensive, technically rigorous system suitable for:
-
-- **Proof-of-Concept Testing**: Validate architecture patterns
-- **Educational Purposes**: Learn distributed data systems
-- **Production Prototyping**: Foundation for enterprise deployment
-- **Research & Analysis**: Advanced analytics capabilities
-
-The platform meets all requirements for a master's degree final project by demonstrating:
-
-- Technical depth across multiple domains
-- Rigorous software engineering practices
-- Comprehensive documentation
-- Production-ready code quality
-- Real-world applicability
-
----
-
-**Project Version**: 1.0.0
-**Status**: Completed - Production Ready for PoC/Development
-**Last Updated**: May 2026
-**Target**: Master's Degree Final Project

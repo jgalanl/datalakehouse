@@ -1,6 +1,8 @@
 # Data Lakehouse Platform - Master's Degree Final Project
 
-A comprehensive, production-ready data lakehouse platform demonstrating technical rigor across all components. This architecture integrates open-source technologies to create a complete data platform suitable for proof-of-concept testing and advanced analytics.
+A local, batch-oriented data lakehouse built for a master's thesis (TFM). It runs a
+medallion (bronze/silver/gold) pipeline over the NYC TLC yellow-taxi dataset and trains
+three Spark MLlib models, integrating seven open-source components under Docker Compose.
 
 ## Architecture Overview
 
@@ -34,6 +36,7 @@ The platform consists of seven core components organized into logical layers:
 ### ML Operations Layer
 
 - **MLflow**: ML experiment tracking and model registry
+- **model-server**: serves a registered model over REST (`mlflow models serve`, `api` profile)
 
 ## System Architecture Diagram
 
@@ -69,9 +72,10 @@ The platform consists of seven core components organized into logical layers:
     └── nessie.nyc.pickup_demand_zone_hour  on main    (aggregated by pickup zone × hour bucket)
 
 Supporting Services:
-├── PostgreSQL (MLflow tracking DB) — `ml` profile
+├── PostgreSQL (MLflow tracking DB) — `ml` + `governance` profiles
 ├── PostgreSQL (OpenMetadata DB) — `governance` profile
-└── Elasticsearch (OpenMetadata search) — `governance` profile
+├── Elasticsearch (OpenMetadata search) — `governance` profile
+└── model-server (MLflow REST serving on :5001) — `api` profile
 ```
 
 ## Prerequisites
@@ -104,24 +108,33 @@ cp .env.example .env
 Bring the platform up directly with Docker Compose profiles:
 
 ```bash
-# Core stack only (MinIO, Nessie, Spark, Dremio)
+# Core only (MinIO, minio-init, Nessie) — no compute. Rarely useful on its own.
 docker compose up -d
 
-# Including ML services (MLflow + its PostgreSQL)
+# Ingest: core + Spark (master/notebook/workers) + Dremio
+docker compose --profile ingest up -d
+
+# ML: core + Spark + Dremio + MLflow (+ its PostgreSQL)
 docker compose --profile ml up -d
 
-# Including governance (OpenMetadata + PostgreSQL + Elasticsearch)
+# Governance: core + MLflow + OpenMetadata (+ PostgreSQL + Elasticsearch)
 docker compose --profile governance up -d
 
-# Everything
+# API: core + MLflow + model-server (serves a registered model over REST on :5001)
+docker compose --profile api up -d model-server
+
+# Multiple profiles union their service sets (e.g. ML + governance)
 docker compose --profile ml --profile governance up -d
 ```
 
-See [RUNBOOK.md](RUNBOOK.md) for the end-to-end execution sequence (bronze → silver → gold → ML).
+See [RUNBOOK.md](RUNBOOK.md) for the end-to-end execution sequence (bronze → silver → gold → ML → serving).
 
-> The `mlflow` and `mlflow-postgres` services are gated behind the `ml` profile.
-> The OpenMetadata stack lives behind the `governance` profile. ML training scripts
-> require the `ml` profile to be active.
+> `minio`, `minio-init` and `nessie` are profile-less — the always-on core. Everything
+> else is gated: Spark + Dremio behind `ingest` (and `ml`), MLflow behind `ml` (and
+> `governance`), the OpenMetadata stack behind `governance`, and the model REST server
+> behind `api`. A bare `docker compose up` brings up only the core, so always pass a
+> profile to get compute. Spark-submit pipelines need `ingest` or `ml`; ML training
+> needs `ml`; serving a trained model needs `api` (see [src/ml/api/](src/ml/api/)).
 
 ### 3. Verify Services
 
@@ -251,9 +264,10 @@ curl http://localhost:9000/minio/health/live
 - Parameter and metric logging
 - Artifact storage
 - Model registry with versioning
-- Model serving capabilities
+- Model serving over REST (`mlflow models serve`) via the `model-server` service (`api` profile) — see [src/ml/api/](src/ml/api/)
 
 **Tracking Server**: http://localhost:5000
+**Model REST API** (when the `api` profile is up): http://localhost:5001
 **Backend**: PostgreSQL
 **Artifact Storage**: S3 (MinIO)
 **Documentation**: https://mlflow.org/docs/
@@ -285,7 +299,7 @@ Key configurations:
 
 ### 1. Bronze Ingestion
 
-Bronze ingestion downloads NYC TLC parquet files for Q1 of 2019/2020/2022/2023/2025
+Bronze ingestion downloads NYC TLC parquet files for Q1 of 2023/2024/2025
 and writes them as Iceberg tables on the `bronze` Nessie branch (WAP per month).
 `BRONZE_SCHEMA` (declared in [src/pipelines/bronze/ingest_yellow_taxi.py](src/pipelines/bronze/ingest_yellow_taxi.py))
 reconciles the year-over-year drift; `cbd_congestion_fee` (added by TLC in Jan 2025)
@@ -385,8 +399,7 @@ and runs the same workflow end-to-end inside one MLflow experiment per use
 case. The split is a **last-year holdout**: `common_test` is every row of
 `TEST_YEAR = 2025` (fully held out — the model never sees any 2025 row
 during training or selection), while `train` / `val` are a
-stratified-by-year random split of `TRAIN_VAL_YEARS = [2019, 2020, 2022,
-2023]` at `val_frac = 0.15` per year. The metric on `common_test` is
+stratified-by-year random split of `TRAIN_VAL_YEARS = [2023, 2024]` at `val_frac = 0.15` per year. The metric on `common_test` is
 therefore an unbiased generalization estimate to a future year, and the
 diagnostic notebook tells the drift story by comparing the per-year
 breakdown of TRAIN_VAL_YEARS (in-sample-ish) to TEST_YEAR (held out).
@@ -415,13 +428,13 @@ Each invocation runs five phases plus a baseline:
   predictor — the previous median version was MAE-optimal, wrong loss for
   our reported metric.
 - **Phase 1 — Training.** One `CV(k=3)` per algorithm over its
-  `FULL_PARAM_GRIDS` entry (5-pt GLR, 8-pt GBT, 7-pt RFR). The within-run
+  `FULL_PARAM_GRIDS` entry (4-pt GLR, 4-pt GBT, 4-pt RFR = 12 fits/algorithm). The within-run
   winner is whichever algorithm's CV bestModel scores lowest on `val_rmse`.
   Each algorithm gets its fairly-tuned best registered — the previous
   design (Phase 1 screening with 3-pt grids + Phase 2 winner-only
   optimization) was collapsed into a single training step.
 - **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS`
-  (the two earliest training years); subset B is the Phase-1 winner trained
+  (the earliest training year); subset B is the Phase-1 winner trained
   on all of `TRAIN_VAL_YEARS` and reused without refit. Both score on the
   same `common_test = TEST_YEAR`, so neither sees the held-out year — the
   contrast isolates "does more training data help generalize to a future
@@ -448,10 +461,12 @@ Each invocation runs five phases plus a baseline:
   `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end of every
   run; `@champion` / `@challenger` aliased versions are always kept.
 
-Open MLflow at http://localhost:5000 and the unified diagnostic notebook
-[src/notebooks/ml/model_diagnostics.ipynb](src/notebooks/ml/model_diagnostics.ipynb)
-— set `USE_CASE` in cell 1 to `"fare"` / `"duration"` / `"demand"` and rerun
-to load `<experiment>@champion` from the registry and plot the per-year
+Open MLflow at http://localhost:5000 and the per-use-case diagnostic notebook
+for the model you trained —
+[fare_diagnostics.ipynb](src/notebooks/ml/fare_diagnostics.ipynb) /
+[duration_diagnostics.ipynb](src/notebooks/ml/duration_diagnostics.ipynb) /
+[demand_diagnostics.ipynb](src/notebooks/ml/demand_diagnostics.ipynb)
+— each loads `<experiment>@champion` from the registry and plots the per-year
 breakdown of `common_test`, predicted vs actual, residuals, feature
 importance and the Phase 2 more-data comparison.
 
@@ -496,12 +511,13 @@ datalakehouse/
 │   ├── ml/                  # ML training on gold — one unified train.py dispatched by use case
 │   │                        #   (train.py {fare|duration|demand} [--fast]); shared building blocks
 │   │                        #   split across splits.py / pipelines.py / algorithms.py / tracking.py
+│   │   └── api/             # REST serving — client.py + example payloads + README (model-server, `api` profile)
 │   └── notebooks/           # Jupyter notebooks, split per medallion layer
 │       ├── bronze/          # explore (pandas, raw parquet first look), preprocess (Spark, silver-rule evidence), verify_iceberg
 │       ├── silver/          # verify_iceberg
 │       ├── gold/            # verify_iceberg (trips + demand audits)
-│       └── ml/              # model_diagnostics.ipynb — unified, set USE_CASE in cell 1 and rerun; loads <experiment>@champion
-├── RUNBOOK.md               # End-to-end execution sequence (bronze → silver → gold → ML)
+│       └── ml/              # {fare,duration,demand}_diagnostics.ipynb — one per use case; each loads <experiment>@champion
+├── RUNBOOK.md               # End-to-end execution sequence (bronze → silver → gold → ML → serving)
 └── docs/                    # Architecture / development / quick reference
 ```
 
@@ -535,42 +551,11 @@ datalakehouse/
 
 ### Data Governance
 
-- **OpenMetadata**: Comprehensive data cataloging and lineage
-- **Quality Monitoring**: Data quality assertions and tracking
-- **Collaboration**: Team-based governance workflows
+- **OpenMetadata**: catalogs the gold Iceberg tables (via Nessie's Iceberg-REST endpoint)
+  and the registered MLflow models; Explore/search backed by Elasticsearch
 
-## Proof-of-Concept Testing Scenarios
-
-### Scenario 1: Multi-Table Transactions
-
-```python
-# Demonstrate ACID transactions with Iceberg + Nessie
-# Create related tables, perform atomic updates, verify consistency
-```
-
-### Scenario 2: Data Versioning & Time Travel
-
-```python
-# Show version history with Nessie branches
-# Query historical data versions
-# Compare data across branches
-```
-
-### Scenario 3: ETL Pipeline
-
-```python
-# Ingest raw data → Process with Spark → Query with Dremio
-# Track data lineage in OpenMetadata
-# Monitor pipeline with MLflow
-```
-
-### Scenario 4: ML Model Management
-
-```python
-# Track experiments with MLflow
-# Register and version models
-# Transition through staging to production
-```
+The end-to-end execution sequence (bronze → silver → gold → ML → cataloging) is in
+[RUNBOOK.md](RUNBOOK.md).
 
 ## Common Operations
 
@@ -727,11 +712,3 @@ See LICENSE file for details.
 ## Support & Feedback
 
 For issues, questions, or suggestions, please refer to the project documentation or create an issue in the repository.
-
----
-
-**Project Status**: Development/Proof-of-Concept
-
-**Last Updated**: May 2026
-
-**Version**: 1.0.0

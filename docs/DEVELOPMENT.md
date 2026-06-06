@@ -44,7 +44,11 @@ cp .env.example .env
 ### 5. Start Services
 
 ```bash
-docker-compose up -d
+# A bare `up` starts only the profile-less core (MinIO, minio-init, Nessie).
+# Pass a profile to get compute: `ingest` (Spark + Dremio), `ml` (+ MLflow),
+# `governance` (MLflow + OpenMetadata), or `api` (MLflow + model-server REST).
+# For dev you usually want `ml`.
+docker compose --profile ml up -d
 ```
 
 ## Python Development
@@ -88,9 +92,13 @@ src/
 │   │                                   #   fast_mode_enabled().
 │   ├── tracking.py                     # MLflow side: get_ml_spark / setup_mlflow,
 │   │                                   #   evaluate_regression (rmse/mae/r2 point estimates),
-│   │                                   #   train_and_log_run, tune_with_cv (Spark CrossValidator)
+│   │                                   #   train_and_log_run, tune_with_cv (hand-rolled k-fold CV:
+│   │                                   #   per-fold feature caching, no CrossValidator)
 │   │                                   #   — return the in-memory PipelineModel alongside metrics;
-│   │                                   #   compute_baseline_metrics + log_baseline_run,
+│   │                                   #   compute_baseline_metrics + log_baseline_run (scores
+│   │                                   #   train/val/common_test, same metric set as model runs),
+│   │                                   #   log_input_datasets (train/val/test Dataset inputs on
+│   │                                   #   every run -> Datasets used field),
 │   │                                   #   measure_inference_latency (1000-row sample, warm-up +
 │   │                                   #   one timed collect),
 │   │                                   #   prune_old_versions (top-N retention; aliased always kept),
@@ -101,7 +109,7 @@ src/
 │   │                                   #   also gets inference_latency_* tags; registry pruned to
 │   │                                   #   REGISTRY_MAX_VERSIONS=20 at the end; common_test held
 │   │                                   #   out — non-champions tagged challenger).
-│   └── train.py                        # Single entry point — `spark-submit train.py {fare|duration|demand} [--fast]`.
+│   ├── train.py                        # Single entry point — `spark-submit train.py {fare|duration|demand} [--fast]`.
 │                                       #   USE_CASES dict carries the per-use-case knobs
 │                                       #   (source / label / year_col / numerical_cols /
 │                                       #   categorical_cols / glr_family / redundant_categoricals).
@@ -115,13 +123,16 @@ src/
 │                                       #   champion's val_rmse; on promotion the new @champion
 │                                       #   gets inference_latency_* tags; registry pruned to
 │                                       #   top 20 non-aliased; rest tagged challenger.
+│   └── api/                            # REST serving — client.py (stdlib consumer), examples/
+│                                       #   ({fare,duration,demand}_request.json), README.md. Served by
+│                                       #   the model-server compose service (`api` profile); no .sh.
 └── notebooks/                  # Jupyter notebooks, split per medallion layer
-    ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2019),
+    ├── bronze/                 # explore.ipynb (pandas, parquet original — first look on Jan 2023),
     │                           # preprocess.ipynb (Spark, full-dataset EDA → silver-rule evidence),
     │                           # verify_iceberg.ipynb
     ├── silver/                 # verify_iceberg.ipynb
     ├── gold/                   # verify_iceberg.ipynb (trips + demand audits)
-    └── ml/                     # model_diagnostics.ipynb — unified notebook, set USE_CASE in cell 1
+    └── ml/                     # {fare,duration,demand}_diagnostics.ipynb — one diagnostic notebook per use case
                                 #   and rerun. Loads `<experiment>@champion` from MLflow Registry;
                                 #   per-year scoring of champion (TRAIN_VAL_YEARS in-sample-ish vs
                                 #   TEST_YEAR held out) shows the drift signal.
@@ -504,7 +515,3 @@ docker exec container-name nslookup service-name
 - **PySpark**: https://spark.apache.org/docs/latest/api/python/
 - **Pytest**: https://docs.pytest.org/
 - **Git**: https://git-scm.com/doc
-
----
-
-**Last Updated**: May 2026

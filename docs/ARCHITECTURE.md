@@ -8,7 +8,7 @@ This document details the architectural decisions and technical rationale behind
 
 ### Decision Rationale
 
-- **S3 Compatibility**: MinIO provides an S3-compatible interface, enabling seamless integration with AWS SDK
+- **S3 Compatibility**: MinIO exposes an S3-compatible API, so Spark's S3A connector and the AWS SDK talk to it unchanged
 - **Self-Hosted**: Full control over data locality and compliance
 - **Performance**: Multi-node support for horizontal scaling
 - **Simplicity**: Single-binary deployment
@@ -186,10 +186,10 @@ Spark Master (8080, 7077)
 
 ### Design Rationale
 
-- **Semantic layer**: Abstract complex data models
-- **Iceberg-native**: First-class support for Iceberg tables
-- **Distributed query execution**: Fault-tolerant analytics
-- **Multiple data sources**: Query across heterogeneous systems
+- **Semantic layer**: virtual datasets/views over the physical tables
+- **Iceberg-native**: reads Iceberg tables directly through the Nessie catalog
+- **Distributed query execution**: parallel scans over the warehouse bucket
+- **SQL interface**: ANSI SQL plus Arrow Flight / JDBC / REST endpoints
 
 ### Catalog Integration
 
@@ -264,17 +264,30 @@ Spark MLlib pipeline (StringIndexer → optional OneHot → numerical scaling �
                   RFR (random forest) }
     (tree models use maxBins=300 for the ~265-level location IDs)
     ↓
-MLflow (Tracking Server, behind the `ml` profile)
+MLflow (Tracking Server, behind the `ml` and `governance` profiles)
     ├── PostgreSQL (run metadata, params, metrics, tags)
     └── MinIO S3 (PipelineModel artifacts in mlflow-artifacts bucket)
         ↓
     Model Registry (MLflow) — single-metric champion / challenger on val_rmse
                               (common_test held out — reported, never used to select)
-        ↓
-    Diagnostics notebook (model_diagnostics.ipynb, set USE_CASE in cell 1)
-    loads `<experiment>@champion` and scores it per year — TRAIN_VAL_YEARS
-    are in-sample-ish, TEST_YEAR is the held-out drift signal.
+        ├── Diagnostics notebook ({fare,duration,demand}_diagnostics.ipynb, one per use
+        │   case) loads `<experiment>@champion` and scores it per year — TRAIN_VAL_YEARS
+        │   are in-sample-ish, TEST_YEAR is the held-out drift signal.
+        └── model-server (`api` profile) — `mlflow models serve` exposes
+            `models:/<model>@<alias>` as a REST endpoint at :5001/invocations
 ```
+
+### Model Serving
+
+A registered model is served over REST by the **`model-server`** service
+(`docker-compose.yml`, **`api` profile**). It runs MLflow's built-in inference server
+(`mlflow models serve -m models:/${SERVE_MODEL}@${SERVE_ALIAS}`) on the Spark image —
+the models are Spark MLlib `PipelineModel`s, so loading one needs a SparkSession; it
+runs `local[*]` (driver == executor), which sidesteps the distributed staging gotcha.
+The endpoint exposes `/ping`, `/health`, `/version` and `POST /invocations` (a
+`dataframe_split` payload of gold feature rows → predictions). The service is isolated
+in its own profile because it serves a *registered* model and must start only after one
+exists. Client + example payloads: `src/ml/api/` (see its `README.md`).
 
 ### ML Use Cases
 
@@ -291,10 +304,10 @@ the old monolithic `ml_common.py`):
   is every row of `TEST_YEAR = 2025` (fully held out — the model is never
   exposed to any TEST_YEAR row during training or selection), and `train`
   / `val` are a stratified-by-year random split of `TRAIN_VAL_YEARS =
-  [2019, 2020, 2022, 2023]` at `val_frac = 0.15` per year. Cyclical
+  [2023, 2024]` at `val_frac = 0.15` per year. Cyclical
   encoding for hour/dow (sin/cos for GLR; trees keep the integer
   columns). Constants: `TEST_YEAR`, `TRAIN_VAL_YEARS`, `SUBSET_A_YEARS =
-  [2019, 2020]` (Phase 2 A — half the training pool; B = all of
+  [2023]` (Phase 2 A — half the training pool; B = all of
   `TRAIN_VAL_YEARS`, reused as the Phase-1 winner).
 - **`pipelines.py`** — `build_regression_pipeline` (StringIndexer → optional
   OneHot → numerical scaling → VectorAssembler → optional VectorIndexer →
@@ -308,19 +321,25 @@ the old monolithic `ml_common.py`):
   (`RandomForestRegressor`, variance-reducing bagging — same tree
   preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}` exposes the
   tree set so `splits.resolve_numerical_cols` knows to skip cyclical
-  encoding. Single grid set: `FULL_PARAM_GRIDS` (5-pt GLR, 8-pt GBT,
-  7-pt RFR — GBT explores depth + shrinkage + stochastic-GBM
-  `subsamplingRate` / `featureSubsetStrategy` per Friedman 2002; RFR
-  explores forest size, depth, row subsampling and column-subset
-  strategy per Breiman 2001). Each algorithm is CV-tuned over its full
+  encoding. Single grid set: `FULL_PARAM_GRIDS` (4-pt GLR, 4-pt GBT, 4-pt RFR — 4 × `CV_NUM_FOLDS=3` = 12 fits/algorithm; GBT explores depth + one stochastic-GBM
+  `subsamplingRate` / `featureSubsetStrategy` probe per Friedman 2002; RFR
+  explores forest size + a depth probe per Breiman 2001). Each algorithm is CV-tuned over its full
   grid in one pass — the old Phase-1 screening + Phase-2 winner-only
   optimization were collapsed into a single training step. Fast-mode
   variants for `--fast` smoke tests (1 % sample, tiny grids, CV k=2).
 - **`tracking.py`** — `get_ml_spark` (pins the session to `main`/gold),
   `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point estimates),
-  `train_and_log_run` and `tune_with_cv` (Spark
-  `CrossValidator(numFolds=3, parallelism=2)`),
-  `compute_baseline_metrics` + `log_baseline_run`, `register_candidates`
+  `train_and_log_run` and `tune_with_cv` (hand-rolled k-fold CV,
+  `CV_NUM_FOLDS=3` — fits the shared feature stages once per fold and
+  caches the transformed vectors, refitting only the bare estimator per
+  grid point at `CV_PARALLELISM=2`, so it skips `CrossValidator`'s
+  redundant per-(fold × point) preprocessing without cross-fold leakage),
+  `compute_baseline_metrics` (single-split helper, still called by the
+  diagnostic notebook) + `log_baseline_run` (fits the per-group means on
+  `train`, scores **every** split, logs `{split}_{metric}`),
+  `log_input_datasets` (attaches the train/val/test MLflow `Dataset`s to
+  each run so the *Datasets used* field is populated everywhere),
+  `register_candidates`
   (multi-version registry helper — registers every candidate of one run,
   picks `@champion` on strict point-estimate improvement over the previous
   champion's `val_rmse`, tags the rest `validation_status="challenger"`).
@@ -333,13 +352,14 @@ stages** end-to-end inside one MLflow experiment per use case:
    silver `taxi_zone_lookup`, so they're dropped up-front for every
    algorithm/phase. Not an A/B probe — the redundancy is provable from the
    zone lookup, not empirical.
-1. **Baseline.** Mean-of-label per `(group_cols)` on `common_test`. Floor
-   reference; the per-group mean is the RMSE-optimal constant-per-group
-   predictor (median would be MAE-optimal — wrong loss for our metric).
-   Any trained model that doesn't beat this on RMSE isn't learning anything
-   beyond per-group averages.
+1. **Baseline.** Mean-of-label per `(group_cols)`, fit on `train` and
+   scored on `train`/`val`/`common_test` (the same metric set as the model
+   runs). Floor reference; the per-group mean is the RMSE-optimal
+   constant-per-group predictor (median would be MAE-optimal — wrong loss
+   for our metric). Any trained model that doesn't beat this on RMSE isn't
+   learning anything beyond per-group averages.
 2. **Phase 1 — Training.** One `CV(k=3)` per algorithm over its
-   `FULL_PARAM_GRIDS` entry (5-pt GLR, 8-pt GBT, 7-pt RFR). The
+   `FULL_PARAM_GRIDS` entry (4-pt GLR, 4-pt GBT, 4-pt RFR = 12 fits/algorithm). The
    within-run winner is whichever algorithm's CV bestModel scores lowest
    on `val_rmse`. Each algorithm is registered with its fairly-tuned
    best, so the "losing" algorithms still appear in the registry as
@@ -347,9 +367,9 @@ stages** end-to-end inside one MLflow experiment per use case:
    design). Collapses the previous Phase 1 (screening) + Phase 2
    (winner-only optimization) into a single training step.
 3. **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS`
-   (the two earliest training years: 2019 / 2020). Subset B is the
+   (the earliest training year, 2023). Subset B is the
    Phase-1 winner trained on all of `TRAIN_VAL_YEARS`
-   (2019/2020/2022/2023) and reused without refit. Both score on the
+   (2023/2024) and reused without refit. Both score on the
    same `common_test = TEST_YEAR`, so neither sees the held-out year —
    the contrast isolates "does more training data help generalize to a
    future year?".
@@ -366,6 +386,20 @@ stages** end-to-end inside one MLflow experiment per use case:
    points to the best non-champion version from this run. Version tags
    expose algorithm, phase, run_name, per-split RMSE/MAE/R² and (where
    applicable) `more_data_subset` for filtering in the registry UI.
+
+**Dataset & run-field policy.** Every run logs its input data and the same
+field set, so an experiment's runs stay comparable in the MLflow UI. Each
+split is wrapped once as an MLflow `Dataset` (`mlflow.data.from_spark`,
+`table_name` = the gold source, `targets` = the label) and the same objects
+are logged on every run via `log_input_datasets`, so the *Datasets used*
+field shows `training`/`validation`/`testing` everywhere (more-data-A logs
+its own subset-A training dataset). The digest is the DataFrame's
+logical-plan `semanticHash()` — no data scan. Run tags share one key set:
+`more_data_subset` defaults to `none` (only the Phase-2 A/B comparison
+overrides it) and `training_data` is a tag on every run; both the baseline
+and the training runs log `train`/`val`/`common_test` metrics. The only
+run-type-specific fields are the tuned-run `cv_*` metrics and per-algorithm
+`best_<hp>` params (a baseline has none; GLR/GBT/RFR tune different knobs).
 
 **Metric policy.** `val_rmse` drives every selection decision (Phase 1
 within-run winner, within-run @champion, cross-run @champion promotion). `common_test`
@@ -503,16 +537,17 @@ Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 2. Phase 0 — drop redundant categoricals                — train.py applies cfg["redundant_categoricals"]
 3. Last-year holdout: common_test = TEST_YEAR (2025);
    train+val = stratified random split of TRAIN_VAL_YEARS  — src/ml/splits.py.make_splits
-4. Baseline (mean(label) per group_cols — RMSE-optimal) — src/ml/tracking.py.compute_baseline_metrics
+4. Baseline (mean(label) per group_cols — RMSE-optimal,            — src/ml/tracking.py.log_baseline_run
+   scored on train/val/common_test like the model runs)
 5. Phase 1 Training: GLR + GBT + RFR — CV(k=3) per algo over its FULL_PARAM_GRIDS,
                                           winner by val_rmse on CV bestModel
 6. Phase 2 More-data: refit Phase-1 winner on SUBSET_A_YEARS — B is the Phase-1 winner reused
-7. Log every run to MLflow                              — params, metrics (val_* + common_test_*), PipelineModel artifact
+7. Log every run to MLflow      — params, train/val/test Dataset inputs, metrics (train_*/val_*/common_test_*), PipelineModel artifact
 8. Phase 3 Register every candidate as a model version  — best val_rmse → @champion only if it is strictly
                                                           below the previous champion's val_rmse;
                                                           rest tagged validation_status="challenger";
                                                           common_test held out, reported but not used to rank
-10. Diagnostics notebook                                — model_diagnostics.ipynb loads <experiment>@champion,
+10. Diagnostics notebook                                — {fare,duration,demand}_diagnostics.ipynb loads <experiment>@champion,
                                                           per-year scoring (TRAIN_VAL = in-sample-ish vs
                                                           TEST_YEAR = held out) = drift signal
 ```
@@ -605,7 +640,3 @@ Every layer transition runs as Write-Audit-Publish on a short-lived WAP branch:
 - Apache Iceberg Spec: https://iceberg.apache.org/spec/
 - S3 API Reference: https://docs.aws.amazon.com/s3/latest/API/
 - Spark Documentation: https://spark.apache.org/docs/
-
----
-
-**Last Updated**: May 2026

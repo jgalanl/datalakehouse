@@ -17,17 +17,21 @@
 | Dremio ODBC          | localhost:45678               | N/A                      |
 | OpenMetadata*        | http://localhost:8585         | See `.env`               |
 | MLflow Tracking**    | http://localhost:5000         | N/A                      |
+| Model REST API***    | http://localhost:5001         | N/A                      |
 | Nessie API (v2)      | http://localhost:19120/api/v2 | N/A                      |
 | Nessie API (v1)      | http://localhost:19120/api/v1 | N/A                      |
 
 \* OpenMetadata is gated behind the `governance` Compose profile.
-\** MLflow + its PostgreSQL are gated behind the `ml` Compose profile.
+\** MLflow + its PostgreSQL are gated behind the `ml` and `governance` Compose profiles.
+\*** The `model-server` (MLflow `mlflow models serve`) is gated behind the `api` profile.
+Spark + Dremio are gated behind `ingest` and `ml`; only MinIO, minio-init and Nessie
+are profile-less (always-on core).
 
 ## Database Access
 
 | Database                  | Host      | Port | Credentials | Profile      |
 | ------------------------- | --------- | ---- | ----------- | ------------ |
-| PostgreSQL (MLflow)       | localhost | 5435 | See `.env`  | `ml`         |
+| PostgreSQL (MLflow)       | localhost | 5435 | See `.env`  | `ml`, `governance` |
 | PostgreSQL (OpenMetadata) | localhost | 5437 | See `.env`  | `governance` |
 | Elasticsearch (OM)        | localhost | 9200 | N/A         | `governance` |
 
@@ -36,16 +40,22 @@
 ### Docker Compose
 
 ```bash
-# Core stack (MinIO, Nessie, Spark, Dremio)
+# Core only (MinIO, minio-init, Nessie) — profile-less, no compute
 docker compose up -d
 
-# With ML services (MLflow + its PostgreSQL)
+# Ingest: core + Spark (master/notebook/workers) + Dremio
+docker compose --profile ingest up -d
+
+# ML: core + Spark + Dremio + MLflow (+ its PostgreSQL)
 docker compose --profile ml up -d
 
-# With governance (OpenMetadata + PostgreSQL + Elasticsearch)
+# Governance: core + MLflow + OpenMetadata (+ PostgreSQL + Elasticsearch)
 docker compose --profile governance up -d
 
-# Everything
+# API: core + MLflow + model-server (serves a registered model over REST; see below)
+docker compose --profile api up -d model-server
+
+# Multiple profiles union their service sets
 docker compose --profile ml --profile governance up -d
 
 # Stop all services
@@ -90,10 +100,31 @@ docker exec spark-master spark-submit \
 docker exec -it spark-master spark-shell
 ```
 
+### Model Serving (REST) — `api` profile
+
+```bash
+# Serve the model in .env (SERVE_MODEL/SERVE_ALIAS, default fare_prediction@champion)
+# as the `model-server` service on host:5001. Train a model first. See RUNBOOK §8.
+docker compose --profile api up -d model-server
+curl -s -X POST http://localhost:5001/invocations \
+  -H 'Content-Type: application/json' -d @src/ml/api/examples/fare_request.json
+# or: python src/ml/api/client.py fare
+```
+
+### OpenMetadata Ingestion — `governance` profile
+
+```bash
+# One-time: build the patched ingestion image (see docker/om-ingestion). RUNBOOK §9.
+docker build -t datalakehouse/om-ingestion:1.12.1 docker/om-ingestion
+# Save ingestion-bot JWT to config/openmetadata/.om-token, then:
+config/openmetadata/run_ingestion.sh mlflow    # models  (MLflow registry)
+config/openmetadata/run_ingestion.sh iceberg   # data    (Iceberg via Nessie REST)
+```
+
 ### Database Access
 
 ```bash
-# PostgreSQL (MLflow) — `ml` profile must be active
+# PostgreSQL (MLflow) — `ml` or `governance` profile must be active
 psql -h localhost -p 5435 -U $MLFLOW_DB_USER -d $MLFLOW_DB_NAME
 
 # PostgreSQL (OpenMetadata) — `governance` profile must be active
@@ -182,14 +213,14 @@ spark.sql("SELECT * FROM nessie.nyc.yellow_taxi VERSION AS OF 0").show()
 
 -- Query silver table (silver lives on the `silver` branch — qualify with AT BRANCH)
 SELECT * FROM nessie.nyc.yellow_taxi AT BRANCH "silver"
-WHERE tpep_pickup_datetime >= '2019-01-01'
+WHERE tpep_pickup_datetime >= '2023-01-01'
 LIMIT 10;
 
 -- Gold trips already include denormalized zone columns (no join needed).
 -- Gold lives on `main`, Dremio's default branch — no AT BRANCH needed.
 SELECT pickup_datetime, pu_zone, do_zone, fare_amount, trip_duration_minutes
 FROM nessie.nyc.yellow_taxi_trips
-WHERE pickup_year = 2019
+WHERE pickup_year = 2023
 LIMIT 10;
 
 -- Aggregate by pickup zone (top zones by trip count and avg fare)
@@ -211,18 +242,20 @@ LIMIT 20;
 
 The three use cases share four focused modules under `src/ml/`:
 
-- `splits.py` — **last-year holdout** (`make_splits` → `common_test` = every row of `TEST_YEAR=2025` (fully held out); `train` / `val` = stratified-by-year random split of `TRAIN_VAL_YEARS=[2019, 2020, 2022, 2023]` at `val_frac=0.15`). The model is never exposed to any `TEST_YEAR` row during training or selection. Cyclical encoding for hour/dow.
+- `splits.py` — **last-year holdout** (`make_splits` → `common_test` = every row of `TEST_YEAR=2025` (fully held out); `train` / `val` = stratified-by-year random split of `TRAIN_VAL_YEARS=[2023, 2024]` at `val_frac=0.15`). The model is never exposed to any `TEST_YEAR` row during training or selection. Cyclical encoding for hour/dow.
 - `pipelines.py` — `build_regression_pipeline` (StringIndexer → optional OneHot → numerical scaling → assemble → optional VectorIndexer → estimator).
-- `algorithms.py` — `glr` (`GeneralizedLinearRegression` with use-case family/link — gamma/log for fare and duration, poisson/log for `n_pickups`), `gbt` (`GBTRegressor`, bias-reducing boosting), `rfr` (`RandomForestRegressor`, variance-reducing bagging — same tree preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}` exposes the tree set. Single grid set `FULL_PARAM_GRIDS` (5-pt GLR, 8-pt GBT, 7-pt RFR) + fast-mode variants. Each algorithm is CV-tuned over its full grid in one pass (collapses the previous Phase-1 screening + Phase-2 winner-only optimization into a single training step).
-- `tracking.py` — `get_ml_spark` / `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point estimates), `train_and_log_run`, `tune_with_cv` (Spark `CrossValidator(numFolds=3, parallelism=2)`) — return the in-memory `PipelineModel` alongside run/metrics; `compute_baseline_metrics` / `log_baseline_run`, `measure_inference_latency(model, df)` (1000-row sample, one warm-up + one timed `transform.collect()`), `prune_old_versions(client, name, keep_recent=REGISTRY_MAX_VERSIONS)` (always retains aliased versions), `register_candidates` (registers every candidate from one run; strict `@champion` promotion — contender's `val_rmse` must be strictly below the previous champion's `val_rmse`; on promotion the new @champion gets the `inference_latency_*` tags; all non-champion candidates tagged `validation_status="challenger"`; `@challenger` alias = best non-champion of the run; every version carries the per-split point metrics + the reproducibility pins `nessie_main_hash` / `source_snapshot_id`; the registry is pruned to `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end). `common_test` is held out — its metrics are logged but never used to rank candidates.
+- `algorithms.py` — `glr` (`GeneralizedLinearRegression` with use-case family/link — gamma/log for fare and duration, poisson/log for `n_pickups`), `gbt` (`GBTRegressor`, bias-reducing boosting), `rfr` (`RandomForestRegressor`, variance-reducing bagging — same tree preprocessing as GBT). `TREE_ALGORITHMS = {"gbt", "rfr"}` exposes the tree set. Single grid set `FULL_PARAM_GRIDS` (4-pt GLR, 4-pt GBT, 4-pt RFR — 4 × `CV_NUM_FOLDS=3` = 12 fits/algorithm) + fast-mode variants. Each algorithm is CV-tuned over its full grid in one pass (collapses the previous Phase-1 screening + Phase-2 winner-only optimization into a single training step).
+- `tracking.py` — `get_ml_spark` / `setup_mlflow`, `evaluate_regression` (rmse/mae/r2 point estimates), `train_and_log_run`, `tune_with_cv` (hand-rolled k-fold CV — fits the shared feature stages once per fold, caches the transformed feature vectors, and refits only the bare estimator per grid point, `CV_PARALLELISM=2` fits at a time; avoids `CrossValidator`'s redundant per-(fold × point) preprocessing with no cross-fold leakage) — return the in-memory `PipelineModel` alongside run/metrics; `compute_baseline_metrics` (single split, still used by the diagnostic notebook) / `log_baseline_run` (scores `train`/`val`/`common_test`, same metric set as the model runs), `log_input_datasets` (logs the train/val/test MLflow `Dataset`s on every run so the *Datasets used* field is populated), `measure_inference_latency(model, df)` (1000-row sample, one warm-up + one timed `transform.collect()`), `prune_old_versions(client, name, keep_recent=REGISTRY_MAX_VERSIONS)` (always retains aliased versions), `register_candidates` (registers every candidate from one run; strict `@champion` promotion — contender's `val_rmse` must be strictly below the previous champion's `val_rmse`; on promotion the new @champion gets the `inference_latency_*` tags; all non-champion candidates tagged `validation_status="challenger"`; `@challenger` alias = best non-champion of the run; every version carries the per-split point metrics + the reproducibility pins `nessie_main_hash` / `source_snapshot_id`; the registry is pruned to `REGISTRY_MAX_VERSIONS = 20` non-aliased versions at the end). `common_test` is held out — its metrics are logged but never used to rank candidates.
 
 One unified `train.py` dispatches by use case and runs the same workflow inside one MLflow experiment per use case:
 
 0. **Phase 0 — drop redundant categoricals.** `borough` (and `pu_service_zone` for demand) are derivable from `pu_location_id` via the silver zone lookup, so they're dropped up-front for every algorithm/phase.
-1. **Baseline.** Mean-of-label per `(group_cols)` on `common_test`. Floor reference; the per-group mean is the RMSE-optimal constant-per-group predictor (median would be MAE-optimal — wrong loss for our metric).
-2. **Phase 1 — Training.** One `CV(k=3)` per algorithm over `FULL_PARAM_GRIDS[algo]` (5-pt GLR, 8-pt GBT, 7-pt RFR). The within-run winner is whichever algorithm's CV bestModel scores lowest on `val_rmse`. Each algorithm gets a fairly-tuned best registered (not a 3-pt screening point like the old Phase 1 design).
-3. **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS` (the two earliest training years); subset B is the Phase-1 winner trained on all of `TRAIN_VAL_YEARS` and reused without refit. Both score on the same `common_test = TEST_YEAR`, so neither sees the held-out year — the contrast isolates "does more training data help?".
+1. **Baseline.** Mean-of-label per `(group_cols)`, scored on `train`/`val`/`common_test` (same metric set as the model runs). Floor reference; the per-group mean is the RMSE-optimal constant-per-group predictor (median would be MAE-optimal — wrong loss for our metric).
+2. **Phase 1 — Training.** One `CV(k=3)` per algorithm over `FULL_PARAM_GRIDS[algo]` (4-pt GLR, 4-pt GBT, 4-pt RFR = 12 fits/algorithm). The within-run winner is whichever algorithm's CV bestModel scores lowest on `val_rmse`. Each algorithm gets a fairly-tuned best registered (not a 3-pt screening point like the old Phase 1 design).
+3. **Phase 2 — More-data.** Refit the Phase-1 winner on `SUBSET_A_YEARS` (the earliest training year); subset B is the Phase-1 winner trained on all of `TRAIN_VAL_YEARS` and reused without refit. Both score on the same `common_test = TEST_YEAR`, so neither sees the held-out year — the contrast isolates "does more training data help?".
 4. **Phase 3 — Registration.** Every candidate (4 per run: 3 training + 1 more-data-A) is registered as a new MLflow Model Registry version under the use-case name. The within-run winner (lowest `val_rmse`) becomes `@champion` only if its `val_rmse` is **strictly below the previous champion's `val_rmse`** (strict point-estimate improvement). Otherwise it stays `validation_status="challenger"`. Every other candidate is always tagged `validation_status="challenger"`. The `@challenger` alias points to the best non-champion version from this run. Every version carries the `nessie_main_hash` + `source_snapshot_id` pins so the exact training input is reproducible. On promotion the new `@champion` also gets `inference_latency_*` tags from a 1000-row `common_test` sample. The registry is finally pruned to the top `REGISTRY_MAX_VERSIONS = 20` non-aliased versions (aliased ones always kept). **`common_test` is held out** — its metrics are logged on every version and shown in the diagnostic notebook as the unbiased generalization estimate, but never used to rank candidates.
+
+Every run (baseline + the four candidates) logs its `training`/`validation`/`testing` splits as MLflow `Dataset` inputs (so the *Datasets used* field is populated everywhere) and shares the same tag/metric field set — `more_data_subset` defaults to `none`, `training_data` is a tag on every run, and `train`/`val`/`common_test` metrics are logged on all runs. The only run-type-specific fields are the tuned-run `cv_*` metrics and per-algorithm `best_<hp>` params.
 
 No PCA. PCA on ~7-9 numericals was considered (an earlier dim-reduction probe) and removed — wrong feature-count regime, interpretability cost, no measurable benefit.
 
@@ -238,11 +271,16 @@ docker exec -it spark-master spark-submit /opt/spark/src/ml/train.py fare --fast
 
 Open the MLflow UI at http://localhost:5000 to inspect runs and the registered
 models (`fare_prediction`, `trip_duration`, `demand_forecast`), then open
-[src/notebooks/ml/model_diagnostics.ipynb](../src/notebooks/ml/model_diagnostics.ipynb)
-— set `USE_CASE = "fare"` / `"duration"` / `"demand"` in the first cell and
-rerun to load `<experiment>@champion`, the per-year breakdown of
+the diagnostic notebook for that use case —
+[fare_diagnostics.ipynb](../src/notebooks/ml/fare_diagnostics.ipynb) /
+[duration_diagnostics.ipynb](../src/notebooks/ml/duration_diagnostics.ipynb) /
+[demand_diagnostics.ipynb](../src/notebooks/ml/demand_diagnostics.ipynb)
+— each loads `<experiment>@champion`, the per-year breakdown of
 `common_test`, predicted vs actual, residuals, feature importance and the
 Phase 2 more-data comparison.
+
+To serve a registered model over REST, see the *Model Serving* command above
+(`api` profile) and [src/ml/api/README.md](../src/ml/api/README.md).
 
 ### Programmatic MLflow access
 
@@ -360,7 +398,3 @@ curl http://localhost:8585/health
 # MLflow health
 curl http://localhost:5000
 ```
-
----
-
-**Last Updated**: May 2026
