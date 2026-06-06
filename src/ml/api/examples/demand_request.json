@@ -1,0 +1,13 @@
+{
+  "dataframe_split": {
+    "columns": [
+      "hour_year", "hour_month", "hour_week",
+      "hour_dow", "hour_of_day", "pu_location_id"
+    ],
+    "data": [
+      [2025, 1, 3, 2, 8, 142],
+      [2025, 1, 3, 5, 23, 132],
+      [2025, 1, 3, 6, 3, 236]
+    ]
+  }
+}
