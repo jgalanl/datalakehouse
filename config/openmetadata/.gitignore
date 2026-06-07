@@ -1,3 +1,0 @@
-# Secrets / runtime artifacts — never commit
-.om-token
-*.runtime.yaml

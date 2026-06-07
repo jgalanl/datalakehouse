@@ -1,14 +1,9 @@
 ﻿# Environment variables
 .env
 
-# Temp folder
-*.tmp*
-
 # Docker volumes and data
 docker-volume/
 docker-volumes/
-minio-data/
-nessie-data/
 
 # IDE and Editor
 .vscode/
@@ -26,23 +21,22 @@ logs/
 .ipynb_checkpoints/
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
 .Python
-env/
-venv/
 .pytest_cache/
 
 # OS
-.DS_Store
 Thumbs.db
 
 # Temporary files
-tmp/
-temp/
-*.tmp
-.tmp_ingest/
+*.tmp*
+*.temp*
+
+# OpenMetadata — runtime artifact rendered by run_ingestion.sh (carries secrets)
+config/openmetadata/*.runtime.yaml
 
 # Claude
 .claude/
