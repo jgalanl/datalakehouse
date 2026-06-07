@@ -1,37 +1,17 @@
-# Data Lakehouse Platform — local proof-of-concept stack.
-#
-# Nessie is the only Iceberg catalog. Spark reads and writes tables through it;
-# Dremio connects to Nessie as a data source (configured via the Dremio UI).
-# Both services work on the same underlying data files.
-#
-# Tuned for a 12 GiB WSL2 / Docker Desktop VM (set via %USERPROFILE%\.wslconfig).
-# Hot-path during ML training (`ml` profile, dremio idle):
-#   spark-master 3.5G + 2 × spark-worker 4G + minio/nessie/mlflow ~1.5G ≈ ~12 GiB.
-# Sum of `limits` exceeds 12 GiB on purpose — notebook and dremio are idle while
-# spark-submit drives the cluster, so they don't claim their full limit at once.
-#
-# Profiles (minio, minio-init, nessie are profile-less — always the base layer):
-#   ingest      → + spark (master/notebook/workers), dremio
-#   ml          → + spark, dremio, mlflow (+postgres)
-#   governance  → + mlflow (+postgres), openmetadata (+postgres/es/migrate)
-# A bare `docker compose up` brings up only the core; pass --profile for the rest.
-
 services:
-
-  # --- Storage ---
-
+  # --- Storage: MinIO (S3) and bucket init ---
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: minio
     hostname: minio
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console UI
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - ./minio-data:/minio/data
+      - minio_data:/minio/data
     command: minio server /minio/data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -53,8 +33,6 @@ services:
       service: storage
       component: minio
 
-  # MinIO Initialization: Creates required buckets
-  # Medallion layers get one bucket each; auxiliary services get their own buckets.
   minio-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     container_name: minio-init
@@ -87,7 +65,24 @@ services:
       service: storage
       component: minio-init
 
-  # --- Catalog ---
+  # --- Catalog: Nessie (Iceberg metadata) ---
+  nessie-init:
+    image: alpine:3.21
+    container_name: nessie-init
+    entrypoint: ["sh", "-c", "chown -R 10000:10001 /nessie/data"]
+    volumes:
+      - nessie_data:/nessie/data
+    networks:
+      - datalakehouse
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+    labels:
+      service: catalog
+      component: nessie-init
 
   nessie:
     image: ghcr.io/projectnessie/nessie:0.106.0
@@ -95,6 +90,9 @@ services:
     hostname: nessie
     ports:
       - "19120:19120"
+    depends_on:
+      nessie-init:
+        condition: service_completed_successfully
     environment:
       QUARKUS_PROFILE: prod
       QUARKUS_HTTP_PORT: 19120
@@ -102,16 +100,10 @@ services:
       QUARKUS_LOG_LEVEL: INFO
       NESSIE_VERSION_STORE_TYPE: ROCKSDB
       NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /nessie/data
-      # Iceberg REST catalog (Nessie's own integrated /iceberg endpoint) is configured
-      # in config/nessie/application.properties. NOT a second catalog: same RocksDB
-      # store exposed over the Iceberg REST protocol so read-only clients
-      # (OpenMetadata's iceberg connector) can list the tables Spark wrote.
-      # MinIO creds are passed here so the properties file can ${}-expand them
-      # without committing secrets.
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - ./nessie-data:/nessie/data
+      - nessie_data:/nessie/data
       - ./config/nessie/application.properties:/deployments/config/application.properties:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
@@ -133,12 +125,47 @@ services:
       service: catalog
       component: nessie
 
-  # The Iceberg REST catalog was intentionally removed. Two independent catalogs
-  # would produce divergent metadata — tables written through one become invisible
-  # to the other. Nessie is the single source of truth.
+  # --- Query engine: Dremio OSS ---
+  dremio:
+    image: dremio/dremio-oss:25.2.0
+    container_name: dremio
+    hostname: dremio
+    profiles: ["ingest", "ml"]
+    ports:
+      - "9047:9047"
+    environment:
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
+        -Dpaths.dist=file:///var/lib/dremio/dist
+        -Dpaths.spilling=[/var/lib/dremio/spill]
+        -Xmx1g
+        -XX:MaxDirectMemorySize=384m
+    volumes:
+      - dremio_data:/var/lib/dremio
+      - ./config/dremio/dremio.conf:/opt/dremio/conf/dremio.conf:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9047"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - datalakehouse
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 768M
+    labels:
+      service: query_engine
+      component: dremio
 
-  # --- Compute ---
-
+  # --- Compute: Spark (master, notebook and two workers) ---
   spark-master:
     build:
       context: ./docker/spark
@@ -147,9 +174,8 @@ services:
     hostname: spark-master
     profiles: ["ingest", "ml"]
     ports:
-      - "8080:8080"   # Master Web UI
-      - "7077:7077"   # Master RPC
-      - "4040:4040"   # Application UI (driver)
+      - "8080:8080"
+      - "4040:4040"
     environment:
       SPARK_LOCAL_IP: spark-master
       SPARK_MASTER_WEBUI_PORT: 8080
@@ -158,6 +184,8 @@ services:
       PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     volumes:
       - spark_data:/home/spark
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
@@ -187,7 +215,6 @@ services:
       service: compute
       component: spark-master
 
-  # Jupyter notebook — acts as the Spark driver for interactive development
   spark-notebook:
     build:
       context: ./docker/spark
@@ -204,8 +231,8 @@ services:
         --NotebookApp.password=
         --notebook-dir=/opt/spark/src
     ports:
-      - "8888:8888"   # Jupyter UI
-      - "4041:4040"   # Application UI (notebook driver)
+      - "8888:8888"
+      - "4041:4040"
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
       PYTHONPATH: "/opt/spark/src"
@@ -236,11 +263,6 @@ services:
       service: compute
       component: spark-notebook
 
-  # Two identical workers give the cluster 2 executor JVMs × 4 cores = 8 cores total.
-  # Required so MLlib CrossValidator can fit two models in parallel (parallelism=2 in
-  # src/ml/tracking.py): each fit lands on its own executor instead of sharing memory.
-  # 4 cores/worker (not 3) converts otherwise-idle host CPUs into task parallelism —
-  # the VM is CPU-rich, so extra cores cost no executor memory.
   spark-worker-1:
     build:
       context: ./docker/spark
@@ -248,13 +270,11 @@ services:
     container_name: spark-worker-1
     hostname: spark-worker-1
     profiles: ["ingest", "ml"]
-    # 3072m advertises 3 GB to the master; the 4 GB container absorbs Spark's
-    # ~10 % executor memory overhead + the worker JVM itself.
     command: >
       spark-class org.apache.spark.deploy.worker.Worker
         spark://spark-master:7077
         --webui-port 8081
-        --cores 4
+        --cores 5
         --memory 3072m
     ports:
       - "8081:8081"
@@ -277,7 +297,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
+          cpus: "5.0"
           memory: 4G
         reservations:
           memory: 2G
@@ -296,7 +316,7 @@ services:
       spark-class org.apache.spark.deploy.worker.Worker
         spark://spark-master:7077
         --webui-port 8082
-        --cores 4
+        --cores 5
         --memory 3072m
     ports:
       - "8082:8082"
@@ -319,7 +339,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
+          cpus: "5.0"
           memory: 4G
         reservations:
           memory: 2G
@@ -327,263 +347,7 @@ services:
       service: compute
       component: spark-worker
 
-  # --- Query engine ---
-
-  # Dremio OSS stores its metadata in an embedded RocksDB instance —
-  # no external database is needed (that's an Enterprise feature).
-  dremio:
-    image: dremio/dremio-oss:25.2.0
-    container_name: dremio
-    hostname: dremio
-    profiles: ["ingest", "ml"]
-    ports:
-      - "9047:9047"    # Web Console
-      - "31010:31010"  # Arrow Flight (JDBC/ODBC)
-      - "45678:45678"  # Legacy ODBC
-      - "32010:32010"  # REST API
-    environment:
-      DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
-        -Dpaths.dist=file:///var/lib/dremio/dist
-        -Dpaths.spilling=[/var/lib/dremio/spill]
-        -Xmx1g
-        -XX:MaxDirectMemorySize=384m
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-    volumes:
-      - dremio_data:/var/lib/dremio
-      - ./config/dremio/dremio.conf:/opt/dremio/conf/dremio.conf:ro
-    depends_on:
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9047"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    networks:
-      - datalakehouse
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1536M
-        reservations:
-          memory: 768M
-    labels:
-      service: query_engine
-      component: dremio
-
-  # --- Governance ---
-
-  # Custom OpenMetadata PostgreSQL image pre-creates the openmetadata_db database
-  openmetadata-postgres:
-    profiles: ["governance"]
-    container_name: openmetadata-postgres
-    image: docker.getcollate.io/openmetadata/postgresql:1.12.1
-    restart: always
-    command:
-      - "-c"
-      - "work_mem=10MB"
-    environment:
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_USER_PASSWORD}
-    ports:
-      - "5437:5432"   # exposed for debugging; remove if not needed
-    volumes:
-      - openmetadata_postgres_data:/var/lib/postgresql/data
-    networks:
-      - datalakehouse
-    healthcheck:
-      test: ["CMD-SHELL", "psql -U $$POSTGRES_USER -d openmetadata_db -c 'SELECT 1' -q 2>/dev/null || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-        reservations:
-          memory: 128M
-    labels:
-      service: governance
-      component: openmetadata-postgres
-
-  openmetadata-elasticsearch:
-    profiles: ["governance"]
-    container_name: openmetadata-es
-    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
-    environment:
-      - discovery.type=single-node
-      - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
-      - xpack.security.enabled=false
-    networks:
-      - datalakehouse
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    healthcheck:
-      test: "curl -s http://localhost:9200/_cluster/health?pretty | grep status | grep -qE 'green|yellow' || exit 1"
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-    volumes:
-      - openmetadata_es_data:/usr/share/elasticsearch/data
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1536M
-        reservations:
-          memory: 1G
-    labels:
-      service: governance
-      component: openmetadata-elasticsearch
-
-  # Runs schema migrations and exits — must complete before the server starts
-  openmetadata-migrate:
-    profiles: ["governance"]
-    container_name: openmetadata-migrate
-    image: docker.getcollate.io/openmetadata/server:1.12.1
-    command: "./bootstrap/openmetadata-ops.sh migrate"
-    environment:
-      OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
-      SERVER_PORT: ${SERVER_PORT:-8585}
-      SERVER_ADMIN_PORT: ${SERVER_ADMIN_PORT:-8586}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      MIGRATION_LIMIT_PARAM: ${MIGRATION_LIMIT_PARAM:-1200}
-      AUTHORIZER_CLASS_NAME: ${AUTHORIZER_CLASS_NAME:-org.openmetadata.service.security.DefaultAuthorizer}
-      AUTHORIZER_REQUEST_FILTER: ${AUTHORIZER_REQUEST_FILTER:-org.openmetadata.service.security.JwtFilter}
-      AUTHORIZER_ADMIN_PRINCIPALS: ${AUTHORIZER_ADMIN_PRINCIPALS:-[admin]}
-      AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: ${AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN:-["all"]}
-      AUTHORIZER_INGESTION_PRINCIPALS: ${AUTHORIZER_INGESTION_PRINCIPALS:-[ingestion-bot]}
-      AUTHORIZER_PRINCIPAL_DOMAIN: ${AUTHORIZER_PRINCIPAL_DOMAIN:-"open-metadata.org"}
-      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: ${AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN:-false}
-      AUTHENTICATION_PROVIDER: ${AUTHENTICATION_PROVIDER:-basic}
-      AUTHENTICATION_ENABLE_SELF_SIGNUP: ${AUTHENTICATION_ENABLE_SELF_SIGNUP:-true}
-      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
-      DB_SCHEME: ${DB_SCHEME:-postgresql}
-      DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
-      DB_USER: ${DB_USER}
-      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
-      DB_HOST: ${DB_HOST:-openmetadata-postgres}
-      DB_PORT: ${DB_PORT:-5432}
-      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
-      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
-      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT:-9200}
-      ELASTICSEARCH_SCHEME: ${ELASTICSEARCH_SCHEME:-http}
-      SEARCH_TYPE: ${SEARCH_TYPE:-elasticsearch}
-      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
-      RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
-      RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
-      JWT_ISSUER: ${JWT_ISSUER}
-      JWT_KEY_ID: ${JWT_KEY_ID}
-      SECRET_MANAGER: ${SECRET_MANAGER:-db}
-      FERNET_KEY: ${FERNET_KEY}
-      APPS_RDF_INDEX_APP_ENABLED: "false"
-      APPS_CACHE_WARMUP_APP_ENABLED: "false"
-      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
-    depends_on:
-      openmetadata-elasticsearch:
-        condition: service_healthy
-      openmetadata-postgres:
-        condition: service_healthy
-    networks:
-      - datalakehouse
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1536M
-        reservations:
-          memory: 512M
-    labels:
-      service: governance
-      component: openmetadata-migrate
-
-  openmetadata:
-    profiles: ["governance"]
-    container_name: openmetadata
-    restart: always
-    image: docker.getcollate.io/openmetadata/server:1.12.1
-    environment:
-      OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
-      SERVER_PORT: ${SERVER_PORT:-8585}
-      SERVER_ADMIN_PORT: ${SERVER_ADMIN_PORT:-8586}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      AUTHORIZER_CLASS_NAME: ${AUTHORIZER_CLASS_NAME:-org.openmetadata.service.security.DefaultAuthorizer}
-      AUTHORIZER_REQUEST_FILTER: ${AUTHORIZER_REQUEST_FILTER:-org.openmetadata.service.security.JwtFilter}
-      AUTHORIZER_ADMIN_PRINCIPALS: ${AUTHORIZER_ADMIN_PRINCIPALS:-[admin]}
-      AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: ${AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN:-["all"]}
-      AUTHORIZER_INGESTION_PRINCIPALS: ${AUTHORIZER_INGESTION_PRINCIPALS:-[ingestion-bot]}
-      AUTHORIZER_PRINCIPAL_DOMAIN: ${AUTHORIZER_PRINCIPAL_DOMAIN:-"open-metadata.org"}
-      AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: ${AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN:-false}
-      AUTHENTICATION_PROVIDER: ${AUTHENTICATION_PROVIDER:-basic}
-      AUTHENTICATION_ENABLE_SELF_SIGNUP: ${AUTHENTICATION_ENABLE_SELF_SIGNUP:-true}
-      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
-      DB_SCHEME: ${DB_SCHEME:-postgresql}
-      DB_PARAMS: ${DB_PARAMS:-allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC}
-      DB_USER: ${DB_USER}
-      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
-      DB_HOST: ${DB_HOST:-openmetadata-postgres}
-      DB_PORT: ${DB_PORT:-5432}
-      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
-      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
-      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT:-9200}
-      ELASTICSEARCH_SCHEME: ${ELASTICSEARCH_SCHEME:-http}
-      SEARCH_TYPE: ${SEARCH_TYPE:-elasticsearch}
-      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
-      RSA_PUBLIC_KEY_FILE_PATH: ${RSA_PUBLIC_KEY_FILE_PATH:-"./conf/public_key.der"}
-      RSA_PRIVATE_KEY_FILE_PATH: ${RSA_PRIVATE_KEY_FILE_PATH:-"./conf/private_key.der"}
-      JWT_ISSUER: ${JWT_ISSUER}
-      JWT_KEY_ID: ${JWT_KEY_ID}
-      PIPELINE_SERVICE_CLIENT_ENDPOINT: ${PIPELINE_SERVICE_CLIENT_ENDPOINT:-http://ingestion:8080}
-      PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL: ${PIPELINE_SERVICE_CLIENT_HEALTH_CHECK_INTERVAL:-300}
-      SERVER_HOST_API_URL: ${SERVER_HOST_API_URL:-http://openmetadata:8585/api}
-      PIPELINE_SERVICE_CLIENT_VERIFY_SSL: ${PIPELINE_SERVICE_CLIENT_VERIFY_SSL:-"no-ssl"}
-      PIPELINE_SERVICE_CLIENT_ENABLED: ${PIPELINE_SERVICE_CLIENT_ENABLED:-false}
-      SECRET_MANAGER: ${SECRET_MANAGER:-db}
-      FERNET_KEY: ${FERNET_KEY}
-      MASK_PASSWORDS_API: ${MASK_PASSWORDS_API:-false}
-      WEB_CONF_URI_PATH: ${WEB_CONF_URI_PATH:-"/api"}
-      APPS_RDF_INDEX_APP_ENABLED: "false"
-      APPS_CACHE_WARMUP_APP_ENABLED: "false"
-      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
-    ports:
-      - "8585:8585"
-      - "8586:8586"
-    depends_on:
-      openmetadata-elasticsearch:
-        condition: service_healthy
-      openmetadata-postgres:
-        condition: service_healthy
-      openmetadata-migrate:
-        condition: service_completed_successfully
-    networks:
-      - datalakehouse
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
-      interval: 30s
-      timeout: 10s
-      retries: 20
-      start_period: 180s
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1536M
-        reservations:
-          memory: 1G
-    labels:
-      service: governance
-      component: openmetadata
-
-  # --- ML operations ---
-
+  # --- ML operations: MLflow (postgres, tracking server and model serving) ---
   mlflow-postgres:
     profiles: ["ml", "governance", "api"]
     image: postgres:16-alpine
@@ -595,8 +359,6 @@ services:
       POSTGRES_DB: ${MLFLOW_DB_NAME}
     volumes:
       - mlflow_postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5435:5432"   # exposed for debugging; remove if not needed
     healthcheck:
       test: ["CMD-SHELL", "psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -c 'SELECT 1' -q 2>/dev/null || exit 1"]
       interval: 10s
@@ -657,16 +419,6 @@ services:
       service: ml_operations
       component: mlflow
 
-  # --- Model serving (REST API) ---
-  # Serves a registered MLflow model as a REST endpoint (POST /invocations).
-  # Reuses the Spark image because the models are Spark MLlib PipelineModels:
-  # loading one needs a SparkSession. It runs local[*] (driver == executor), so
-  # the model's staged sparkml/ dir is visible to the "cluster" — the distributed
-  # "executors can't read the driver's /tmp" gotcha doesn't apply.
-  # Gated behind the `api` profile (NOT ml/core): it must start AFTER a model is
-  # trained and registered, or it restart-loops on a missing alias. Bring it up
-  # with `docker compose --profile api up -d` once a champion exists.
-  # Which model is served is set in .env: SERVE_MODEL / SERVE_ALIAS.
   model-server:
     build:
       context: ./docker/spark
@@ -681,7 +433,7 @@ services:
         -p 5001
         --env-manager local
     ports:
-      - "5001:5001"   # POST /invocations — see src/ml/api/README.md
+      - "5001:5001"
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
@@ -692,6 +444,7 @@ services:
     volumes:
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./config/spark/hadoop-metrics2.properties:/opt/spark/conf/hadoop-metrics2.properties:ro
     depends_on:
       mlflow:
         condition: service_healthy
@@ -700,7 +453,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s   # cold Spark session + model download from MinIO
+      start_period: 90s
     networks:
       - datalakehouse
     restart: on-failure
@@ -715,14 +468,174 @@ services:
       service: ml_operations
       component: model-server
 
+  # --- Governance: OpenMetadata (postgres, elasticsearch, migrate and server) ---
+  openmetadata-postgres:
+    profiles: ["governance"]
+    container_name: openmetadata-postgres
+    image: docker.getcollate.io/openmetadata/postgresql:1.12.1
+    restart: always
+    command:
+      - "-c"
+      - "work_mem=10MB"
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_USER_PASSWORD}
+    volumes:
+      - openmetadata_postgres_data:/var/lib/postgresql/data
+    networks:
+      - datalakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U $$POSTGRES_USER -d openmetadata_db -c 'SELECT 1' -q 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 128M
+    labels:
+      service: governance
+      component: openmetadata-postgres
+
+  openmetadata-elasticsearch:
+    profiles: ["governance"]
+    container_name: openmetadata-es
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
+      - xpack.security.enabled=false
+    networks:
+      - datalakehouse
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: "curl -s http://localhost:9200/_cluster/health?pretty | grep status | grep -qE 'green|yellow' || exit 1"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    volumes:
+      - openmetadata_es_data:/usr/share/elasticsearch/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 1G
+    labels:
+      service: governance
+      component: openmetadata-elasticsearch
+
+  openmetadata-migrate:
+    profiles: ["governance"]
+    container_name: openmetadata-migrate
+    image: docker.getcollate.io/openmetadata/server:1.12.1
+    command: "./bootstrap/openmetadata-ops.sh migrate"
+    environment:
+      MIGRATION_LIMIT_PARAM: ${MIGRATION_LIMIT_PARAM:-1200}
+      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
+      DB_SCHEME: ${DB_SCHEME:-postgresql}
+      DB_USER: ${DB_USER}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
+      DB_HOST: ${DB_HOST:-openmetadata-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
+      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_KEY_ID: ${JWT_KEY_ID}
+      FERNET_KEY: ${FERNET_KEY}
+      APPS_RDF_INDEX_APP_ENABLED: "false"
+      APPS_CACHE_WARMUP_APP_ENABLED: "false"
+      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
+    depends_on:
+      openmetadata-elasticsearch:
+        condition: service_healthy
+      openmetadata-postgres:
+        condition: service_healthy
+    networks:
+      - datalakehouse
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 512M
+    labels:
+      service: governance
+      component: openmetadata-migrate
+
+  openmetadata:
+    profiles: ["governance"]
+    container_name: openmetadata
+    restart: always
+    image: docker.getcollate.io/openmetadata/server:1.12.1
+    environment:
+      DB_DRIVER_CLASS: ${DB_DRIVER_CLASS:-org.postgresql.Driver}
+      DB_SCHEME: ${DB_SCHEME:-postgresql}
+      DB_USER: ${DB_USER}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD}
+      DB_HOST: ${DB_HOST:-openmetadata-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_HOST:-openmetadata-elasticsearch}
+      OPENMETADATA_HEAP_OPTS: ${OPENMETADATA_HEAP_OPTS:--Xmx1G -Xms1G}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_KEY_ID: ${JWT_KEY_ID}
+      FERNET_KEY: ${FERNET_KEY}
+      AUTHORIZER_ADMIN_PRINCIPALS: ${AUTHORIZER_ADMIN_PRINCIPALS:-[admin]}
+      AUTHORIZER_PRINCIPAL_DOMAIN: ${AUTHORIZER_PRINCIPAL_DOMAIN:-"open-metadata.org"}
+      PIPELINE_SERVICE_CLIENT_ENABLED: ${PIPELINE_SERVICE_CLIENT_ENABLED:-false}
+      APPS_RDF_INDEX_APP_ENABLED: "false"
+      APPS_CACHE_WARMUP_APP_ENABLED: "false"
+      CACHE_SPECS: "maximumSize=100,expireAfterAccess=10m"
+    ports:
+      - "8585:8585"
+    depends_on:
+      openmetadata-elasticsearch:
+        condition: service_healthy
+      openmetadata-postgres:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    networks:
+      - datalakehouse
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+        reservations:
+          memory: 1G
+    labels:
+      service: governance
+      component: openmetadata
+
 volumes:
+  minio_data:
+    driver: local
+  nessie_data:
+    driver: local
   spark_data:
     driver: local
   spark_worker_1_data:
     driver: local
   spark_worker_2_data:
     driver: local
-  dremio_data:      # Dremio uses embedded RocksDB, so no separate postgres volume needed
+  dremio_data:
     driver: local
   openmetadata_postgres_data:
     driver: local
