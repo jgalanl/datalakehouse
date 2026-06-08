@@ -44,7 +44,7 @@ MLFLOW_ARTIFACT_ROOT = "s3://mlflow-artifacts"
 # inference fails inside the spark-master container (no usable conda env to
 # introspect) and falls back to a bare ['pyspark==3.5.8']. Pinning this list
 # silences that warning and makes the saved env reproducible.
-MODEL_PIP_REQUIREMENTS = ["pyspark==3.5.8", "mlflow==2.20.3"]
+MODEL_PIP_REQUIREMENTS = ["pyspark==3.5.8", "mlflow==2.22.1"]
 
 
 def progress(msg: str) -> None:
