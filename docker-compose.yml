@@ -170,6 +170,7 @@ services:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
+      target: app
     container_name: spark-master
     hostname: spark-master
     profiles: ["ingest", "ml"]
@@ -181,7 +182,6 @@ services:
       SPARK_MASTER_WEBUI_PORT: 8080
       SPARK_NO_DAEMONIZE: "true"
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       MLFLOW_TRACKING_URI: http://mlflow:5000
@@ -219,6 +219,7 @@ services:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
+      target: notebook
     container_name: spark-notebook
     hostname: spark-notebook
     profiles: ["ingest", "ml"]
@@ -235,7 +236,6 @@ services:
       - "4041:4040"
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       MLFLOW_TRACKING_URI: http://mlflow:5000
@@ -248,7 +248,7 @@ services:
       - ./src:/opt/spark/src
     depends_on:
       spark-master:
-        condition: service_started
+        condition: service_healthy
     networks:
       - datalakehouse
     restart: unless-stopped
@@ -267,6 +267,7 @@ services:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
+      target: base
     container_name: spark-worker-1
     hostname: spark-worker-1
     profiles: ["ingest", "ml"]
@@ -280,7 +281,6 @@ services:
       - "8081:8081"
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -309,6 +309,7 @@ services:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
+      target: base
     container_name: spark-worker-2
     hostname: spark-worker-2
     profiles: ["ingest", "ml"]
@@ -322,7 +323,6 @@ services:
       - "8082:8082"
     environment:
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      PYTHONPATH: "/opt/spark/src"
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -423,6 +423,7 @@ services:
     build:
       context: ./docker/spark
       dockerfile: Dockerfile
+      target: app
     container_name: model-server
     hostname: model-server
     profiles: ["api"]
@@ -440,7 +441,6 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       SPARK_CLASSPATH: "/opt/spark/jars/*"
-      PYTHONPATH: "/opt/spark/src"
     volumes:
       - ./config/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
       - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
@@ -472,6 +472,7 @@ services:
   openmetadata-postgres:
     profiles: ["governance"]
     container_name: openmetadata-postgres
+    hostname: openmetadata-postgres
     image: docker.getcollate.io/openmetadata/postgresql:1.12.1
     restart: always
     command:
@@ -504,7 +505,9 @@ services:
   openmetadata-elasticsearch:
     profiles: ["governance"]
     container_name: openmetadata-es
+    hostname: openmetadata-elasticsearch
     image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
+    restart: unless-stopped
     environment:
       - discovery.type=single-node
       - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
@@ -575,6 +578,7 @@ services:
   openmetadata:
     profiles: ["governance"]
     container_name: openmetadata
+    hostname: openmetadata
     restart: always
     image: docker.getcollate.io/openmetadata/server:1.12.1
     environment:
