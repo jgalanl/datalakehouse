@@ -49,12 +49,12 @@ def merge_branch(spark: SparkSession, source: str, into: str = "main") -> None:
         spark.sql(f"MERGE BRANCH `{source}` INTO `{into}` IN nessie")
     except Exception as e:
         # Stale branch from a previous Nessie instance — manual reset required
-        # (delete ./nessie-data, restart Nessie). See CLAUDE.md "Known Gotchas".
+        # (docker compose down -v, then restart). See CLAUDE.md "Known Gotchas".
         if "No common ancestor" in str(e):
             raise NoCommonAncestorError(
                 f"Cannot merge '{source}' into '{into}': no common ancestor. "
                 f"Nessie likely has stale history from a previous instance. "
-                f"Fix: stop Nessie, delete ./nessie-data, restart."
+                f"Fix: docker compose down -v (removes the nessie_data volume), then restart."
             ) from e
         raise
 
