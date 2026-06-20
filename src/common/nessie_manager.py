@@ -1,28 +1,12 @@
-"""Nessie branch management via Spark SQL extensions."""
-
 from pyspark.sql import Row, SparkSession
 
 PERSISTENT_BRANCHES = ["main", "silver", "bronze"]
-
-# Data domain. All tables live under a single namespace `nessie.{DOMAIN}` —
-# the medallion layer is encoded by the Nessie branch (bronze/silver/main),
-# not the namespace, so a table identifier never echoes its branch name.
 DOMAIN = "nyc"
 NAMESPACE = f"nessie.{DOMAIN}"
 
 
 def table_location(layer: str, table: str) -> str:
-    """Physical warehouse path for an Iceberg table: {layer}/{domain}/{table}.
-
-    Tables declare this as an explicit LOCATION so the on-disk medallion
-    folders survive the single shared namespace — without it every layer
-    would collide under the same `.../{domain}/` prefix.
-    """
     return f"s3a://warehouse/{layer}/{DOMAIN}/{table}"
-
-
-class NoCommonAncestorError(Exception):
-    pass
 
 
 def list_references(spark: SparkSession) -> list[Row]:
@@ -30,8 +14,7 @@ def list_references(spark: SparkSession) -> list[Row]:
 
 
 def ref_exists(spark: SparkSession, name: str) -> bool:
-    refs = spark.sql("LIST REFERENCES IN nessie")
-    return refs.filter(refs.name == name).count() > 0
+    return current_ref_hash(spark, name) is not None
 
 
 def create_branch(spark: SparkSession, name: str, from_ref: str = "main") -> None:
@@ -48,10 +31,9 @@ def merge_branch(spark: SparkSession, source: str, into: str = "main") -> None:
     try:
         spark.sql(f"MERGE BRANCH `{source}` INTO `{into}` IN nessie")
     except Exception as e:
-        # Stale branch from a previous Nessie instance — manual reset required
-        # (docker compose down -v, then restart). See CLAUDE.md "Known Gotchas".
+        # Historial de Nessie obsoleto → reset manual (docker compose down -v y reiniciar).
         if "No common ancestor" in str(e):
-            raise NoCommonAncestorError(
+            raise RuntimeError(
                 f"Cannot merge '{source}' into '{into}': no common ancestor. "
                 f"Nessie likely has stale history from a previous instance. "
                 f"Fix: docker compose down -v (removes the nessie_data volume), then restart."
@@ -60,19 +42,7 @@ def merge_branch(spark: SparkSession, source: str, into: str = "main") -> None:
 
 
 def ensure_persistent_branches(spark: SparkSession) -> None:
-    """Create bronze/silver from main if missing, then seed namespaces.
-
-    Safe to call repeatedly: existing branches are left untouched (never
-    dropped or recreated). If a branch is truly stale from a prior Nessie
-    instance, a WAP merge will raise NoCommonAncestorError with a
-    clear message directing to manual reset.
-
-    Also seeds the namespace on main itself: gold lives on main (no separate
-    gold branch). Seeding gives main a real namespace commit so wap/gold-*
-    branches forked from main share a non-trivial ancestor with it. Without
-    this seed, the very first gold merge into main throws a spurious
-    "No common ancestor" because both refs sit at the initial empty commit.
-    """
+    """Crea bronze/silver a partir de main si no existen y siembra el namespace en cada rama."""
     for branch in PERSISTENT_BRANCHES:
         if branch == "main":
             continue
@@ -81,10 +51,8 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
         else:
             print(f"  Creating persistent branch '{branch}' from main")
             create_branch(spark, branch, from_ref="main")
-        # Seed the branch with a namespace commit (idempotent).
         set_spark_branch(spark, branch)
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NAMESPACE}")
-    # Seed the namespace on main too (gold lives on main).
     set_spark_branch(spark, "main")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NAMESPACE}")
 
@@ -94,36 +62,27 @@ def create_tag(spark: SparkSession, name: str, from_ref: str = "main") -> None:
 
 
 def set_spark_branch(spark: SparkSession, branch: str) -> SparkSession:
-    """Switch Nessie ref via USE REFERENCE (nessie-spark-extensions).
-
-    Previous approach (newSession + conf.set) didn't reliably switch the cached catalog ref.
-    """
     spark.sql(f"USE REFERENCE `{branch}` IN nessie")
     return spark
 
 
 def wap_branch_name(layer: str, table: str, year: int, month: int) -> str:
-    """Working-branch name for one WAP cycle (Write → Audit → Publish)."""
+    """Nombre de la rama de trabajo para un ciclo WAP."""
     return f"wap/{layer}-{table}-{year}-{month:02d}"
 
 
 def yearly_tag_name(layer: str, table: str, year: int) -> str:
-    """Yearly audit tag created on the persistent layer after the last merged month."""
+    """Tag de auditoría anual que se crea en la rama persistente tras fusionar el último mes."""
     return f"{layer}-{table}-{year}"
 
 
 def review_tag_name(layer: str, table: str, year: int, month: int) -> str:
-    """Tag name for a month quarantined by the audit step (WAP reject)."""
+    """Nombre del tag para un mes puesto en cuarentena por la auditoría (rechazo del WAP)."""
     return f"review/{layer}-{table}-{year}-{month:02d}"
 
 
 def current_ref_hash(spark: SparkSession, ref: str = "main") -> str | None:
-    """Latest commit hash on `ref` (branch or tag). None if the ref is unknown.
-
-    Used by downstream consumers (ML training, audit notebooks) to pin the
-    Nessie state at run-time as an immutable identifier — the full hash
-    locates every table on every branch as of that moment.
-    """
+    """Hash del último commit en `ref` (rama o tag), o None si no se conoce. Fija el estado de Nessie en tiempo de ejecución."""
     rows = (
         spark.sql("LIST REFERENCES IN nessie")
         .filter(f"name = '{ref}'")
@@ -135,11 +94,7 @@ def current_ref_hash(spark: SparkSession, ref: str = "main") -> str | None:
 
 
 def latest_snapshot_id(spark: SparkSession, table: str) -> int | None:
-    """Latest Iceberg snapshot ID for `table` on the current Nessie ref.
-
-    Reads the `<table>.snapshots` metadata table and returns the most recently
-    committed snapshot. None if the table has no snapshots yet (just created).
-    """
+    """ID del último snapshot de Iceberg de `table` en el ref actual de Nessie, o None si no tiene snapshots."""
     rows = spark.sql(
         f"SELECT snapshot_id FROM {table}.snapshots "
         f"ORDER BY committed_at DESC LIMIT 1"

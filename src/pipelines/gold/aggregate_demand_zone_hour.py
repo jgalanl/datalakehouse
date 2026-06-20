@@ -1,9 +1,3 @@
-"""Gold ETL — aggregate silver yellow_taxi to (pickup_zone, hour) demand grain.
-
-WAP pattern: branch from main, read silver, aggregate, validate, merge to main.
-Target dataset for the demand forecasting model.
-"""
-
 import sys
 
 from pyspark.sql import DataFrame, SparkSession
@@ -23,19 +17,18 @@ from common import nessie_manager as nessie
 
 YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
-# SOURCE_* are read on the silver ref; TARGET is written on main. Same
-# namespace throughout — the active Nessie branch selects the layer.
+# SOURCE_* se leen en silver, TARGET se escribe en main; la rama activa selecciona la capa.
 SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
 SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
 TARGET = "nessie.nyc.pickup_demand_zone_hour"
 TARGET_LOCATION = nessie.table_location("gold", "pickup_demand_zone_hour")
 
-# Strict left join with silver zones — silver guarantees PU IDs are in [1, 265]
-# and the lookup covers the full range, so no NULL zone column is acceptable.
+# Silver garantiza IDs PU en [1, 265] y el lookup está completo, así que el left
+# join nunca debería dejar una zona en nulo.
 MAX_NULL_ZONE_ROWS = 0
 
-# Group-by keys, derived time features and the audit gate make every column
-# non-null except service_zone (silver zone_lookup keeps it nullable).
+# Las claves del group-by, las features temporales y la auditoría hacen que todas las
+# columnas sean no nulas salvo service_zone (el zone_lookup de silver lo deja nullable).
 GOLD_SCHEMA = StructType([
     StructField("hour_bucket", TimestampNTZType(), nullable=False),
     StructField("pu_location_id", IntegerType(), nullable=False),
@@ -57,7 +50,7 @@ GOLD_SCHEMA = StructType([
 
 
 def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
-    """Aggregate trips by (pu_location_id, hour_bucket) and denormalize zone info."""
+    """Agrega los viajes por (pu_location_id, hour_bucket) y desnormaliza la información de zonas."""
     pu_zones = zones.select(
         col("location_id").alias("pu_location_id"),
         col("borough").alias("pu_borough"),
@@ -79,11 +72,11 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
             avg("trip_distance").alias("avg_distance"),
             avg("passenger_count").alias("avg_passengers"),
         )
-        # Time features derived from the hour bucket itself.
+        # Features temporales derivadas del propio hour bucket.
         .withColumn("hour_year", spark_year("hour_bucket"))
         .withColumn("hour_month", spark_month("hour_bucket"))
         .withColumn("hour_week", weekofyear("hour_bucket"))
-        # Python convention: 0=Mon..6=Sun (matches pandas.dt.weekday).
+        # Convención de Python: 0=lun..6=dom (igual que pandas.dt.weekday).
         .withColumn("hour_dow", weekday("hour_bucket"))
         .withColumn("hour_of_day", spark_hour("hour_bucket"))
     )
@@ -92,12 +85,12 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
         aggregated
         .join(broadcast(pu_zones), on="pu_location_id", how="left")
         .select(
-            # Key
+            # Clave
             "hour_bucket",
             "pu_location_id", "pu_borough", "pu_zone", "pu_service_zone",
-            # Derived time features
+            # Features temporales derivadas
             "hour_year", "hour_month", "hour_week", "hour_dow", "hour_of_day",
-            # Target + auxiliary metrics
+            # Variable objetivo + métricas auxiliares
             "n_pickups",
             "total_revenue", "avg_fare", "avg_tip",
             "avg_distance", "avg_passengers",
@@ -116,7 +109,7 @@ def table_exists(spark: SparkSession) -> bool:
 def validate(
     silver_count: int, gold_count: int, total_pickups: int, null_zone_count: int,
 ) -> tuple[bool, str]:
-    """Audit: aggregation must conserve total trip count and have no NULL zones."""
+    """Auditoría: la agregación debe conservar el total de viajes y no tener zonas nulas."""
     if gold_count == 0:
         return False, "gold empty after aggregation"
     if total_pickups != silver_count:
@@ -134,7 +127,7 @@ def validate(
 def wap_aggregate(
     spark: SparkSession, year_val: int, m: int, branch_name: str
 ) -> tuple[int, int, bool, str]:
-    """WAP cycle for one (year, month). Branch from main → aggregate silver → audit."""
+    """Ciclo WAP para un (año, mes). Rama desde main → agrega silver → audita."""
     label = f"{year_val}-{m:02d}"
 
     try:
@@ -155,7 +148,7 @@ def wap_aggregate(
 
         gold_df = transform(trips, zones).cache()
         try:
-            # Single agg pass: row count, pickup conservation, null-zone count.
+            # Una sola pasada de agregación: recuento de filas, conservación de pickups y filas con zona nula.
             stats = gold_df.agg(
                 count("*").alias("gold_count"),
                 spark_sum("n_pickups").alias("total_pickups"),
@@ -209,7 +202,7 @@ def main():
     nessie.ensure_persistent_branches(spark)
 
     total_silver = total_gold = processed = 0
-    quarantined: list[tuple[str, str, str]] = []  # (label, review_tag, reason)
+    quarantined: list[tuple[str, str, str]] = []  # (etiqueta, review_tag, motivo)
 
     for year_val in YEARS:
         merged_in_year = 0

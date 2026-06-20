@@ -1,9 +1,3 @@
-"""Gold ETL — enrich silver yellow_taxi with derived time features and zone denorm.
-
-WAP pattern: branch from main, read silver, transform, validate, merge to main.
-Gold is the only consumer-facing layer for ML pipelines.
-"""
-
 import sys
 
 from pyspark.sql import DataFrame, SparkSession
@@ -23,20 +17,18 @@ from common import nessie_manager as nessie
 
 YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
-# SOURCE_* are read on the silver ref; TARGET is written on main. Same
-# namespace throughout — the active Nessie branch selects the layer.
+# SOURCE_* se leen en silver, TARGET se escribe en main; la rama activa selecciona la capa.
 SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
 SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
 TARGET = "nessie.nyc.yellow_taxi_trips"
 TARGET_LOCATION = nessie.table_location("gold", "yellow_taxi_trips")
 
-# The left join with silver zones must not drop or null-out rows: silver
-# already filters PU/DO IDs to [1, 265] and the lookup covers the full range.
+# Silver filtra los IDs PU/DO a [1, 265] y el lookup está completo, así que el left
+# join nunca debería dejar una zona en nulo.
 MAX_NULL_ZONE_ROWS = 0
 
-# Gold is a consumer contract: every column that is provably non-null gets a
-# NOT NULL constraint. Year-dependent surcharges (added in 2019/2020/2025)
-# and the silver zone_lookup.service_zone (unfiltered) stay nullable.
+# Gold es un contrato con el consumidor: las columnas demostrablemente no nulas llevan NOT NULL.
+# Los recargos que dependen del año y el service_zone sin filtrar siguen siendo nullable.
 GOLD_SCHEMA = StructType([
     StructField("pickup_datetime", TimestampNTZType(), nullable=False),
     StructField("dropoff_datetime", TimestampNTZType(), nullable=False),
@@ -74,7 +66,7 @@ GOLD_SCHEMA = StructType([
 
 
 def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
-    """Rename to snake_case, derive time features, and denormalize zone info."""
+    """Renombra a snake_case, deriva las features temporales y desnormaliza la información de zonas."""
     pu_zones = zones.select(
         col("location_id").alias("pu_location_id"),
         col("borough").alias("pu_borough"),
@@ -96,18 +88,16 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
         .withColumnRenamed("DOLocationID", "do_location_id")
         .withColumnRenamed("tpep_pickup_datetime", "pickup_datetime")
         .withColumnRenamed("tpep_dropoff_datetime", "dropoff_datetime")
-        # Cast int-like columns; silver keeps ratecode_id as Double due to schema drift.
+        # Casteamos las columnas tipo entero; silver mantiene ratecode_id como Double por el drift de esquema.
         .withColumn("vendor_id", col("vendor_id").cast("int"))
         .withColumn("ratecode_id", col("ratecode_id").cast("int"))
         .withColumn("pu_location_id", col("pu_location_id").cast("int"))
         .withColumn("do_location_id", col("do_location_id").cast("int"))
-        # Derived time features.
+        # Features temporales derivadas.
         .withColumn("pickup_year", spark_year("pickup_datetime"))
         .withColumn("pickup_month", spark_month("pickup_datetime"))
-        # ISO 8601 week of year (1..53). Note: a week can span the calendar
-        # year boundary, so pickup_year + pickup_week is not strictly ISO.
         .withColumn("pickup_week", weekofyear("pickup_datetime"))
-        # Python convention: 0=Mon..6=Sun (matches pandas.dt.weekday).
+        # Convención de Python: 0=lun..6=dom (igual que pandas.dt.weekday).
         .withColumn("pickup_dow", weekday("pickup_datetime"))
         .withColumn("pickup_hour", hour("pickup_datetime"))
         .withColumn(
@@ -122,20 +112,20 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
         .join(broadcast(do_zones), on="do_location_id", how="left")
     )
 
-    # Explicit column order — gold is a consumer contract, schema should be stable.
+    # Orden de columnas explícito: gold es un contrato con el consumidor, el esquema debe ser estable.
     return joined.select(
-        # Identity and time
+        # Identidad y tiempo
         "pickup_datetime", "dropoff_datetime",
         "pickup_year", "pickup_month", "pickup_week",
         "pickup_dow", "pickup_hour",
         "trip_duration_minutes",
-        # Geography (denormalized)
+        # Geografía (desnormalizada)
         "pu_location_id", "pu_borough", "pu_zone", "pu_service_zone",
         "do_location_id", "do_borough", "do_zone", "do_service_zone",
-        # Trip attributes
+        # Atributos del viaje
         "vendor_id", "ratecode_id", "payment_type", "store_and_fwd_flag",
         "passenger_count", "trip_distance",
-        # Amounts
+        # Importes
         "fare_amount", "tip_amount", "tolls_amount", "mta_tax", "extra",
         "improvement_surcharge", "congestion_surcharge",
         "airport_fee", "cbd_congestion_fee",
@@ -152,7 +142,7 @@ def table_exists(spark: SparkSession) -> bool:
 
 
 def validate(silver_count: int, gold_count: int, null_zone_count: int) -> tuple[bool, str]:
-    """Audit step: returns (passed, reason). Never raises."""
+    """Paso de auditoría: devuelve (passed, reason). Nunca lanza excepción."""
     if gold_count == 0:
         return False, "gold empty after transform"
     if gold_count != silver_count:
@@ -165,16 +155,16 @@ def validate(silver_count: int, gold_count: int, null_zone_count: int) -> tuple[
 def wap_build(
     spark: SparkSession, year_val: int, m: int, branch_name: str
 ) -> tuple[int, int, bool, str]:
-    """WAP cycle: branch from main → read silver → transform → write → audit → merge.
+    """Ciclo WAP: rama desde main, lee silver, transforma, escribe, audita y fusiona.
 
-    Returns (silver_count, gold_count, passed, reason). Caller quarantines on fail.
+    Devuelve (silver_count, gold_count, passed, reason). Quien llama pone en cuarentena si falla.
     """
     label = f"{year_val}-{m:02d}"
 
     try:
         nessie.create_branch(spark, branch_name, from_ref="main")
 
-        # Read silver inputs on the silver ref.
+        # Leemos las entradas de silver en el ref de silver.
         nessie.set_spark_branch(spark, "silver")
         zones = spark.table(SOURCE_ZONES)
         trips = spark.table(SOURCE_TRIPS).filter(
@@ -188,12 +178,11 @@ def wap_build(
             print(f"  [{label}] No silver data for this month, skipping")
             return 0, 0, True, "no silver data"
 
-        # Materialize the joined result before switching refs — otherwise the
-        # write would try to re-read silver tables while the catalog points
-        # to the WAP branch on main.
+        # Materializamos antes de cambiar de ref; si no, la escritura volvería a leer silver
+        # mientras el catálogo apunta a la rama WAP en main.
         gold_df = transform(trips, zones).cache()
         try:
-            # Single agg pass: row count + null-zone count (PU or DO).
+            # Una sola pasada de agregación: recuento de filas + filas con zona nula (PU o DO).
             stats = gold_df.agg(
                 count("*").alias("gold_count"),
                 spark_sum(when(
@@ -242,7 +231,7 @@ def main():
     nessie.ensure_persistent_branches(spark)
 
     total_silver = total_gold = processed = 0
-    quarantined: list[tuple[str, str, str]] = []  # (label, review_tag, reason)
+    quarantined: list[tuple[str, str, str]] = []  # (etiqueta, review_tag, motivo)
 
     for year_val in YEARS:
         merged_in_year = 0

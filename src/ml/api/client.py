@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""Send a prediction request to a locally served MLflow model.
-
-The model is served by the `api` compose profile (`mlflow models serve`, see
-https://mlflow.org/docs/latest/ml/deployment/deploy-model-locally/). This POSTs a
-`dataframe_split` JSON payload to the /invocations endpoint and prints the
-predictions. Standard library only — runs on the host.
-
-  python src/ml/api/client.py                                  # fare example, port 5001
-  python src/ml/api/client.py demand --port 5003
-  python src/ml/api/client.py --json path/to/payload.json
-"""
+"""Envía un payload dataframe_split a un modelo de MLflow servido en local e imprime las predicciones.
+Solo librería estándar — corre en el host. Uso: python src/ml/api/client.py [fare|duration|demand] [--json FILE] [--host H] [--port P]"""
 import argparse
 import json
 import os
+import sys
+import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,8 +33,14 @@ def main():
     url = f"http://{args.host}:{args.port}/invocations"
     req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        print(json.load(resp))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            print(json.dumps(json.load(resp), indent=2))
+    except urllib.error.HTTPError as e:
+        # MLflow devuelve el motivo del fallo en el cuerpo de la respuesta; lo mostramos.
+        sys.exit(f"HTTP {e.code} from {url}: {e.read().decode(errors='replace')}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Could not reach {url}: {e.reason} (is the `api` profile up?)")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,3 @@
-"""MLflow tracking: Spark/MLflow setup, run helpers, baseline, registry.
-
-Bundles everything that touches MLflow into one module: session setup
-(`get_ml_spark`, `setup_mlflow`), evaluation helpers, the run-logging
-wrappers (`train_and_log_run`, `tune_with_cv`), the mean-per-group baseline,
-and the multi-candidate registry helper (`register_candidates`).
-"""
-
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,65 +5,44 @@ from datetime import datetime, timezone
 from functools import reduce
 from typing import Callable
 
-# MLflow + MinIO env. spark-master inherits AWS_* from docker-compose but not
-# MLFLOW_*; setting them before importing mlflow lets boto3 reach MinIO when
-# artifacts are uploaded.
 os.environ.setdefault("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 os.environ.setdefault("MLFLOW_S3_ENDPOINT_URL", "http://minio:9000")
 
-import mlflow  # noqa: E402
-import mlflow.spark  # noqa: E402
-from mlflow import MlflowClient  # noqa: E402
-from mlflow.exceptions import MlflowException  # noqa: E402
-from pyspark.ml import Pipeline  # noqa: E402
-from pyspark.ml.evaluation import RegressionEvaluator  # noqa: E402
-from pyspark.sql import DataFrame, SparkSession  # noqa: E402
-from pyspark.sql.functions import broadcast, col, lit, mean as spark_mean, when  # noqa: E402
-from pyspark.sql.types import DoubleType  # noqa: E402
+import mlflow
+import mlflow.spark
+from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import broadcast, col, lit, mean as spark_mean, when
+from pyspark.sql.types import DoubleType
 
-from common.spark_factory import get_spark  # noqa: E402
-from common import nessie_manager as nessie  # noqa: E402
+from common.spark_factory import get_spark
+from common import nessie_manager as nessie
 
 MLFLOW_TRACKING_URI = os.environ["MLFLOW_TRACKING_URI"]
 
-# Per-experiment artifact root. Without this, MLflow lays artifacts out under
-# the numeric experiment id (`s3://mlflow-artifacts/1/`, `2/`, ...), which is
-# opaque in the MinIO browser. Passing this prefix at experiment creation time
-# yields `s3://mlflow-artifacts/{experiment_name}/{run_id}/...` instead.
+# Raíz de artefactos: una carpeta por experimento en vez de los ids numéricos de MLflow.
 MLFLOW_ARTIFACT_ROOT = "s3://mlflow-artifacts"
 
-# Explicit env spec for logged models. MLflow's automatic pip-requirements
-# inference fails inside the spark-master container (no usable conda env to
-# introspect) and falls back to a bare ['pyspark==3.5.8']. Pinning this list
-# silences that warning and makes the saved env reproducible.
+# Fijamos el entorno del modelo; la auto-inferencia de MLflow no funciona en spark-master.
 MODEL_PIP_REQUIREMENTS = ["pyspark==3.5.8", "mlflow==2.22.1"]
 
 
 def progress(msg: str) -> None:
-    """Timestamped, flushed progress line. spark-submit buffers stdout, so
-    long Spark stages look frozen without an explicit flush."""
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
 def get_ml_spark(app_name: str) -> SparkSession:
-    """Build a Spark session pinned to main (gold ref)."""
     spark = get_spark(app_name=app_name)
     nessie.set_spark_branch(spark, "main")
     return spark
 
 
 def setup_mlflow(experiment_name: str) -> None:
-    """Point MLflow at the tracking server and activate `experiment_name`.
-
-    On first creation, set `artifact_location` so artifacts land under
-    `s3://mlflow-artifacts/{experiment_name}/` instead of the opaque numeric
-    experiment id. This is immutable per experiment — pre-existing experiments
-    keep their original layout.
-
-    If the experiment was soft-deleted in the UI, mlflow.set_experiment would
-    raise — MLflow won't reuse a deleted name. Restore it so the script
-    survives a half-done cleanup; delete individual runs in the UI if needed.
-    """
+    """Activa el experimento. Lo crea (con un artifact_location con nombre) la primera
+    vez, y lo restaura si alguien lo había borrado de forma lógica."""
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = MlflowClient()
     exp = client.get_experiment_by_name(experiment_name)
@@ -87,25 +58,17 @@ def setup_mlflow(experiment_name: str) -> None:
     mlflow.set_experiment(experiment_name)
 
 
-# ----- Evaluation -----------------------------------------------------------
+# ----- Evaluación -----------------------------------------------------------
 
 REGRESSION_METRICS: tuple[str, ...] = ("rmse", "mae", "r2")
 
-# Concurrent estimator fits inside one fold's grid search. Mirrors the old
-# CrossValidator(parallelism=2): the cluster has 2 worker JVMs, so 2 fits can
-# run at once, each feeding off the one cached per-fold feature set. Going
-# higher just queues fits on the same executors and contends for that cache.
+# Cuántos fits de estimador corren a la vez por fold: uno por JVM de worker.
 CV_PARALLELISM: int = 2
 
-# How many rows of common_test to score when timing the @champion's inference
-# latency. 1000 is enough for a stable ms/row figure across runs without
-# inflating the Phase 3 registration cost.
+# Filas de common_test que puntuamos al medir la latencia de inferencia del @champion.
 INFERENCE_LATENCY_SAMPLE_ROWS: int = 1000
 
-# Hard cap on retained model versions per registered model. Anything beyond
-# this — except versions carrying an `@champion` / `@challenger` alias — is
-# pruned at the end of `register_candidates`. Each train.py run registers
-# ~5 versions, so 20 is roughly the last four invocations' worth.
+# Tope de versiones que se conservan. Las que tienen alias (@champion/@challenger) quedan exentas.
 REGISTRY_MAX_VERSIONS: int = 20
 REGISTRY_PROTECTED_ALIASES: tuple[str, ...] = ("champion", "challenger")
 
@@ -113,9 +76,8 @@ REGISTRY_PROTECTED_ALIASES: tuple[str, ...] = ("champion", "challenger")
 def evaluate_predictions(
     predictions_df: DataFrame, label_col: str,
 ) -> dict[str, float]:
-    """Return {rmse, mae, r2} for a DataFrame that already has `label_col` and
-    a `prediction` column. Pure helper — caller manages caching (the three
-    evaluators each do a full pass, so caching upstream is worth it)."""
+    """{rmse, mae, r2} para un df con `label_col` + `prediction`. Conviene cachear antes:
+    cada métrica hace su propia pasada completa."""
     return {
         m: float(RegressionEvaluator(
             labelCol=label_col, predictionCol="prediction", metricName=m,
@@ -127,7 +89,7 @@ def evaluate_predictions(
 def evaluate_regression(
     model, df: DataFrame, label_col: str,
 ) -> dict[str, float]:
-    """Score `model` on `df` — returns {rmse, mae, r2}."""
+    """Puntúa `model` sobre `df` y devuelve {rmse, mae, r2}."""
     predictions = model.transform(df).select(label_col, "prediction").cache()
     try:
         return evaluate_predictions(predictions, label_col)
@@ -140,23 +102,17 @@ def log_split_metrics(metrics: dict[str, float], split: str) -> None:
         mlflow.log_metric(f"{split}_{name}", value)
 
 
-# A dataset input is a (mlflow Dataset, context) pair. `context` is the free
-# text shown in the MLflow UI's "Datasets used" column ("training"/"validation"/
-# "testing"). Logging the same set on every run is what makes the dataset field
-# uniformly populated instead of empty.
+# (Dataset de mlflow, context); context es la etiqueta bajo "Datasets used" en la UI.
 DatasetInput = tuple["mlflow.data.dataset.Dataset", str]
 
 
 def log_input_datasets(input_datasets: list[DatasetInput] | None) -> None:
-    """Attach each (dataset, context) to the active run via mlflow.log_input.
-
-    Called inside an open run by every run-logging helper so the train / val /
-    test inputs show up on the run's Datasets field. No-op when None."""
+    """Asocia cada (dataset, context) al run activo; no hace nada si es None."""
     for dataset, context in input_datasets or []:
         mlflow.log_input(dataset, context=context)
 
 
-# ----- Training helpers -----------------------------------------------------
+# ----- Utilidades de entrenamiento ------------------------------------------
 
 def train_and_log_run(
     *,
@@ -168,12 +124,8 @@ def train_and_log_run(
     extra_params: dict | None = None,
     input_datasets: list[DatasetInput] | None = None,
 ) -> tuple[str, dict[str, dict[str, float]], object]:
-    """Fit pipeline on splits['train'], evaluate on every split, log to MLflow.
-
-    Returns (run_id, per-split metrics dict, fitted PipelineModel) — the
-    in-memory model is returned so callers can reuse it (e.g. for inference
-    latency measurement) without paying the cost of reloading from MLflow.
-    """
+    """Entrena con splits['train'], puntúa cada split y lo registra todo en MLflow.
+    Devuelve (run_id, métricas por split, modelo entrenado) para que quien llama lo reutilice."""
     with mlflow.start_run(run_name=run_name) as run:
         run_id = run.info.run_id
         mlflow.set_tags(tags)
@@ -221,27 +173,15 @@ def tune_with_cv(
     extra_params: dict,
     input_datasets: list[DatasetInput] | None = None,
 ) -> tuple[str, dict, dict[str, dict[str, float]], object]:
-    """K-fold CV search over `param_list` for one algorithm.
+    """CV de k folds sobre `param_list` para un algoritmo.
 
-    Unlike Spark's CrossValidator — which refits the *entire* pipeline,
-    including the shared StringIndexer/OneHot/scaler stages, once per
-    (fold × grid point) — this fits the feature stages **once per fold** on
-    that fold's training rows, caches the transformed (train_fold, val_fold)
-    feature vectors, and reuses them across every grid point. The grid only
-    varies the estimator, so its preprocessing is identical across points;
-    doing it once per fold instead of once per (fold × point) drops that
-    redundant work. Preprocessing is still fit per fold on the fold's own
-    training rows (no cross-fold scaler/indexer leakage), so the CV stays
-    honest.
-
-    bestModel is the full pipeline refit on all of train_df with the winning
-    params — we evaluate it on every entry in `eval_splits` and log it.
-
-    Returns (run_id, best_params, {split: {metric: value}}, bestModel) — the
-    in-memory PipelineModel is returned alongside its run/metrics so callers
-    don't have to reload it from MLflow when measuring inference latency.
+    Entrena las etapas de features compartidas una vez por fold y cachea los vectores
+    transformados, y luego solo reentrena el estimador por cada punto del grid. Así evita
+    tanto la fuga entre folds como el preprocesado redundante que CrossValidator hace en
+    cada punto. bestModel es el pipeline completo reentrenado sobre todo train_df con los
+    parámetros ganadores. Devuelve (run_id, best_params, {split: {métrica: valor}}, bestModel).
     """
-    # Split the pipeline: shared feature stages + the (tunable) estimator.
+    # Separamos el pipeline: las etapas de features compartidas y, aparte, el estimador a ajustar.
     sample_pipeline = pipeline_factory(algorithm, param_list[0])
     stages = sample_pipeline.getStages()
     feature_stages, estimator = stages[:-1], stages[-1]
@@ -265,8 +205,6 @@ def tune_with_cv(
         )
         t0 = time.perf_counter()
 
-        # k equal folds. train_df is cached upstream, so the randomSplit is
-        # stable across the re-evaluations below.
         folds = train_df.randomSplit([1.0] * num_folds, seed=42)
         rmse_sums = [0.0] * len(param_list)
 
@@ -282,15 +220,13 @@ def tune_with_cv(
                 (folds[j] for j in range(num_folds) if j != i),
             )
 
-            # Fit + apply the shared preprocessing ONCE for this fold, then
-            # cache the assembled feature vectors for every grid point to read.
             feat_model = Pipeline(stages=feature_stages).fit(train_fold)
             train_feat = feat_model.transform(train_fold) \
                 .select(features_col, label_col).cache()
             val_feat = feat_model.transform(val_fold) \
                 .select(features_col, label_col).cache()
             try:
-                tr_n = train_feat.count()  # materialize before the grid loop
+                tr_n = train_feat.count()
                 vl_n = val_feat.count()
                 progress(
                     f"  [{run_name}] fold {i + 1}/{num_folds}: features ready "
@@ -315,10 +251,8 @@ def tune_with_cv(
                     )
                     return idx, rmse
 
-                # 2 estimator fits run concurrently (see CV_PARALLELISM), both
-                # reading the one cached per-fold feature set. pool.map blocks
-                # inside the `with`, so rmse_sums is only touched here on the
-                # main thread.
+                # CV_PARALLELISM fits a la vez. pool.map bloquea, así que rmse_sums
+                # solo se toca desde el hilo principal.
                 with ThreadPoolExecutor(max_workers=CV_PARALLELISM) as pool:
                     for idx, rmse in pool.map(_fit_eval, enumerate(param_list)):
                         rmse_sums[idx] += rmse
@@ -346,7 +280,7 @@ def tune_with_cv(
         for k, v in best_params.items():
             mlflow.log_param(f"best_{k}", v)
 
-        # bestModel: full pipeline refit on ALL of train_df with best params.
+        # bestModel: reentrenamos el pipeline entero sobre todo train_df con los mejores parámetros.
         progress(f"  [{run_name}] refitting bestModel on full train...")
         refit_t = time.perf_counter()
         best_model = pipeline_factory(algorithm, best_params).fit(train_df)
@@ -380,8 +314,7 @@ def tune_with_cv(
 def _fit_baseline_predictor(
     train_df: DataFrame, label_col: str, group_cols: list[str],
 ) -> tuple[DataFrame, float]:
-    """Per-group mean predictor: returns (group_means_df, global_mean). The
-    global mean is the fallback for groups unseen at scoring time."""
+    """Predictor por media de grupo. Devuelve (group_means_df, media global de respaldo)."""
     group_means = (
         train_df
         .groupBy(*group_cols)
@@ -399,7 +332,7 @@ def _score_baseline(
     df: DataFrame, group_means: DataFrame, global_mean: float,
     label_col: str, group_cols: list[str],
 ) -> dict[str, float]:
-    """Score the per-group-mean predictor on `df` — returns {rmse, mae, r2}."""
+    """Puntúa el predictor de media por grupo sobre `df` y devuelve {rmse, mae, r2}."""
     predictions = (
         df
         .join(broadcast(group_means), on=group_cols, how="left")
@@ -425,19 +358,8 @@ def compute_baseline_metrics(
     label_col: str,
     group_cols: list[str],
 ) -> dict[str, float]:
-    """Mean-of-label-per-group baseline — predicts `mean(label)` for each
-    (group_cols) bucket seen in train, falling back to the global mean for
-    unseen buckets in test.
-
-    Mean (not median) because RMSE is our reported metric: among all
-    constant-per-group predictors, the per-group mean is the
-    RMSE-optimal one. Using the median (MAE-optimal) would inflate the
-    model's lift over baseline by handicapping the baseline on the metric
-    we actually report.
-
-    A floor reference: any trained model that doesn't beat this on RMSE
-    isn't learning anything beyond per-group averages.
-    """
+    """Baseline de media de la etiqueta por grupo, con la media global como respaldo para
+    los grupos no vistos. Usamos la media y no la mediana porque es la constante óptima en RMSE por grupo."""
     group_means, global_mean = _fit_baseline_predictor(
         train_df, label_col, group_cols,
     )
@@ -454,16 +376,13 @@ def log_baseline_run(
     extra_params: dict,
     input_datasets: list[DatasetInput] | None = None,
 ) -> dict[str, float]:
-    """Fit the mean-per-group baseline on `train_df`, score every split in
-    `eval_splits`, and log `{split}_{metric}` for each — so the baseline run
-    carries the same per-split metric set (train/val/common_test) as the model
-    runs instead of only common_test. Returns the common_test metrics (the
-    value used downstream for the baseline_common_test_rmse tag)."""
+    """Entrena con `train_df` y luego puntúa y registra cada split para que el run lleve
+    el mismo conjunto de métricas que los runs de modelos. Devuelve las métricas de common_test."""
     progress(f"  [baseline] fitting mean-per-group predictor on {group_cols}...")
     group_means, global_mean = _fit_baseline_predictor(
         train_df, label_col, group_cols,
     )
-    group_means = group_means.cache()  # reused across every split
+    group_means = group_means.cache()  # puntuamos cada split contra esto
     try:
         per_split: dict[str, dict[str, float]] = {}
         with mlflow.start_run(run_name="baseline"):
@@ -488,29 +407,22 @@ def log_baseline_run(
     return per_split.get("common_test", next(iter(per_split.values())))
 
 
-# ----- Inference latency ----------------------------------------------------
+# ----- Latencia de inferencia -----------------------------------------------
 
 def measure_inference_latency(
     model,
     df: DataFrame,
     n_rows: int = INFERENCE_LATENCY_SAMPLE_ROWS,
 ) -> tuple[float, float, int]:
-    """Time how long `model.transform(...)` takes on a small sample of `df`.
-
-    Returns (elapsed_seconds, ms_per_row, actual_n_rows). The sample is
-    cached and a warm-up pass is run before timing, so the measurement
-    isolates the prediction cost from broadcast/JIT/scheduler overhead.
-
-    Numbers are Spark-cluster latency (full distributed roundtrip) — useful
-    as a regression check against the previous champion ("did v40 suddenly
-    get 5× slower than v39?"), not as a production-serving SLO.
-    """
+    """Cronometra model.transform sobre una muestra cacheada de `n_rows`, tras una pasada
+    de calentamiento. Devuelve (segundos, ms_por_fila, n_filas_reales). Es latencia del
+    clúster de Spark: una comprobación de regresión entre champions, no un SLO de producción."""
     sample = df.limit(n_rows).cache()
     try:
         actual_n = sample.count()
         if actual_n == 0:
             return 0.0, float("nan"), 0
-        # Warm-up — first transform pays the JIT/broadcast cost.
+        # Calentamiento: el primer transform absorbe el coste de JIT/broadcast.
         model.transform(sample).select("prediction").count()
         t0 = time.perf_counter()
         model.transform(sample).select("prediction").collect()
@@ -520,7 +432,7 @@ def measure_inference_latency(
         sample.unpersist()
 
 
-# ----- Model registry -------------------------------------------------------
+# ----- Registro de modelos --------------------------------------------------
 
 def prune_old_versions(
     client: MlflowClient,
@@ -528,14 +440,8 @@ def prune_old_versions(
     keep_recent: int = REGISTRY_MAX_VERSIONS,
     protected_aliases: tuple[str, ...] = REGISTRY_PROTECTED_ALIASES,
 ) -> list[str]:
-    """Delete versions of `name` beyond the `keep_recent` most recent.
-
-    Any version carrying one of `protected_aliases` is always kept, even if
-    it falls outside the top-N most-recent. That preserves the cross-run
-    audit trail (the alias resolves to a real, loadable version) while
-    capping the registry growth — without this every train.py run leaks
-    ~5 versions forever.
-    """
+    """Borra las versiones más allá de las `keep_recent` más recientes. Nunca toca una versión
+    que tenga un alias protegido: el alias tiene que seguir siendo cargable."""
     versions = client.search_model_versions(f"name='{name}'")
     if not versions:
         return []
@@ -583,44 +489,19 @@ def register_candidates(
     max_versions: int = REGISTRY_MAX_VERSIONS,
     protected_aliases: tuple[str, ...] = REGISTRY_PROTECTED_ALIASES,
 ) -> dict[str, tuple]:
-    """Register every entry in `candidates` as a new version of `name`.
+    """Registra cada candidato como una versión nueva de `name`.
 
-    Each candidate is a dict with at least a "run_id" key (the rest is
-    passed verbatim to `build_version_description` / `build_version_tags`).
-
-    On first creation of `name`, seed the registered model with the
-    `registered_model_*` metadata. Later invocations do NOT overwrite that —
-    manual UI edits survive.
-
-    The candidate whose run_id == `champion_run_id` is the contender for
-    @champion (the within-run winner). Promotion rule (lower
-    `promotion_metric` is better): contender's `promotion_metric` strictly
-    below the previous @champion's value → contender gets @champion +
-    `validation_status="champion"`, previous champion stays registered and
-    is tagged `validation_status="challenger"`. Otherwise the contender is
-    tagged `validation_status="challenger"`.
-
-    Every other candidate is always tagged `validation_status="challenger"`.
-
-    The @challenger alias points to the best non-champion version registered
-    in this round (lowest `promotion_metric`).
-
-    On promotion, if `latency_model` + `latency_sample_df` are provided, the
-    new @champion version gets three latency tags
-    (`inference_latency_ms_per_row`, `inference_latency_sample_n`,
-    `inference_latency_total_s`). The measurement uses
-    `measure_inference_latency` (1000-row sample by default) — see that
-    helper for what the numbers actually represent.
-
-    Finally calls `prune_old_versions(name, keep_recent=max_versions)` to
-    cap registry growth at `max_versions` non-aliased versions. The
-    `@champion` / `@challenger` aliased versions are always kept.
-
-    Returns: {run_id: (ModelVersion, status)} for each candidate.
+    Cada candidato es un dict con al menos "run_id". El candidato de champion_run_id se
+    queda con @champion solo si su `promotion_metric` es estrictamente menor que la del
+    champion actual; en caso contrario es un challenger, y todo lo demás también lo es.
+    @challenger apunta a la mejor versión que no sea champion. Cuando hay una promoción, el
+    nuevo @champion recibe los tags de latencia (si se pasaron latency_model/df) y después
+    se poda el registro.
+    Devuelve {run_id: (ModelVersion, status)}.
     """
     client = MlflowClient()
 
-    # First-creation hook.
+    # Creamos el modelo registrado la primera vez que lo vemos.
     try:
         client.get_registered_model(name)
     except MlflowException:
@@ -632,8 +513,7 @@ def register_candidates(
 
     deployment_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    # Register each candidate. mlflow.register_model waits until READY
-    # (default await_registration_for=300s).
+    # register_model bloquea hasta que la versión está READY.
     registered: dict[str, "mlflow.entities.model_registry.ModelVersion"] = {}
     for n, c in enumerate(candidates, start=1):
         progress(
@@ -652,7 +532,7 @@ def register_candidates(
         version_tags_full = {
             **build_version_tags(c),
             "deployment_date": deployment_date,
-            "validation_status": "challenger",  # default; overridden below
+            "validation_status": "challenger",  # por defecto, puede cambiar más abajo
         }
         for k, v in version_tags_full.items():
             client.set_model_version_tag(
@@ -677,7 +557,7 @@ def register_candidates(
         cur_champ_metric = client.get_run(cur_champ.run_id).data.metrics[promotion_metric]
         promoted = contender_metric < cur_champ_metric
     except MlflowException:
-        # First-ever registration: contender becomes champion unconditionally.
+        # Todavía no hay champion, así que el aspirante gana por defecto.
         promoted = True
 
     if promoted:
@@ -697,16 +577,14 @@ def register_candidates(
                 f"(first version of {name})"
             )
     else:
-        # Already defaulted to challenger; nothing to change on the tag side.
+        # Ya quedó etiquetado como challenger arriba, así que dejamos el tag como está.
         print(
             f"  v{contender_mv.version} stays as challenger "
             f"({promotion_metric} {contender_metric:.4f} >= "
             f"v{cur_champ_version}'s {cur_champ_metric:.4f})"
         )
 
-    # @challenger alias → best non-champion candidate from this run. If the
-    # contender stayed as challenger, that's the contender itself (it's by
-    # definition the best of the new batch on promotion_metric).
+    # Apuntamos @challenger al mejor candidato que no sea champion de esta ejecución.
     non_champion_run_ids = [c["run_id"] for c in candidates if c["run_id"] != champion_run_id]
     challenger_alias_version: str | None = None
     if non_champion_run_ids:
@@ -725,10 +603,7 @@ def register_candidates(
         )
         print(f"  @challenger -> v{challenger_alias_version}")
 
-    # Inference latency tag on the new @champion. Only measured on promotion
-    # (not on every candidate) — it's a regression check against the previous
-    # champion ("did the cluster cost-per-prediction jump?"), and that signal
-    # only makes sense for the version that will actually serve.
+    # Tags de latencia solo en el @champion recién promovido: es el que se va a servir.
     if promoted and latency_model is not None and latency_sample_df is not None:
         elapsed_s, ms_per_row, n = measure_inference_latency(
             latency_model, latency_sample_df,
@@ -750,8 +625,7 @@ def register_candidates(
             f"{ms_per_row:.3f} ms/row on n={n} (total {elapsed_s:.2f}s)"
         )
 
-    # Registry cleanup — cap retained versions at `max_versions`, never
-    # touching anything carrying an `@champion`/`@challenger` alias.
+    # Mantenemos el registro pequeño; las versiones con alias sobreviven a la poda.
     prune_old_versions(
         client, name, keep_recent=max_versions,
         protected_aliases=protected_aliases,

@@ -1,5 +1,3 @@
-"""Data preparation for ML training: last-year holdout split + cyclical encoding."""
-
 import math
 from functools import reduce
 
@@ -8,26 +6,14 @@ from pyspark.sql.functions import col, cos as spark_cos, lit, sin as spark_sin
 from pyspark.sql.types import DoubleType
 
 
-# Last-year holdout: TEST_YEAR is *entirely* held out — common_test is every
-# row of that year and contains zero rows the model has ever seen during
-# training or hyperparameter selection. The metric on common_test is therefore
-# an unbiased generalization estimate to a future year, not contaminated by
-# the within-year temporal autocorrelation a random per-year split leaks. The
-# trade-off is that the per-year breakdown of common_test collapses to a
-# single year (TEST_YEAR), so the diagnostic notebook tells the drift story
-# by comparing TEST_YEAR's metric to the per-TRAIN_VAL_YEAR breakdown instead.
+
 TEST_YEAR: int = 2025
 TRAIN_VAL_YEARS: list[int] = [2023, 2024]
 
-# Phase 2 (more-data) compares two training-pool sizes, BOTH evaluated on
-# common_test = TEST_YEAR — so neither A nor B ever sees the test year and
-# the comparison is fair. A = the earliest year (half the pool); B = all
-# of TRAIN_VAL_YEARS, reused as the Phase-1 winner (no refit needed).
+
 SUBSET_A_YEARS: list[int] = [2023]
 
-# Partition count for the cached split DataFrames. The per-year unionByName in
-# make_splits accumulates many uneven partitions; repartitioning keeps each
-# cached columnar block small enough to build on a 2 GB executor without OOM.
+# Reparticionamos para que cada bloque columnar cacheado quepa en un executor de 3 GB.
 SPLIT_PARTITIONS = 64
 
 
@@ -40,28 +26,16 @@ def make_splits(
     seed: int = 42,
     n_partitions: int = SPLIT_PARTITIONS,
 ) -> tuple[DataFrame, DataFrame, DataFrame]:
-    """Last-year holdout split into (train, val, common_test).
+    """Holdout del último año: (train, val, common_test).
 
-    `common_test` is every row where `year_col == test_year` — the model
-    has never seen any of it during training or selection. Within
-    `train_val_years`, the rows are stratified-by-year random-split into
-    train (~ 1 - val_frac per year) and val (~ val_frac per year). Val is
-    a model-selection signal; some residual within-year autocorrelation
-    between train and val is acceptable. The honest generalization
-    estimate is the metric on common_test.
-
-    The defaults pull from the module constants TRAIN_VAL_YEARS / TEST_YEAR.
+    common_test son todas las filas de test_year, que nunca se tocan durante el
+    entrenamiento ni la selección. train/val es un split aleatorio por año de train_val_years.
     """
     train_val_years = train_val_years or TRAIN_VAL_YEARS
     test_year = test_year if test_year is not None else TEST_YEAR
 
-    # randomSplit assigns rows by (partition index, position within partition),
-    # so it's only deterministic if the parent yields the same rows in the same
-    # partitions every time it's evaluated. df is lazy here, and train/val are
-    # counted in separate actions that would recompute df independently -> a row
-    # could land in both splits (overlap) or neither (drop), and counts drift
-    # run-to-run. Materializing df once pins the layout so the split is a true,
-    # reproducible partition. (common_test is a plain filter and never overlaps.)
+    # Cacheamos una vez para que randomSplit sea determinista. Si no, el padre lazy
+    # se recalcula en cada acción y las filas se mueven entre (o fuera de) los splits.
     df = df.cache()
 
     common_test = df.filter(col(year_col) == test_year)
@@ -72,19 +46,20 @@ def make_splits(
         yr = df.filter(col(year_col) == y)
         t, v = yr.randomSplit([train_weight, val_frac], seed=seed)
         parts.append((t, v))
-    train = reduce(DataFrame.unionByName, (p[0] for p in parts))
-    val = reduce(DataFrame.unionByName, (p[1] for p in parts))
-    return (
-        train.repartition(n_partitions),
-        val.repartition(n_partitions),
-        common_test.repartition(n_partitions),
-    )
+    train = reduce(DataFrame.unionByName, (p[0] for p in parts)).repartition(n_partitions)
+    val = reduce(DataFrame.unionByName, (p[1] for p in parts)).repartition(n_partitions)
+    common_test = common_test.repartition(n_partitions)
+
+    # Materializamos los hijos en su propia caché (con el padre aún cacheado, así
+    # randomSplit es determinista) y soltamos el padre: nadie más lo consume.
+    for child in (train, val, common_test):
+        child.cache().count()
+    df.unpersist()
+    return train, val, common_test
 
 
-# Hour-of-day (0..23) and day-of-week (0..6) wrap around. Integer encoding
-# puts 23h numerically far from 0h even though they're adjacent. sin/cos at
-# the right period fixes this for GLR; trees split on integers fine and
-# don't benefit.
+# Codificamos hora (0..23) y día de la semana (0..6) como sin/cos para que las 23h queden
+# pegadas a las 0h. GLR lo necesita; los árboles dividen sobre los enteros, así que no.
 CYCLICAL_COLS: dict[str, int] = {
     "pickup_hour": 24,
     "pickup_dow": 7,
@@ -96,11 +71,8 @@ CYCLICAL_COLS: dict[str, int] = {
 def add_cyclical_features(
     df: DataFrame, numerical_cols: list[str],
 ) -> tuple[DataFrame, list[str]]:
-    """Append sin/cos columns for each cyclical numerical feature in the input.
-
-    Returns (df_with_extra_cols, added_col_names). The original integer cols
-    are kept in the DataFrame — tree-model pipelines still consume them.
-    """
+    """Añade sin/cos por cada feature cíclica, manteniendo también las columnas enteras
+    (los árboles las siguen usando). Devuelve (df, nombres de las columnas añadidas)."""
     added: list[str] = []
     out = df
     for c in numerical_cols:
@@ -119,10 +91,8 @@ def add_cyclical_features(
 def resolve_numerical_cols(
     algorithm: str, base_numerical_cols: list[str],
 ) -> list[str]:
-    """Trees (GBT, RFR) keep the integer hour/dow. GLR swaps them for sin/cos."""
-    # Late import to avoid the splits ↔ algorithms cycle (algorithms imports
-    # from pipelines; splits is consumed by both).
-    from ml.algorithms import TREE_ALGORITHMS
+    """Los árboles (GBT, RFR) mantienen la hora/día enteros; GLR cambia al par sin/cos."""
+    from ml.algorithms import TREE_ALGORITHMS  # import tardío para romper un ciclo
 
     if algorithm in TREE_ALGORITHMS:
         return base_numerical_cols

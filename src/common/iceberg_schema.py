@@ -1,9 +1,3 @@
-"""Generate Iceberg CREATE TABLE column DDL from a Spark StructType.
-
-Each StructField becomes `name type [NOT NULL]` — the nullable flag becomes
-a Iceberg NOT NULL constraint, which the writer enforces at row level.
-"""
-
 from pyspark.sql.types import StructType
 
 

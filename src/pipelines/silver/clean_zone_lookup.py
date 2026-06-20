@@ -1,9 +1,3 @@
-"""Silver ETL — clean and conform the NYC TLC taxi zone lookup from bronze.
-
-Small reference table (~265 rows). WAP: branch from silver, read bronze, clean,
-validate, merge to silver. Full refresh by overwrite (unpartitioned).
-"""
-
 from datetime import date
 
 from pyspark.sql import DataFrame, SparkSession
@@ -14,8 +8,7 @@ from common.spark_factory import get_spark
 from common.iceberg_schema import schema_to_ddl
 from common import nessie_manager as nessie
 
-# SOURCE and TARGET share an identifier — same table name, different Nessie
-# branch (bronze vs silver). The active ref decides which one a read hits.
+# Mismo identificador en ambas ramas; el ref activo de Nessie decide a qué tabla apunta la lectura.
 SOURCE = "nessie.nyc.taxi_zone_lookup"
 TARGET = "nessie.nyc.taxi_zone_lookup"
 TARGET_LOCATION = nessie.table_location("silver", "taxi_zone_lookup")
@@ -23,12 +16,11 @@ TARGET_LOCATION = nessie.table_location("silver", "taxi_zone_lookup")
 VALID_LOCATION_MIN = 1
 VALID_LOCATION_MAX = 265
 
-# Bronze has 265 rows; allow small drift but flag large changes.
+# Bronze tiene 265 filas; toleramos una pequeña variación pero marcamos cambios grandes.
 MIN_EXPECTED_ROWS = 250
 MAX_EXPECTED_ROWS = 300
 
-# location_id, borough, zone are filtered by isNotNull/range — survivors are
-# non-null. service_zone is not filtered, stays nullable.
+# location_id/borough/zone se filtran, así que no son nulos; service_zone sigue siendo nullable.
 SILVER_ZONE_SCHEMA = StructType([
     StructField("location_id", IntegerType(), nullable=False),
     StructField("borough", StringType(), nullable=False),
@@ -38,7 +30,7 @@ SILVER_ZONE_SCHEMA = StructType([
 
 
 def clean(df: DataFrame) -> DataFrame:
-    """Rename to snake_case, trim strings, drop invalid rows, dedupe."""
+    """Renombra a snake_case, recorta espacios, descarta filas inválidas y elimina duplicados."""
     return (
         df
         .select(
@@ -56,7 +48,7 @@ def clean(df: DataFrame) -> DataFrame:
 
 
 def validate(silver_count: int) -> tuple[bool, str]:
-    """Audit step: returns (passed, reason). Never raises."""
+    """Paso de auditoría: devuelve (passed, reason). Nunca lanza excepción."""
     if silver_count == 0:
         return False, "silver empty after cleaning"
     if silver_count < MIN_EXPECTED_ROWS:
@@ -101,9 +93,8 @@ def main() -> None:
             spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             print(f"  Writing {TARGET}")
-            # Full refresh: keep one stable table and overwrite its rows, so
-            # each run is a clean snapshot instead of a dropped+recreated table
-            # that orphans the previous run's files.
+            # Refresco completo: sobrescribimos una tabla estable para que cada ejecución
+            # sea un snapshot limpio, en vez de borrar y recrear dejando ficheros huérfanos.
             spark.sql(f"""
                 CREATE TABLE IF NOT EXISTS {TARGET} (
                     {schema_to_ddl(SILVER_ZONE_SCHEMA)}

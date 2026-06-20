@@ -1,5 +1,3 @@
-"""SparkSession factory — all config comes from spark-defaults.conf."""
-
 from pyspark.sql import SparkSession
 
 

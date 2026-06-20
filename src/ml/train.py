@@ -1,72 +1,16 @@
-"""Unified ML training script — one entry point for all three use cases.
+"""Script de entrenamiento unificado: spark-submit src/ml/train.py <fare|duration|demand> [--fast].
+Cada ejecución registra todo en un único experimento de MLflow:
+  Fase 0    descarta las categóricas redundantes (p. ej. borough, derivable de location_id).
+  baseline  media(etiqueta) por grupo — el suelo óptimo en RMSE de una constante por grupo.
+  Fase 1    un CV por algoritmo sobre su grid completo; gana el menor val_rmse.
+  Fase 2    más datos A (subconjunto) vs B (el ganador, reutilizado); ambos puntúan sobre TEST_YEAR.
+  Fase 3    registra los 4 candidatos; el ganador se queda con @champion solo si su
+            val_rmse supera al del champion del registro; si no, sigue de challenger.
 
-  spark-submit src/ml/train.py <use_case> [--fast]
-
-  use_case ∈ {fare, duration, demand}
-
-Phases (run end-to-end per invocation, all logged to one MLflow experiment):
-
-  Phase 0 — Drop redundant categoricals (e.g. borough — derivable from
-            location_id). Applied to the feature set up-front, so every
-            subsequent phase trains on the reduced columns.
-  baseline      — mean(label) per (group_cols). Floor reference; mean is
-                  the RMSE-optimal constant-per-group predictor (median
-                  would be MAE-optimal — wrong loss for our metric).
-  Phase 1 — Training      : one CV(k=3) per algorithm over its full grid
-                            (6 points per algorithm — equal tuning budget
-                            across GLR/GBT/RFR). The within-run winner is
-                            the algorithm whose
-                            CV-bestModel scores lowest on val_rmse. Every
-                            algorithm gets registered with its full-grid
-                            best, so the "losing" algorithms still appear
-                            in the registry as fairly-tuned challengers.
-  Phase 2 — More-data     : winner refit on subset A (SUBSET_A_YEARS — the
-                            earliest training year) vs subset B (all
-                            of TRAIN_VAL_YEARS, reused as the Phase-1
-                            winner without refit). Both scored on the same
-                            common_test = TEST_YEAR, so neither sees the
-                            held-out year — the contrast isolates "does
-                            more training data help?".
-  Phase 3 — Register every candidate (3 Phase-1 Training + 1 Phase-2
-            More-data = 4 per run) as a new MLflow model version. The
-            within-run winner (lowest val_rmse) gets @champion only if its
-            val_rmse is strictly below the previous registry champion's
-            val_rmse; otherwise it stays validation_status="challenger".
-            All other candidates from the run are tagged
-            validation_status="challenger". The @challenger alias points to
-            the best non-champion version from this run.
-
-Metric policy: val_rmse drives every selection decision (within-run
-@champion contender, cross-run @champion promotion). common_test is held
-out — its metrics are logged on every version but never used to rank
-candidates, so the diagnostic notebook can report them as an unbiased
-generalization estimate.
-
-Split policy: last-year holdout. common_test is every row of TEST_YEAR
-(2025) — the model has never seen any of it during training or selection.
-train + val are stratified-by-year random split of TRAIN_VAL_YEARS
-(2023/2024). This closes the within-year temporal-autocorrelation
-leak of a per-year random split: no two trips minutes apart end up across
-the train/test boundary.
-
-Reproducibility policy: every registered version carries the Nessie main
-commit hash and the source Iceberg snapshot_id as tags
-(`nessie_main_hash`, `source_snapshot_id`). The full hash pins every
-table on every branch as of training time, so a model card is enough to
-rebuild the exact training input later — even if gold has rolled forward.
-
-Latency policy: on promotion the new @champion is scored on 1000 rows of
-common_test and the elapsed time is logged on its version
-(`inference_latency_ms_per_row`, `inference_latency_sample_n`,
-`inference_latency_total_s`). The numbers are Spark-cluster latency, not
-a production SLO — they're a regression check between champions ("did v40
-suddenly get 5× slower than v39?").
-
-Registry retention policy: at the end of every run the registry is
-pruned to the top REGISTRY_MAX_VERSIONS most-recent versions, with the
-exception that any version carrying an @champion or @challenger alias is
-always kept. Caps registry growth (~5 versions per train.py run) without
-losing the audit trail to whatever the current aliases point at.
+A tener en cuenta: val_rmse guía cada decisión (common_test queda reservado y solo se
+reporta), el split es un holdout del último año (common_test = TEST_YEAR), cada versión se
+fija con nessie_main_hash + source_snapshot_id, el @champion recibe un tag de latencia de
+inferencia, y el registro se poda a REGISTRY_MAX_VERSIONS conservando las versiones con alias.
 """
 
 import sys
@@ -113,7 +57,7 @@ from ml.tracking import (
 
 CREATED_BY = "jgalanllano"
 
-# yellow_taxi_trips feature set — shared by fare and duration use cases.
+# Conjunto de features de yellow_taxi_trips, compartido por los casos fare y duration.
 TRIP_NUMERICAL_COLS = [
     "trip_distance", "passenger_count",
     "pickup_year", "pickup_month", "pickup_week",
@@ -125,8 +69,7 @@ TRIP_CATEGORICAL_COLS = [
     "vendor_id", "ratecode_id", "payment_type",
 ]
 TRIP_BASELINE_GROUP_COLS = ["pu_location_id", "pickup_hour"]
-# Phase 0: borough is derivable from location_id, so it carries no information
-# beyond the ID itself. Dropped up-front for every algorithm/phase.
+
 TRIP_REDUNDANT_CATEGORICALS = ["pu_borough", "do_borough"]
 
 USE_CASES: dict[str, dict] = {
@@ -138,10 +81,9 @@ USE_CASES: dict[str, dict] = {
         "year_col": "pickup_year",
         "numerical_cols": TRIP_NUMERICAL_COLS,
         "categorical_cols": TRIP_CATEGORICAL_COLS,
-        "glr_family": "gamma",        # positive, right-skewed
+        "glr_family": "gamma",
         "project_name": "NYC Taxi Fare Prediction",
         "baseline_group_cols": TRIP_BASELINE_GROUP_COLS,
-        # Silver enforces fare > 0; no filter needed here.
         "label_filter_predicate": None,
         "redundant_categoricals": TRIP_REDUNDANT_CATEGORICALS,
     },
@@ -156,8 +98,6 @@ USE_CASES: dict[str, dict] = {
         "glr_family": "gamma",
         "project_name": "NYC Taxi Trip Duration Prediction",
         "baseline_group_cols": TRIP_BASELINE_GROUP_COLS,
-        # Sub-second trips: unix_timestamp truncates → duration 0. Filter so
-        # GLR (gamma family requires y > 0) does not blow up.
         "label_filter_predicate": lambda c: c > 0,
         "redundant_categoricals": TRIP_REDUNDANT_CATEGORICALS,
     },
@@ -167,8 +107,6 @@ USE_CASES: dict[str, dict] = {
         "source": "nessie.nyc.pickup_demand_zone_hour",
         "label_col": "n_pickups",
         "year_col": "hour_year",
-        # Calendar features only. Aggregated columns (avg_fare, total_revenue,
-        # ...) require n_pickups to exist, so they would be leakage.
         "numerical_cols": [
             "hour_year", "hour_month", "hour_week",
             "hour_dow", "hour_of_day",
@@ -176,19 +114,17 @@ USE_CASES: dict[str, dict] = {
         "categorical_cols": [
             "pu_location_id", "pu_borough", "pu_service_zone",
         ],
-        "glr_family": "poisson",      # non-negative integer counts
+        "glr_family": "poisson",      # recuentos enteros no negativos
         "project_name": "NYC Taxi Pickup Demand Forecast",
         "baseline_group_cols": ["pu_location_id", "hour_of_day"],
         "label_filter_predicate": None,
-        # Phase 0: pu_borough and pu_service_zone are both derivable from
-        # pu_location_id via the zone lookup — drop both.
         "redundant_categoricals": ["pu_borough", "pu_service_zone"],
     },
 }
 
 
 def _parse_cli(argv: list[str]) -> tuple[str, bool]:
-    """Returns (use_case, fast). Exits with a usage message on bad input."""
+    """Devuelve (use_case, fast). Sale con un mensaje de uso si la entrada es incorrecta."""
     positional = [a for a in argv if not a.startswith("--")]
     if len(positional) != 1 or positional[0] not in USE_CASES:
         names = "|".join(USE_CASES)
@@ -198,7 +134,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, bool]:
 
 
 def _build_pipeline(algorithm: str, params: dict, cfg: dict):
-    """Compose feature pipeline + estimator for `algorithm` under cfg."""
+    """Construye el pipeline de features + el estimador para `algorithm` según cfg."""
     pipeline_config = algorithm_pipeline_config(algorithm)
     numerical_cols = resolve_numerical_cols(algorithm, cfg["numerical_cols"])
 
@@ -222,16 +158,9 @@ def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
 
 
 def _make_dataset(df: DataFrame, name: str, cfg: dict):
-    """Wrap a split DataFrame as an MLflow Dataset for the run's Datasets field.
-
-    Source is recorded as the gold Iceberg table, `targets` marks the label
-    column, and the digest comes from the DataFrame's logical-plan semantic
-    hash (no data scan), so it fingerprints the exact read + sample + split.
-    The same object is logged on every run so the Datasets field is populated
-    uniformly across baseline / training / more-data runs. The snapshot pin is
-    not passed as `version` (that path is Delta-only and rejects Iceberg
-    tables) — it already travels on every run as the `source_snapshot_id`
-    param/tag."""
+    """Envuelve un split como Dataset de MLflow. El digest es el hash semántico del plan
+    lógico (sin escaneo). Sin `version=` — eso es solo para Delta; el snapshot lo fijamos
+    a través de source_snapshot_id."""
     return mlflow.data.from_spark(
         df,
         table_name=cfg["source"],
@@ -248,13 +177,9 @@ def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
         "phase": phase,
         "project_name": cfg["project_name"],
         "created_by": CREATED_BY,
-        # Present on every run so the column is never sparse. Only the Phase-2
-        # A/B comparison overrides it ("A" for more-data-A, "B" for the reused
-        # Phase-1 winner); every other run stays "none".
+        # Se pone en cada run para que la columna nunca esté dispersa; solo la Fase 2 fija A/B.
         "more_data_subset": "none",
-        # The training-pool years, as a tag on every run (the diagnostic
-        # notebook reads it as a tag). more-data-A overrides it to its subset;
-        # logged as a tag, not a param, to avoid the param/tag duplication.
+        # Los años del pool de entrenamiento (more-data-A lo sobrescribe con su subconjunto).
         "training_data": str(TRAIN_VAL_YEARS),
     }
     if extra:
@@ -285,11 +210,7 @@ def main() -> None:
                 "(keeps CV cost bounded; per-fold rows still in the millions)."
             )
 
-        # ---- Phase 0: drop redundant categoricals ------------------------
-        # Borough (and pu_service_zone for demand) are derivable from
-        # location_id via the zone lookup, so they carry no information
-        # beyond it. Drop up-front so every algorithm/phase trains on the
-        # same reduced feature set.
+        # ---- Fase 0: descartamos las categóricas redundantes (derivables de location_id) ----
         redundant = list(cfg["redundant_categoricals"])
         cfg = {**cfg, "categorical_cols": [
             c for c in cfg["categorical_cols"] if c not in redundant
@@ -298,10 +219,9 @@ def main() -> None:
         print(f"  dropped: {redundant}")
         print(f"  remaining categoricals: {cfg['categorical_cols']}")
 
-        # ---- Load + project + optional sample + cyclical features ----
-        # Pin the data state at run-time: Nessie main hash + Iceberg snapshot
-        # id of the source table. These travel onto every registered version
-        # as tags so a future reader can rebuild the exact training input.
+        # ---- Carga + proyección + muestreo opcional + features cíclicas ----
+        # Fijamos el estado de los datos (hash de main en Nessie + snapshot id del origen)
+        # en cada versión, para que más adelante se pueda reconstruir la entrada exacta.
         nessie_main_hash = nessie.current_ref_hash(spark, "main") or ""
         source_snapshot_id = nessie.latest_snapshot_id(spark, cfg["source"])
         progress(
@@ -318,8 +238,8 @@ def main() -> None:
             df = df.sample(sample_fraction, seed=42)
         df, _added = add_cyclical_features(df, cfg["numerical_cols"])
 
+        # make_splits devuelve los splits ya cacheados y materializados.
         train, val, common_test = make_splits(df, cfg["year_col"])
-        train, val, common_test = train.cache(), val.cache(), common_test.cache()
         eval_splits: dict[str, DataFrame] = {"val": val, "common_test": common_test}
         splits: dict[str, DataFrame] = {"train": train, **eval_splits}
 
@@ -332,10 +252,8 @@ def main() -> None:
             print("Empty train or val. Is gold populated?")
             sys.exit(1)
 
-        # Build the input Dataset objects once and reuse them across every run
-        # so the MLflow "Datasets used" field is populated uniformly. The
-        # digest is the DataFrame's logical-plan semantic hash, so each object
-        # is cheap and the val/test pair is shared verbatim by all runs.
+        # Construimos los Datasets de entrada una vez y los reutilizamos entre runs (barato:
+        # el digest es un hash semántico) para que el campo "Datasets used" salga uniforme.
         ds_train = _make_dataset(train, f"{use_case}_train", cfg)
         ds_val = _make_dataset(val, f"{use_case}_val", cfg)
         ds_common_test = _make_dataset(common_test, f"{use_case}_common_test", cfg)
@@ -367,9 +285,7 @@ def main() -> None:
         )
         print(f"  Baseline on common_test: {baseline_metrics}")
 
-        # candidates: single source of truth for within-run champion
-        # selection. Each phase appends; winners are picked by filtering on
-        # `phase` and the relevant split metric.
+        # Única fuente de verdad para elegir al champion; cada fase va añadiendo.
         candidates: list[dict] = []
 
         def record(run_id, run_name, algorithm, phase, params, all_metrics,
@@ -385,14 +301,9 @@ def main() -> None:
                 "extra_tags": extra_tags or {},
             })
 
-        # ---- Phase 1: Training — full CV per algorithm -------------------
-        # One CV(k=cv_folds) per algorithm over its FULL grid. The within-
-        # run winner is whichever algorithm's CV-bestModel scores lowest on
-        # val_rmse. Every algorithm gets registered with its fairly-tuned
-        # best, so the losing algorithms still appear in the registry as
-        # challengers (not as 3-pt screening points like the old Phase 1
-        # design). Collapses the previous Phase 1 (screening) + Phase 2
-        # (winner-only optimization) into a single training step.
+        # ---- Fase 1: Entrenamiento — CV completo por algoritmo -------------------
+        # Un CV(k=cv_folds) por algoritmo sobre su grid completo; gana el algoritmo
+        # cuyo bestModel del CV obtiene el menor val_rmse.
         print(f"\n=== Phase 1: Training — CV(k={cv_folds}) per algorithm ===")
         progress(
             f"Phase 1: tuning {len(ALGORITHMS)} algorithm(s) "
@@ -442,12 +353,8 @@ def main() -> None:
               f"common_test_rmse={winner_metrics['common_test']['rmse']:.4f})")
         print(f"    best params: {winner_params}")
 
-        # ---- Phase 2: More-data — A vs (Phase 1 winner as B) -------------
-        # A = SUBSET_A_YEARS (the earliest training year); B = the full
-        # TRAIN_VAL_YEARS pool, reused as the Phase-1 winner (which already
-        # trained on it). Both are scored on the same common_test = TEST_YEAR,
-        # so neither sees the test year — the comparison is fair and isolates
-        # "does more training data help generalize to a future year?".
+        # ---- Fase 2: Más datos — A (subconjunto) vs ganador de la Fase 1 (= B) ------
+        # Ambos se puntúan sobre common_test = TEST_YEAR, aislando "¿ayudan más datos?".
         print(f"\n=== Phase 2: More-data — A vs Phase-1 winner (= B) for {winner} ===")
         MlflowClient().set_tag(winner_run_id, "more_data_subset", "B")
         training_winner_candidate["extra_tags"]["more_data_subset"] = "B"
@@ -489,10 +396,7 @@ def main() -> None:
                                "training_data": str(SUBSET_A_YEARS)})
             _print_metrics(metrics)
 
-        # ---- Summary -----------------------------------------------------
-        # Sorted by val_rmse — the selection metric. common_test_rmse is
-        # reported but never used to rank, so common_test stays an unbiased
-        # held-out estimate. See [[project-ml-val-for-selection]] in memory.
+        # ---- Resumen — ordenado por val_rmse; common_test se reporta, nunca se usa para rankear ----
         print("\n=== Summary (all candidates, sorted by val_rmse) ===")
         header = (
             f"{'run_name':<22} {'algorithm':<6} "
@@ -516,10 +420,8 @@ def main() -> None:
             f"(reported only — common_test isn't used to rank candidates)"
         )
 
-        # ---- Phase 3: Register every candidate ---------------------------
-        # The within-run winner (lowest val_rmse) is the contender for
-        # @champion. common_test is never used as a selection signal — it
-        # stays held-out so the metric reported on it is unbiased.
+        # ---- Fase 3: Registramos cada candidato ---------------------------
+        # El candidato con menor val_rmse es el aspirante a @champion.
         champ_candidate = ranked[0]
 
         def _build_version_description(c: dict) -> str:

@@ -1,15 +1,9 @@
-"""Bronze ingestion — NYC TLC taxi zone lookup to Iceberg.
-
-Small reference table (~265 rows). WAP: branch, validate, merge to bronze.
-"""
-
 import os
 import shutil
 import sys
 from datetime import date
 from pathlib import Path
 from urllib.request import urlretrieve
-from urllib.error import URLError
 
 from pyspark.sql.functions import lit
 from pyspark.sql.types import (
@@ -23,9 +17,8 @@ from common import nessie_manager as nessie
 ZONE_LOOKUP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
 TABLE = "nessie.nyc.taxi_zone_lookup"
 TABLE_LOCATION = nessie.table_location("bronze", "taxi_zone_lookup")
-DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # shared bind mount
-
-# Bronze stays faithful to source; cleaning happens in silver.
+DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # bind mount compartido
+# Esquema bronze de la tabla de zonas. Todos los campos son nullable para permitir la evolución del esquema.
 BRONZE_ZONE_SCHEMA = StructType([
     StructField("LocationID", IntegerType(), nullable=True),
     StructField("Borough", StringType(), nullable=True),
@@ -50,7 +43,7 @@ def main() -> None:
         try:
             urlretrieve(ZONE_LOOKUP_URL, dest)
             print(f"  -> {os.path.getsize(dest) / 1024:.1f} KB")
-        except URLError as e:
+        except OSError as e:
             print(f"  FAILED: {e}")
             sys.exit(1)
 
@@ -82,10 +75,6 @@ def main() -> None:
             )
             count = df.count()
             print(f"  Records: {count}")
-
-            # Full refresh: keep one stable table and overwrite its rows, so
-            # each run is a clean snapshot instead of a dropped+recreated table
-            # that orphans the previous run's files.
             spark.sql(f"""
                 CREATE TABLE IF NOT EXISTS {TABLE} (
                     {schema_to_ddl(BRONZE_ZONE_SCHEMA)}

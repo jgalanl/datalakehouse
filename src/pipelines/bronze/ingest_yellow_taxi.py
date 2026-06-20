@@ -1,16 +1,9 @@
-"""Bronze ingestion — NYC TLC yellow taxi parquet files to Iceberg.
-
-WAP pattern: each month goes on an isolated Nessie branch,
-gets validated, then merged to bronze.
-"""
-
 import os
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlretrieve
-from urllib.error import URLError
 
 import pyarrow.parquet as pq
 from pyspark.sql import DataFrame, SparkSession
@@ -29,10 +22,9 @@ MONTHS = [1, 2, 3]
 TABLE = "nessie.nyc.yellow_taxi"
 TABLE_LOCATION = nessie.table_location("bronze", "yellow_taxi")
 SCHEMA_REPORT_PATH = Path(__file__).parent / "schema_differences.txt"
-DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # shared bind mount
+DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")
 
-# Bronze stays faithful to the source: every column nullable. Nullability
-# tightens in silver, once cleaning rules have actually run.
+# Esquema de las tablas bronze. Todos los campos son nullable para permitir la evolución del esquema.
 BRONZE_SCHEMA = StructType([
     StructField("VendorID", LongType(), nullable=True),
     StructField("tpep_pickup_datetime", TimestampNTZType(), nullable=True),
@@ -55,7 +47,7 @@ BRONZE_SCHEMA = StructType([
     StructField("airport_fee", DoubleType(), nullable=True),
 ])
 
-# New field since Jan 2025 — Iceberg schema evolution via Nessie
+# Campo nuevo desde enero de 2025 — evolución del esquema de Iceberg vía Nessie.
 CBD_FIELD = StructField("cbd_congestion_fee", DoubleType(), nullable=True)
 
 
@@ -75,7 +67,7 @@ def download_one(url: str, name: str) -> Path | None:
         urlretrieve(url, dest)
         print(f"      -> {os.path.getsize(dest) / 1024 / 1024:.1f} MB")
         return dest
-    except URLError as e:
+    except OSError as e:
         print(f"      FAILED: {e}")
         return None
 
@@ -131,14 +123,14 @@ def save_schema_report(schemas: dict[str, pq.ParquetSchema]) -> None:
 
 
 def normalize_df(spark: SparkSession, path: Path) -> DataFrame:
-    """Cast a raw parquet file to the canonical schema.
+    """Castea un parquet original al esquema canónico.
 
-    cbd_congestion_fee is only included when present in the source,
-    so Iceberg schema evolution kicks in on the first 2025 file.
+    cbd_congestion_fee solo se incluye cuando aparece en el origen, de modo que la
+    evolución del esquema de Iceberg se dispara con el primer fichero de 2025.
     """
     raw = spark.read.parquet(str(path))
 
-    # 2025 files use "Airport_fee" instead of "airport_fee"
+    # Los ficheros de 2025 usan "Airport_fee" en vez de "airport_fee".
     col_map = {c.lower(): c for c in raw.columns}
     if "airport_fee" in col_map and col_map["airport_fee"] != "airport_fee":
         raw = raw.withColumnRenamed(col_map["airport_fee"], "airport_fee")
@@ -159,7 +151,9 @@ def table_exists(spark: SparkSession) -> bool:
         return False
 
 
-def validate_ingestion(spark: SparkSession, expected_count: int) -> None:
+def validate_ingestion(
+    spark: SparkSession, prev_count: int, expected_count: int
+) -> None:
     table_df = spark.table(TABLE)
 
     required_cols = {f.name for f in BRONZE_SCHEMA.fields}
@@ -172,13 +166,18 @@ def validate_ingestion(spark: SparkSession, expected_count: int) -> None:
             f"Column mismatch. Missing: {missing or 'none'}, extra: {extra or 'none'}"
         )
 
-    actual = table_df.count()
-    if actual == 0:
-        raise ValueError("Table is empty after ingestion")
-    if actual < expected_count:
-        raise ValueError(f"Expected >= {expected_count} records, got {actual}")
+    # Validamos solo el delta del append: la tabla acumula los meses anteriores ya
+    # fusionados, así que su total no dice nada sobre lo que escribió este mes.
+    # (No filtramos por (año, mes): el parquet de la TLC trae filas sueltas fuera de
+    # ventana, así que num_rows del fichero no coincide con la partición.)
+    appended = table_df.count() - prev_count
+    if appended != expected_count:
+        raise ValueError(
+            f"Appended {appended:,} rows, expected {expected_count:,}"
+        )
 
-    print(f"  Validation passed: {actual:,} records, {len(table_df.columns)} columns")
+    print(f"  Validation passed: {appended:,} records appended, "
+          f"{len(table_df.columns)} columns")
 
 
 def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
@@ -186,7 +185,7 @@ def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
     print(f"\n  [{label}] Reading and normalizing...")
     df = normalize_df(spark, path)
     has_cbd = "cbd_congestion_fee" in df.columns
-    count = df.count()
+    count = pq.read_metadata(str(path)).num_rows
     print(f"  [{label}] {count:,} records")
 
     if not table_exists(spark):
@@ -216,12 +215,13 @@ def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
 
 def wap_ingest(spark: SparkSession, path: Path, year: int, month: int,
                branch_name: str) -> int:
-    """Branch from bronze -> ingest -> validate -> merge back."""
+    """Crea una rama desde bronze, ingesta, valida y fusiona de vuelta."""
     try:
         nessie.create_branch(spark, branch_name, from_ref="bronze")
         nessie.set_spark_branch(spark, branch_name)
+        prev_count = spark.table(TABLE).count() if table_exists(spark) else 0
         count = ingest_month(spark, path, year, month)
-        validate_ingestion(spark, expected_count=count)
+        validate_ingestion(spark, prev_count=prev_count, expected_count=count)
         nessie.merge_branch(spark, source=branch_name, into="bronze")
         return count
     finally:
