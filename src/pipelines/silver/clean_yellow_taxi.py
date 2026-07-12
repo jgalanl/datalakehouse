@@ -135,15 +135,15 @@ def table_exists(spark: SparkSession) -> bool:
 def validate(bronze_count: int, silver_count: int) -> tuple[bool, str]:
     """Paso de auditoría: devuelve (passed, reason). Nunca lanza excepción; el WAP decide qué hacer."""
     if silver_count == 0:
-        return False, "silver empty after cleaning"
+        return False, "silver vacío tras la limpieza"
     drop_ratio = (bronze_count - silver_count) / bronze_count
     if drop_ratio > MAX_DROP_RATIO:
         return False, (
-            f"drop ratio {drop_ratio:.1%} exceeds threshold {MAX_DROP_RATIO:.0%} "
+            f"ratio de descarte {drop_ratio:.1%} supera el umbral {MAX_DROP_RATIO:.0%} "
             f"({bronze_count:,} -> {silver_count:,})"
         )
     return True, (
-        f"{silver_count:,} kept, {bronze_count - silver_count:,} dropped "
+        f"{silver_count:,} conservadas, {bronze_count - silver_count:,} descartadas "
         f"({drop_ratio:.1%})"
     )
 
@@ -166,23 +166,23 @@ def wap_clean(
         ).cache()
         try:
             bronze_count = bronze_df.count()
-            print(f"  [{label}] Bronze: {bronze_count:,} rows")
+            print(f"  [{label}] Bronze: {bronze_count:,} filas")
 
             if bronze_count == 0:
-                print(f"  [{label}] No bronze data for this month, skipping")
-                return 0, 0, True, "no bronze data"
+                print(f"  [{label}] Sin datos bronze este mes, se omite")
+                return 0, 0, True, "sin datos bronze"
 
             # Cacheamos la porción limpia: se materializa en el ref de bronze antes del
             # cambio, así la escritura nunca vuelve a resolver el origen contra la rama WAP.
             silver_df = clean(bronze_df).cache()
             try:
                 silver_count = silver_df.count()
-                print(f"  [{label}] After cleaning: {silver_count:,} rows")
+                print(f"  [{label}] Tras la limpieza: {silver_count:,} filas")
 
                 nessie.set_spark_branch(spark, branch_name)
 
                 if not table_exists(spark):
-                    print(f"  [{label}] Creating table {TARGET}")
+                    print(f"  [{label}] Creando tabla {TARGET}")
                     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
                     spark.sql(f"""
                         CREATE TABLE {TARGET} (
@@ -195,17 +195,17 @@ def wap_clean(
                             'write.spark.check-nullability' = 'false'
                         )
                     """)
-                print(f"  [{label}] Appending to {TARGET}")
+                print(f"  [{label}] Añadiendo a {TARGET}")
                 silver_df.writeTo(TARGET).append()
             finally:
                 silver_df.unpersist()
 
             passed, reason = validate(bronze_count, silver_count)
             if passed:
-                print(f"  [{label}] Audit passed: {reason}")
+                print(f"  [{label}] Auditoría superada: {reason}")
                 nessie.merge_branch(spark, source=branch_name, into="silver")
             else:
-                print(f"  [{label}] Audit FAILED: {reason}")
+                print(f"  [{label}] Auditoría FALLIDA: {reason}")
             return bronze_count, silver_count, passed, reason
         finally:
             bronze_df.unpersist()
@@ -227,10 +227,10 @@ def main():
             branch_name = nessie.wap_branch_name("silver", "yellow_taxi", year_val, m)
 
             if nessie.ref_exists(spark, branch_name):
-                print(f"  Dropping stale WAP branch '{branch_name}'")
+                print(f"  Eliminando rama WAP obsoleta '{branch_name}'")
                 nessie.drop_branch(spark, branch_name)
 
-            print(f"\n  [{label}] WAP clean (branch: {branch_name})")
+            print(f"\n  [{label}] Limpieza WAP (rama: {branch_name})")
             bronze_count, silver_count, passed, reason = wap_clean(
                 spark, year_val, m, branch_name
             )
@@ -238,7 +238,7 @@ def main():
             if not passed:
                 # Cuarentena: congelamos el snapshot fallido como tag de revisión, borramos la rama y seguimos.
                 review_tag = nessie.review_tag_name("silver", "yellow_taxi", year_val, m)
-                print(f"  [{label}] Quarantining as tag '{review_tag}'")
+                print(f"  [{label}] Poniendo en cuarentena como tag '{review_tag}'")
                 nessie.create_tag(spark, review_tag, from_ref=branch_name)
                 nessie.drop_branch(spark, branch_name)
                 quarantined.append((label, review_tag, reason))
@@ -259,25 +259,25 @@ def main():
         # quedara en cuarentena: el tag sigue marcando un snapshot real de silver.
         if merged_in_year > 0:
             tag_name = nessie.yearly_tag_name("silver", "yellow_taxi", year_val)
-            print(f"  Creating tag '{tag_name}' ({merged_in_year} month(s) merged)")
+            print(f"  Creando tag '{tag_name}' ({merged_in_year} mes(es) fusionado(s))")
             nessie.create_tag(spark, tag_name, from_ref="silver")
 
     if processed == 0 and not quarantined:
-        print("No months processed. Is bronze populated?")
+        print("No se procesó ningún mes. ¿Está bronze poblado?")
         sys.exit(1)
 
     cleaned = total_bronze - total_silver
     retention = total_silver / total_bronze if total_bronze > 0 else 0
-    print(f"\nDone. {processed} months merged -> {TARGET}")
+    print(f"\nHecho. {processed} meses fusionados -> {TARGET}")
     print(f"  Bronze: {total_bronze:,}  Silver: {total_silver:,}  "
-          f"Dropped: {cleaned:,}  Retention: {retention:.1%}")
+          f"Descartadas: {cleaned:,}  Retención: {retention:.1%}")
 
     if quarantined:
-        print(f"\nQuarantined months ({len(quarantined)}) — NOT merged to silver:")
+        print(f"\nMeses en cuarentena ({len(quarantined)}) — NO fusionados a silver:")
         for qlabel, qtag, qreason in quarantined:
             print(f"  [{qlabel}] {qtag}: {qreason}")
 
-    print("\nNessie references after silver ETL:")
+    print("\nReferencias Nessie tras el ETL silver:")
     nessie.print_references(spark)
     spark.stop()
 

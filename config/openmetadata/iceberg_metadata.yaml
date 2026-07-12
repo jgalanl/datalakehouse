@@ -1,10 +1,10 @@
-# OpenMetadata ingestion — lakehouse DATA via the native Iceberg connector,
-# pointed at Nessie's integrated Iceberg-REST catalog (http://nessie:19120/iceberg).
-# This preserves real Iceberg table semantics (schemas, columns) and reads the same
-# Nessie store Spark writes to. OM 1.12.1 OSS has no Dremio connector (Collate-only),
-# so the Iceberg REST catalog is the OSS-native path to these tables.
-# Secrets (__MINIO_KEY__, __MINIO_SECRET__, __OM_JWT__) are injected at run time by
-# run_ingestion.sh from .env.
+# Ingesta de OpenMetadata — DATOS del lakehouse mediante el conector nativo de Iceberg,
+# apuntando al catálogo Iceberg-REST integrado de Nessie (http://nessie:19120/iceberg).
+# Esto preserva la semántica real de las tablas Iceberg (esquemas, columnas) y lee el mismo
+# almacén Nessie en el que escribe Spark. OM 1.12.1 OSS no tiene conector de Dremio (solo Collate),
+# así que el catálogo Iceberg REST es la vía nativa de OSS para estas tablas.
+# Los secretos (__MINIO_KEY__, __MINIO_SECRET__, __OM_JWT__) los inyecta en tiempo de ejecución
+# run_ingestion.sh desde .env.
 source:
   type: iceberg
   serviceName: iceberg_lakehouse
@@ -13,14 +13,14 @@ source:
       type: Iceberg
       catalog:
         name: nessie
-        databaseName: nessie            # logical DB name surfaced in OpenMetadata
+        databaseName: nessie            # nombre lógico de BD que se muestra en OpenMetadata
         connection:
-          uri: http://nessie:19120/iceberg          # Nessie Iceberg-REST base (prefix=main via /config)
-          # OM's catalog.connection is a non-discriminated union [Hive, Rest, ...] and
-          # both Hive and Rest only require `uri`, so {uri, fileSystem} alone resolves to
-          # Hive (→ a hung Thrift metastore call). A Rest-only field disambiguates it to
-          # RestCatalogConnection. Nessie's REST catalog has no auth, so it ignores this
-          # bearer token — it exists purely to select the REST connection type.
+          uri: http://nessie:19120/iceberg          # base Iceberg-REST de Nessie (prefix=main vía /config)
+          # catalog.connection de OM es una unión no discriminada [Hive, Rest, ...] y
+          # tanto Hive como Rest solo requieren `uri`, así que {uri, fileSystem} por sí solo se resuelve a
+          # Hive (→ una llamada colgada al metastore Thrift). Un campo exclusivo de Rest lo desambigua a
+          # RestCatalogConnection. El catálogo REST de Nessie no tiene autenticación, así que ignora este
+          # token bearer — existe únicamente para seleccionar el tipo de conexión REST.
           token: nessie-no-auth
           fileSystem:
             type:

@@ -30,8 +30,8 @@ BRONZE_ZONE_SCHEMA = StructType([
 def validate_ingestion(spark, expected_count: int) -> None:
     actual = spark.table(TABLE).count()
     if actual != expected_count:
-        raise ValueError(f"Expected {expected_count} records, got {actual}")
-    print(f"  Validation passed: {actual} records")
+        raise ValueError(f"Se esperaban {expected_count} registros, se obtuvieron {actual}")
+    print(f"  Validación superada: {actual} registros")
 
 
 def main() -> None:
@@ -39,15 +39,15 @@ def main() -> None:
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         dest = DOWNLOAD_DIR / "taxi_zone_lookup.csv"
 
-        print(f"\n[1/2] Downloading {ZONE_LOOKUP_URL}")
+        print(f"\n[1/2] Descargando {ZONE_LOOKUP_URL}")
         try:
             urlretrieve(ZONE_LOOKUP_URL, dest)
             print(f"  -> {os.path.getsize(dest) / 1024:.1f} KB")
         except OSError as e:
-            print(f"  FAILED: {e}")
+            print(f"  FALLÓ: {e}")
             sys.exit(1)
 
-        print("\n[2/2] Ingesting zone lookup (WAP: branch -> validate -> merge)\n")
+        print("\n[2/2] Ingestando tabla de zonas (WAP: rama -> validar -> fusionar)\n")
         spark = get_spark(app_name="bronze-ingest-zone-lookup")
         nessie.ensure_persistent_branches(spark=spark)
         spark = nessie.set_spark_branch(spark=spark, branch="bronze")
@@ -61,7 +61,7 @@ def main() -> None:
             layer="bronze", table="taxi_zone_lookup", year=today.year,
         )
 
-        print(f"  Creating branch '{branch_name}' from bronze")
+        print(f"  Creando rama '{branch_name}' desde bronze")
         nessie.create_branch(spark=spark, name=branch_name, from_ref="bronze")
         spark = nessie.set_spark_branch(spark=spark, branch=branch_name)
 
@@ -74,7 +74,7 @@ def main() -> None:
                 .csv(str(dest))
             )
             count = df.count()
-            print(f"  Records: {count}")
+            print(f"  Registros: {count}")
             spark.sql(f"""
                 CREATE TABLE IF NOT EXISTS {TABLE} (
                     {schema_to_ddl(BRONZE_ZONE_SCHEMA)}
@@ -89,10 +89,10 @@ def main() -> None:
 
             validate_ingestion(spark=spark, expected_count=count)
 
-            print(f"  Merging '{branch_name}' -> bronze")
+            print(f"  Fusionando '{branch_name}' -> bronze")
             nessie.merge_branch(spark=spark, source=branch_name, into="bronze")
 
-            print(f"  Creating tag '{tag_name}'")
+            print(f"  Creando tag '{tag_name}'")
             nessie.create_tag(spark=spark, name=tag_name, from_ref="bronze")
             nessie.drop_branch(spark=spark, name=branch_name)
 
@@ -102,7 +102,7 @@ def main() -> None:
         finally:
             spark = nessie.set_spark_branch(spark=spark, branch="bronze")
 
-        print(f"\nDone. Zone lookup written to {TABLE}")
+        print(f"\nHecho. Tabla de zonas escrita en {TABLE}")
         nessie.print_references(spark=spark)
         spark.stop()
     finally:

@@ -23,7 +23,7 @@ def create_branch(spark: SparkSession, name: str, from_ref: str = "main") -> Non
 
 def drop_branch(spark: SparkSession, name: str) -> None:
     if name in PERSISTENT_BRANCHES:
-        raise ValueError(f"Cannot drop persistent branch '{name}'")
+        raise ValueError(f"No se puede eliminar la rama persistente '{name}'")
     spark.sql(f"DROP BRANCH IF EXISTS `{name}` IN nessie")
 
 
@@ -34,9 +34,9 @@ def merge_branch(spark: SparkSession, source: str, into: str = "main") -> None:
         # Historial de Nessie obsoleto → reset manual (docker compose down -v y reiniciar).
         if "No common ancestor" in str(e):
             raise RuntimeError(
-                f"Cannot merge '{source}' into '{into}': no common ancestor. "
-                f"Nessie likely has stale history from a previous instance. "
-                f"Fix: docker compose down -v (removes the nessie_data volume), then restart."
+                f"No se puede fusionar '{source}' en '{into}': sin ancestro común. "
+                f"Nessie probablemente arrastra historial obsoleto de una instancia anterior. "
+                f"Solución: docker compose down -v (elimina el volumen nessie_data) y reinicia."
             ) from e
         raise
 
@@ -47,9 +47,9 @@ def ensure_persistent_branches(spark: SparkSession) -> None:
         if branch == "main":
             continue
         if ref_exists(spark, branch):
-            print(f"  Persistent branch '{branch}' already exists")
+            print(f"  La rama persistente '{branch}' ya existe")
         else:
-            print(f"  Creating persistent branch '{branch}' from main")
+            print(f"  Creando rama persistente '{branch}' desde main")
             create_branch(spark, branch, from_ref="main")
         set_spark_branch(spark, branch)
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NAMESPACE}")
@@ -108,7 +108,7 @@ def print_references(spark: SparkSession) -> None:
     refs_df = spark.sql("LIST REFERENCES IN nessie")
     rows = refs_df.collect()
     if not rows:
-        print("  No references found.")
+        print("  No se encontraron referencias.")
         return
     columns = refs_df.columns
     for ref in rows:

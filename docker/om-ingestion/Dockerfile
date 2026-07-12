@@ -2,7 +2,7 @@ FROM docker.getcollate.io/openmetadata/ingestion:1.12.1
 
 RUN pip install --no-cache-dir "mlflow-skinny==2.22.1"
 
-# Select the latest version by timestamp
+# Selecciona la última versión por marca de tiempo
 
 RUN python - <<'PY'
 import pathlib, re

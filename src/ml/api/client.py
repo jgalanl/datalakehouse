@@ -20,8 +20,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("use_case", nargs="?", default="fare", choices=sorted(EXAMPLES),
-                    help="which example payload to send (default: fare)")
-    ap.add_argument("--json", help="custom dataframe_split payload (overrides use_case)")
+                    help="qué payload de ejemplo enviar (por defecto: fare)")
+    ap.add_argument("--json", help="payload dataframe_split propio (anula use_case)")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=5001)
     args = ap.parse_args()
@@ -38,9 +38,9 @@ def main():
             print(json.dumps(json.load(resp), indent=2))
     except urllib.error.HTTPError as e:
         # MLflow devuelve el motivo del fallo en el cuerpo de la respuesta; lo mostramos.
-        sys.exit(f"HTTP {e.code} from {url}: {e.read().decode(errors='replace')}")
+        sys.exit(f"HTTP {e.code} desde {url}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
-        sys.exit(f"Could not reach {url}: {e.reason} (is the `api` profile up?)")
+        sys.exit(f"No se pudo conectar con {url}: {e.reason} (¿está activo el perfil `api`?)")
 
 
 if __name__ == "__main__":

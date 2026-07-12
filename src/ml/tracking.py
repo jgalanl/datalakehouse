@@ -50,15 +50,15 @@ def setup_mlflow(experiment_name: str) -> None:
         artifact_location = f"{MLFLOW_ARTIFACT_ROOT}/{experiment_name}"
         client.create_experiment(experiment_name, artifact_location=artifact_location)
         progress(
-            f"Created MLflow experiment '{experiment_name}' at {artifact_location}."
+            f"Experimento MLflow '{experiment_name}' creado en {artifact_location}."
         )
     elif exp.lifecycle_stage == "deleted":
         client.restore_experiment(exp.experiment_id)
-        progress(f"Restored soft-deleted MLflow experiment '{experiment_name}'.")
+        progress(f"Restaurado el experimento MLflow borrado lógicamente '{experiment_name}'.")
     mlflow.set_experiment(experiment_name)
 
 
-# ----- Evaluación -----------------------------------------------------------
+# --- Evaluación ---
 
 REGRESSION_METRICS: tuple[str, ...] = ("rmse", "mae", "r2")
 
@@ -112,7 +112,7 @@ def log_input_datasets(input_datasets: list[DatasetInput] | None) -> None:
         mlflow.log_input(dataset, context=context)
 
 
-# ----- Utilidades de entrenamiento ------------------------------------------
+# --- Utilidades de entrenamiento ---
 
 def train_and_log_run(
     *,
@@ -133,10 +133,10 @@ def train_and_log_run(
         if extra_params:
             mlflow.log_params(extra_params)
 
-        progress(f"  [{run_name}] fitting ({len(pipeline.getStages())} stages)...")
+        progress(f"  [{run_name}] entrenando ({len(pipeline.getStages())} etapas)...")
         t0 = time.perf_counter()
         model = pipeline.fit(splits["train"])
-        progress(f"  [{run_name}] fit done in {time.perf_counter() - t0:.1f}s")
+        progress(f"  [{run_name}] entrenamiento hecho en {time.perf_counter() - t0:.1f}s")
 
         all_metrics: dict[str, dict[str, float]] = {}
         for split_name, split_df in splits.items():
@@ -150,12 +150,12 @@ def train_and_log_run(
                 f"({time.perf_counter() - t1:.1f}s)"
             )
 
-        progress(f"  [{run_name}] logging model...")
+        progress(f"  [{run_name}] registrando modelo...")
         t2 = time.perf_counter()
         mlflow.spark.log_model(
             model, artifact_path="model", pip_requirements=MODEL_PIP_REQUIREMENTS,
         )
-        progress(f"  [{run_name}] model logged in {time.perf_counter() - t2:.1f}s")
+        progress(f"  [{run_name}] modelo registrado en {time.perf_counter() - t2:.1f}s")
     return run_id, all_metrics, model
 
 
@@ -211,8 +211,8 @@ def tune_with_cv(
         for i in range(num_folds):
             fold_t = time.perf_counter()
             progress(
-                f"  [{run_name}] fold {i + 1}/{num_folds}: fitting feature "
-                f"stages + caching fold features..."
+                f"  [{run_name}] fold {i + 1}/{num_folds}: entrenando etapas de features "
+                f"+ cacheando features del fold..."
             )
             val_fold = folds[i]
             train_fold = reduce(
@@ -229,16 +229,16 @@ def tune_with_cv(
                 tr_n = train_feat.count()
                 vl_n = val_feat.count()
                 progress(
-                    f"  [{run_name}] fold {i + 1}/{num_folds}: features ready "
-                    f"(train {tr_n:,} / val {vl_n:,} rows); training "
-                    f"{len(param_list)} grid point(s), {CV_PARALLELISM} at a time..."
+                    f"  [{run_name}] fold {i + 1}/{num_folds}: features listas "
+                    f"(train {tr_n:,} / val {vl_n:,} filas); entrenando "
+                    f"{len(param_list)} punto(s) de grid, {CV_PARALLELISM} a la vez..."
                 )
 
                 def _fit_eval(item):
                     idx, params = item
                     progress(
                         f"    [{run_name}] fold {i + 1} · grid "
-                        f"{idx + 1}/{len(param_list)}: training start {params}"
+                        f"{idx + 1}/{len(param_list)}: inicio entrenamiento {params}"
                     )
                     pt = time.perf_counter()
                     pm = {estimator.getParam(k): v for k, v in params.items()}
@@ -246,7 +246,7 @@ def tune_with_cv(
                     rmse = evaluator.evaluate(model.transform(val_feat))
                     progress(
                         f"    [{run_name}] fold {i + 1} · grid "
-                        f"{idx + 1}/{len(param_list)}: done val_rmse={rmse:.4f} "
+                        f"{idx + 1}/{len(param_list)}: hecho val_rmse={rmse:.4f} "
                         f"({time.perf_counter() - pt:.1f}s)"
                     )
                     return idx, rmse
@@ -260,7 +260,7 @@ def tune_with_cv(
                 train_feat.unpersist()
                 val_feat.unpersist()
             progress(
-                f"  [{run_name}] fold {i + 1}/{num_folds} done "
+                f"  [{run_name}] fold {i + 1}/{num_folds} hecho "
                 f"({time.perf_counter() - fold_t:.1f}s)"
             )
 
@@ -268,8 +268,8 @@ def tune_with_cv(
         best_idx = min(range(len(avg_metrics)), key=lambda i: avg_metrics[i])
         best_params = param_list[best_idx]
         progress(
-            f"  [{run_name}] CV done in {time.perf_counter() - t0:.1f}s — "
-            f"winner grid {best_idx + 1}/{len(param_list)} "
+            f"  [{run_name}] CV hecho en {time.perf_counter() - t0:.1f}s — "
+            f"ganador grid {best_idx + 1}/{len(param_list)} "
             f"avg_val_rmse={avg_metrics[best_idx]:.4f} {best_params}"
         )
 
@@ -281,12 +281,12 @@ def tune_with_cv(
             mlflow.log_param(f"best_{k}", v)
 
         # bestModel: reentrenamos el pipeline entero sobre todo train_df con los mejores parámetros.
-        progress(f"  [{run_name}] refitting bestModel on full train...")
+        progress(f"  [{run_name}] reentrenando bestModel sobre todo train...")
         refit_t = time.perf_counter()
         best_model = pipeline_factory(algorithm, best_params).fit(train_df)
         progress(
-            f"  [{run_name}] bestModel refit in {time.perf_counter() - refit_t:.1f}s; "
-            f"evaluating on {len(eval_splits)} split(s)..."
+            f"  [{run_name}] bestModel reentrenado en {time.perf_counter() - refit_t:.1f}s; "
+            f"evaluando sobre {len(eval_splits)} split(s)..."
         )
 
         all_metrics: dict[str, dict[str, float]] = {}
@@ -300,7 +300,7 @@ def tune_with_cv(
                 f"r2={metrics['r2']:.4f}"
             )
 
-        progress(f"  [{run_name}] logging best model...")
+        progress(f"  [{run_name}] registrando mejor modelo...")
         mlflow.spark.log_model(
             best_model, artifact_path="model",
             pip_requirements=MODEL_PIP_REQUIREMENTS,
@@ -309,7 +309,7 @@ def tune_with_cv(
     return run_id, best_params, all_metrics, best_model
 
 
-# ----- Baseline -------------------------------------------------------------
+# --- Baseline ---
 
 def _fit_baseline_predictor(
     train_df: DataFrame, label_col: str, group_cols: list[str],
@@ -378,7 +378,7 @@ def log_baseline_run(
 ) -> dict[str, float]:
     """Entrena con `train_df` y luego puntúa y registra cada split para que el run lleve
     el mismo conjunto de métricas que los runs de modelos. Devuelve las métricas de common_test."""
-    progress(f"  [baseline] fitting mean-per-group predictor on {group_cols}...")
+    progress(f"  [baseline] entrenando predictor media-por-grupo sobre {group_cols}...")
     group_means, global_mean = _fit_baseline_predictor(
         train_df, label_col, group_cols,
     )
@@ -407,7 +407,7 @@ def log_baseline_run(
     return per_split.get("common_test", next(iter(per_split.values())))
 
 
-# ----- Latencia de inferencia -----------------------------------------------
+# --- Latencia de inferencia ---
 
 def measure_inference_latency(
     model,
@@ -432,7 +432,7 @@ def measure_inference_latency(
         sample.unpersist()
 
 
-# ----- Registro de modelos --------------------------------------------------
+# --- Registro de modelos ---
 
 def prune_old_versions(
     client: MlflowClient,
@@ -465,12 +465,12 @@ def prune_old_versions(
             client.delete_model_version(name=name, version=v.version)
             deleted.append(v.version)
             print(
-                f"  Pruned v{v.version} from {name} "
-                f"(retain {len(keep)} versions: top {keep_recent} most recent "
-                f"+ aliased)"
+                f"  Podada v{v.version} de {name} "
+                f"(se conservan {len(keep)} versiones: top {keep_recent} más recientes "
+                f"+ con alias)"
             )
         except MlflowException as e:
-            print(f"  Failed to prune v{v.version}: {e}")
+            print(f"  No se pudo podar v{v.version}: {e}")
     return deleted
 
 
@@ -517,9 +517,9 @@ def register_candidates(
     registered: dict[str, "mlflow.entities.model_registry.ModelVersion"] = {}
     for n, c in enumerate(candidates, start=1):
         progress(
-            f"  Registering candidate {n}/{len(candidates)} "
-            f"({c.get('run_name', c['run_id'])}) as a new version of {name} "
-            f"(waiting for READY)..."
+            f"  Registrando candidato {n}/{len(candidates)} "
+            f"({c.get('run_name', c['run_id'])}) como nueva versión de {name} "
+            f"(esperando READY)..."
         )
         mv = mlflow.register_model(
             model_uri=f"runs:/{c['run_id']}/model",
@@ -539,7 +539,7 @@ def register_candidates(
                 name=name, version=mv.version, key=k, value=str(v),
             )
         registered[c["run_id"]] = mv
-        progress(f"  Candidate {n}/{len(candidates)} registered as v{mv.version}.")
+        progress(f"  Candidato {n}/{len(candidates)} registrado como v{mv.version}.")
 
     def _set_status(version: str, status: str) -> None:
         client.set_model_version_tag(
@@ -566,22 +566,22 @@ def register_candidates(
         if cur_champ_version is not None:
             _set_status(cur_champ_version, "challenger")
             print(
-                f"  v{contender_mv.version} promoted to @champion "
+                f"  v{contender_mv.version} promovida a @champion "
                 f"({promotion_metric} {contender_metric:.4f} < "
-                f"v{cur_champ_version}'s {cur_champ_metric:.4f}); "
-                f"v{cur_champ_version} tagged validation_status=challenger"
+                f"el de v{cur_champ_version} {cur_champ_metric:.4f}); "
+                f"v{cur_champ_version} etiquetada validation_status=challenger"
             )
         else:
             print(
-                f"  v{contender_mv.version} set as @champion "
-                f"(first version of {name})"
+                f"  v{contender_mv.version} establecida como @champion "
+                f"(primera versión de {name})"
             )
     else:
         # Ya quedó etiquetado como challenger arriba, así que dejamos el tag como está.
         print(
-            f"  v{contender_mv.version} stays as challenger "
+            f"  v{contender_mv.version} se queda como challenger "
             f"({promotion_metric} {contender_metric:.4f} >= "
-            f"v{cur_champ_version}'s {cur_champ_metric:.4f})"
+            f"el de v{cur_champ_version} {cur_champ_metric:.4f})"
         )
 
     # Apuntamos @challenger al mejor candidato que no sea champion de esta ejecución.
@@ -621,8 +621,8 @@ def register_candidates(
             key="inference_latency_total_s", value=f"{elapsed_s:.3f}",
         )
         print(
-            f"  v{contender_mv.version} inference latency: "
-            f"{ms_per_row:.3f} ms/row on n={n} (total {elapsed_s:.2f}s)"
+            f"  v{contender_mv.version} latencia de inferencia: "
+            f"{ms_per_row:.3f} ms/fila en n={n} (total {elapsed_s:.2f}s)"
         )
 
     # Mantenemos el registro pequeño; las versiones con alias sobreviven a la poda.

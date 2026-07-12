@@ -32,8 +32,8 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
     pandas==2.2.3 \
     numpy==1.26.4
 
-# JARs (one layer): Iceberg runtime, Nessie SQL extensions, AWS SDK bundle, 
-# and hadoop-aws
+# JARs (una sola capa): runtime de Iceberg, extensiones SQL de Nessie, bundle del AWS SDK
+# y hadoop-aws
 WORKDIR /opt/spark/jars
 RUN curl -fSL https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar -o iceberg-spark-runtime.jar && \
     curl -fSL https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/${NESSIE_VERSION}/nessie-spark-extensions-3.5_2.12-${NESSIE_VERSION}.jar -o nessie-spark-extensions.jar && \
@@ -51,7 +51,7 @@ USER spark
 WORKDIR /opt/spark
 CMD ["spark-class", "org.apache.spark.deploy.master.Master"]
 
-# --- app: spark-master and model-server
+# --- app: spark-master y model-server
 FROM base AS app
 USER root
 RUN pip install --no-cache-dir \

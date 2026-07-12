@@ -1,5 +1,5 @@
 services:
-  # --- Storage: MinIO (S3) and bucket init ---
+  # --- Almacenamiento: MinIO (S3) e inicialización de buckets ---
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: minio
@@ -30,7 +30,7 @@ services:
         reservations:
           memory: 384M
     labels:
-      service: storage
+      service: storagef
       component: minio
 
   minio-init:
@@ -65,7 +65,7 @@ services:
       service: storage
       component: minio-init
 
-  # --- Catalog: Nessie (Iceberg metadata) ---
+  # --- Catálogo: Nessie (metadatos de Iceberg) ---
   nessie-init:
     image: alpine:3.21
     container_name: nessie-init
@@ -125,7 +125,7 @@ services:
       service: catalog
       component: nessie
 
-  # --- Query engine: Dremio OSS ---
+  # --- Motor de consulta: Dremio OSS ---
   dremio:
     image: dremio/dremio-oss:25.2.0
     container_name: dremio
@@ -165,7 +165,7 @@ services:
       service: query_engine
       component: dremio
 
-  # --- Compute: Spark (master, notebook and two workers) ---
+  # --- Cómputo: Spark (master, notebook y dos workers) ---
   spark-master:
     build:
       context: ./docker/spark
@@ -347,7 +347,7 @@ services:
       service: compute
       component: spark-worker
 
-  # --- ML operations: MLflow (postgres, tracking server and model serving) ---
+  # --- Operaciones de ML: MLflow (postgres, servidor de tracking y serving del modelo) ---
   mlflow-postgres:
     profiles: ["ml", "governance", "api"]
     image: postgres:16-alpine
@@ -468,7 +468,7 @@ services:
       service: ml_operations
       component: model-server
 
-  # --- Governance: OpenMetadata (postgres, elasticsearch, migrate and server) ---
+  # --- Gobernanza: OpenMetadata (postgres, elasticsearch, migrate y servidor) ---
   openmetadata-postgres:
     profiles: ["governance"]
     container_name: openmetadata-postgres

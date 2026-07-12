@@ -6,11 +6,8 @@ from pyspark.sql.functions import col, cos as spark_cos, lit, sin as spark_sin
 from pyspark.sql.types import DoubleType
 
 
-
 TEST_YEAR: int = 2025
 TRAIN_VAL_YEARS: list[int] = [2023, 2024]
-
-
 SUBSET_A_YEARS: list[int] = [2023]
 
 # Reparticionamos para que cada bloque columnar cacheado quepa en un executor de 3 GB.

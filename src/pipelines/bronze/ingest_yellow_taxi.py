@@ -68,13 +68,13 @@ def download_one(url: str, name: str) -> Path | None:
         print(f"      -> {os.path.getsize(dest) / 1024 / 1024:.1f} MB")
         return dest
     except OSError as e:
-        print(f"      FAILED: {e}")
+        print(f"      FALLÓ: {e}")
         return None
 
 
 def compare_schemas(schemas: dict[str, pq.ParquetSchema]) -> str:
     if len(schemas) < 2:
-        return "Not enough files to compare schemas.\n"
+        return "No hay ficheros suficientes para comparar esquemas.\n"
 
     names = sorted(schemas)
     ref_name, ref_schema = names[0], schemas[names[0]]
@@ -82,11 +82,11 @@ def compare_schemas(schemas: dict[str, pq.ParquetSchema]) -> str:
 
     lines = [
         "=" * 80,
-        "NYC TLC Yellow Taxi — Schema Comparison Report",
-        f"Generated: {datetime.now().isoformat()}",
-        f"Reference: {ref_name}  |  Files compared: {len(names)}",
+        "NYC TLC Yellow Taxi — Informe de comparación de esquemas",
+        f"Generado: {datetime.now().isoformat()}",
+        f"Referencia: {ref_name}  |  Ficheros comparados: {len(names)}",
         "=" * 80,
-        f"\n--- Reference schema ({ref_name}) ---",
+        f"\n--- Esquema de referencia ({ref_name}) ---",
     ]
     for i, field in enumerate(ref_schema, 1):
         lines.append(f"  {i:>2}. {field.name:<35} {field.type}")
@@ -110,7 +110,7 @@ def compare_schemas(schemas: dict[str, pq.ParquetSchema]) -> str:
             lines.append(f"  ~ {c:<35} {ref_fields[c]} -> {curr[c]}")
 
     if not any_diff:
-        lines.append("\nAll files share the same schema.")
+        lines.append("\nTodos los ficheros comparten el mismo esquema.")
     lines.append("\n" + "=" * 80)
     return "\n".join(lines) + "\n"
 
@@ -119,7 +119,7 @@ def save_schema_report(schemas: dict[str, pq.ParquetSchema]) -> None:
     report = compare_schemas(schemas)
     print(report)
     SCHEMA_REPORT_PATH.write_text(report, encoding="utf-8")
-    print(f"  Report saved to {SCHEMA_REPORT_PATH}")
+    print(f"  Informe guardado en {SCHEMA_REPORT_PATH}")
 
 
 def normalize_df(spark: SparkSession, path: Path) -> DataFrame:
@@ -163,7 +163,7 @@ def validate_ingestion(
     extra = actual_cols - required_cols - evolved_cols
     if missing or extra:
         raise ValueError(
-            f"Column mismatch. Missing: {missing or 'none'}, extra: {extra or 'none'}"
+            f"Discrepancia de columnas. Faltan: {missing or 'ninguna'}, sobran: {extra or 'ninguna'}"
         )
 
     # Validamos solo el delta del append: la tabla acumula los meses anteriores ya
@@ -173,23 +173,23 @@ def validate_ingestion(
     appended = table_df.count() - prev_count
     if appended != expected_count:
         raise ValueError(
-            f"Appended {appended:,} rows, expected {expected_count:,}"
+            f"Se añadieron {appended:,} filas, se esperaban {expected_count:,}"
         )
 
-    print(f"  Validation passed: {appended:,} records appended, "
-          f"{len(table_df.columns)} columns")
+    print(f"  Validación superada: {appended:,} registros añadidos, "
+          f"{len(table_df.columns)} columnas")
 
 
 def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
     label = f"{year}-{month:02d}"
-    print(f"\n  [{label}] Reading and normalizing...")
+    print(f"\n  [{label}] Leyendo y normalizando...")
     df = normalize_df(spark, path)
     has_cbd = "cbd_congestion_fee" in df.columns
     count = pq.read_metadata(str(path)).num_rows
-    print(f"  [{label}] {count:,} records")
+    print(f"  [{label}] {count:,} registros")
 
     if not table_exists(spark):
-        print(f"  [{label}] Creating table {TABLE}")
+        print(f"  [{label}] Creando tabla {TABLE}")
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
         spark.sql(f"""
             CREATE TABLE {TABLE} (
@@ -204,12 +204,12 @@ def ingest_month(spark: SparkSession, path: Path, year: int, month: int) -> int:
         """)
 
     if has_cbd and "cbd_congestion_fee" not in spark.table(TABLE).columns:
-        print(f"  [{label}] Schema evolution: adding cbd_congestion_fee")
+        print(f"  [{label}] Evolución de esquema: añadiendo cbd_congestion_fee")
         spark.sql(f"ALTER TABLE {TABLE} ADD COLUMNS (cbd_congestion_fee double)")
-    print(f"  [{label}] Appending to {TABLE}")
+    print(f"  [{label}] Añadiendo a {TABLE}")
     df.writeTo(TABLE).append()
 
-    print(f"  [{label}] Done ({count:,} records)")
+    print(f"  [{label}] Hecho ({count:,} registros)")
     return count
 
 
@@ -242,7 +242,7 @@ def main():
             label = f"{year}-{month:02d}"
             branch_name = nessie.wap_branch_name("bronze", "yellow_taxi", year, month)
 
-            print(f"\n  [{label}] Downloading...")
+            print(f"\n  [{label}] Descargando...")
             path = download_one(url, name)
             if path is None:
                 continue
@@ -251,36 +251,36 @@ def main():
                 schemas[name] = pq.read_schema(str(path))
 
                 if nessie.ref_exists(spark, branch_name):
-                    print(f"  Dropping stale WAP branch '{branch_name}'")
+                    print(f"  Eliminando rama WAP obsoleta '{branch_name}'")
                     nessie.drop_branch(spark, branch_name)
 
-                print(f"  Creating WAP branch '{branch_name}' from bronze")
+                print(f"  Creando rama WAP '{branch_name}' desde bronze")
                 count = wap_ingest(spark, path, year, month, branch_name)
                 nessie.drop_branch(spark, branch_name)
 
                 if month == MONTHS[-1]:
                     tag_name = nessie.yearly_tag_name("bronze", "yellow_taxi", year)
-                    print(f"  Creating tag '{tag_name}'")
+                    print(f"  Creando tag '{tag_name}'")
                     nessie.create_tag(spark, tag_name, from_ref="bronze")
 
                 total_records += count
                 ingested += 1
             except Exception:
-                print(f"\n  [{label}] Ingestion failed. "
-                      f"WAP branch '{branch_name}' preserved for inspection.")
+                print(f"\n  [{label}] Ingesta fallida. "
+                      f"Rama WAP '{branch_name}' conservada para inspección.")
                 raise
             finally:
                 path.unlink(missing_ok=True)
 
         if ingested == 0:
-            print("No files downloaded. Exiting.")
+            print("No se descargó ningún fichero. Saliendo.")
             sys.exit(1)
 
-        print("\n  Schema comparison report\n")
+        print("\n  Informe de comparación de esquemas\n")
         save_schema_report(schemas)
 
-        print(f"\nDone. {ingested} months ingested -> {TABLE} ({total_records:,} records)")
-        print("\nNessie references after ingestion:")
+        print(f"\nHecho. {ingested} meses ingestados -> {TABLE} ({total_records:,} registros)")
+        print("\nReferencias Nessie tras la ingesta:")
         nessie.print_references(spark)
         spark.stop()
     finally:

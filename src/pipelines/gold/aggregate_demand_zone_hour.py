@@ -111,16 +111,16 @@ def validate(
 ) -> tuple[bool, str]:
     """Auditoría: la agregación debe conservar el total de viajes y no tener zonas nulas."""
     if gold_count == 0:
-        return False, "gold empty after aggregation"
+        return False, "gold vacío tras la agregación"
     if total_pickups != silver_count:
         return False, (
-            f"pickup conservation broken: silver={silver_count:,} "
+            f"conservación de pickups rota: silver={silver_count:,} "
             f"sum(n_pickups)={total_pickups:,}"
         )
     if null_zone_count > MAX_NULL_ZONE_ROWS:
-        return False, f"{null_zone_count:,} rows have NULL zone after join"
+        return False, f"{null_zone_count:,} filas con zona NULL tras el join"
     return True, (
-        f"{gold_count:,} (zone, hour) groups, {total_pickups:,} pickups conserved"
+        f"{gold_count:,} grupos (zona, hora), {total_pickups:,} pickups conservados"
     )
 
 
@@ -140,11 +140,11 @@ def wap_aggregate(
             (spark_month(col("tpep_pickup_datetime")) == m)
         )
         silver_count = trips.count()
-        print(f"  [{label}] Silver: {silver_count:,} rows")
+        print(f"  [{label}] Silver: {silver_count:,} filas")
 
         if silver_count == 0:
-            print(f"  [{label}] No silver data for this month, skipping")
-            return 0, 0, True, "no silver data"
+            print(f"  [{label}] Sin datos silver este mes, se omite")
+            return 0, 0, True, "sin datos silver"
 
         gold_df = transform(trips, zones).cache()
         try:
@@ -159,15 +159,15 @@ def wap_aggregate(
             total_pickups = stats["total_pickups"] or 0
             null_zone_count = stats["null_zone_count"] or 0
             print(
-                f"  [{label}] After aggregation: {gold_count:,} (zone, hour) groups, "
-                f"{total_pickups:,} pickups, {null_zone_count:,} NULL zone"
+                f"  [{label}] Tras la agregación: {gold_count:,} grupos (zona, hora), "
+                f"{total_pickups:,} pickups, {null_zone_count:,} zona NULL"
             )
 
             nessie.set_spark_branch(spark, branch_name)
             spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             if not table_exists(spark):
-                print(f"  [{label}] Creating table {TARGET}")
+                print(f"  [{label}] Creando tabla {TARGET}")
                 spark.sql(f"""
                     CREATE TABLE {TARGET} (
                         {schema_to_ddl(GOLD_SCHEMA)}
@@ -179,7 +179,7 @@ def wap_aggregate(
                         'write.spark.check-nullability' = 'false'
                     )
                 """)
-            print(f"  [{label}] Appending to {TARGET}")
+            print(f"  [{label}] Añadiendo a {TARGET}")
             gold_df.writeTo(TARGET).append()
         finally:
             gold_df.unpersist()
@@ -188,10 +188,10 @@ def wap_aggregate(
             silver_count, gold_count, total_pickups, null_zone_count
         )
         if passed:
-            print(f"  [{label}] Audit passed: {reason}")
+            print(f"  [{label}] Auditoría superada: {reason}")
             nessie.merge_branch(spark, source=branch_name, into="main")
         else:
-            print(f"  [{label}] Audit FAILED: {reason}")
+            print(f"  [{label}] Auditoría FALLIDA: {reason}")
         return silver_count, gold_count, passed, reason
     finally:
         nessie.set_spark_branch(spark, "main")
@@ -213,10 +213,10 @@ def main():
             )
 
             if nessie.ref_exists(spark, branch_name):
-                print(f"  Dropping stale WAP branch '{branch_name}'")
+                print(f"  Eliminando rama WAP obsoleta '{branch_name}'")
                 nessie.drop_branch(spark, branch_name)
 
-            print(f"\n  [{label}] WAP aggregate (branch: {branch_name})")
+            print(f"\n  [{label}] Agregación WAP (rama: {branch_name})")
             silver_count, gold_count, passed, reason = wap_aggregate(
                 spark, year_val, m, branch_name
             )
@@ -225,7 +225,7 @@ def main():
                 review_tag = nessie.review_tag_name(
                     "gold", "pickup_demand_zone_hour", year_val, m
                 )
-                print(f"  [{label}] Quarantining as tag '{review_tag}'")
+                print(f"  [{label}] Poniendo en cuarentena como tag '{review_tag}'")
                 nessie.create_tag(spark, review_tag, from_ref=branch_name)
                 nessie.drop_branch(spark, branch_name)
                 quarantined.append((label, review_tag, reason))
@@ -245,22 +245,22 @@ def main():
             tag_name = nessie.yearly_tag_name(
                 "gold", "pickup_demand_zone_hour", year_val
             )
-            print(f"  Creating tag '{tag_name}' ({merged_in_year} month(s) merged)")
+            print(f"  Creando tag '{tag_name}' ({merged_in_year} mes(es) fusionado(s))")
             nessie.create_tag(spark, tag_name, from_ref="main")
 
     if processed == 0 and not quarantined:
-        print("No months processed. Is silver populated?")
+        print("No se procesó ningún mes. ¿Está silver poblado?")
         sys.exit(1)
 
-    print(f"\nDone. {processed} months merged -> {TARGET}")
-    print(f"  Silver trips: {total_silver:,}  Gold (zone, hour) groups: {total_gold:,}")
+    print(f"\nHecho. {processed} meses fusionados -> {TARGET}")
+    print(f"  Viajes silver: {total_silver:,}  Grupos gold (zona, hora): {total_gold:,}")
 
     if quarantined:
-        print(f"\nQuarantined months ({len(quarantined)}) — NOT merged to main:")
+        print(f"\nMeses en cuarentena ({len(quarantined)}) — NO fusionados a main:")
         for qlabel, qtag, qreason in quarantined:
             print(f"  [{qlabel}] {qtag}: {qreason}")
 
-    print("\nNessie references after gold ETL:")
+    print("\nReferencias Nessie tras el ETL gold:")
     nessie.print_references(spark)
     spark.stop()
 

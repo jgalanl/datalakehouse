@@ -128,7 +128,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, bool]:
     positional = [a for a in argv if not a.startswith("--")]
     if len(positional) != 1 or positional[0] not in USE_CASES:
         names = "|".join(USE_CASES)
-        print(f"Usage: spark-submit src/ml/train.py <{names}> [--fast]")
+        print(f"Uso: spark-submit src/ml/train.py <{names}> [--fast]")
         sys.exit(2)
     return positional[0], fast_mode_enabled(argv)
 
@@ -194,20 +194,20 @@ def main() -> None:
     full_grids = FAST_FULL_PARAM_GRIDS if fast else FULL_PARAM_GRIDS
     cv_folds = FAST_CV_NUM_FOLDS if fast else CV_NUM_FOLDS
 
-    progress(f"Starting Spark for use_case={use_case!r} fast={fast}...")
+    progress(f"Iniciando Spark para use_case={use_case!r} fast={fast}...")
     spark = get_ml_spark(app_name=cfg["app_name"])
     try:
-        progress("Spark ready. Configuring MLflow...")
+        progress("Spark listo. Configurando MLflow...")
         setup_mlflow(cfg["experiment"])
         if fast:
             progress(
-                f"FAST MODE — sampling {FAST_SAMPLE_FRACTION:.0%} of gold, "
-                "tiny grids/folds. Smoke test only; metrics not meaningful."
+                f"MODO RÁPIDO — muestreando {FAST_SAMPLE_FRACTION:.0%} de gold, "
+                "grids/folds mínimos. Solo prueba de humo; métricas sin valor."
             )
         else:
             progress(
-                f"Sampling {SAMPLE_FRACTION:.0%} of gold for training "
-                "(keeps CV cost bounded; per-fold rows still in the millions)."
+                f"Muestreando {SAMPLE_FRACTION:.0%} de gold para entrenar "
+                "(acota el coste del CV; cada fold sigue con millones de filas)."
             )
 
         # ---- Fase 0: descartamos las categóricas redundantes (derivables de location_id) ----
@@ -215,9 +215,9 @@ def main() -> None:
         cfg = {**cfg, "categorical_cols": [
             c for c in cfg["categorical_cols"] if c not in redundant
         ]}
-        print("\n=== Phase 0: dropping redundant categoricals ===")
-        print(f"  dropped: {redundant}")
-        print(f"  remaining categoricals: {cfg['categorical_cols']}")
+        print("\n=== Fase 0: descartando categóricas redundantes ===")
+        print(f"  descartadas: {redundant}")
+        print(f"  categóricas restantes: {cfg['categorical_cols']}")
 
         # ---- Carga + proyección + muestreo opcional + features cíclicas ----
         # Fijamos el estado de los datos (hash de main en Nessie + snapshot id del origen)
@@ -225,11 +225,11 @@ def main() -> None:
         nessie_main_hash = nessie.current_ref_hash(spark, "main") or ""
         source_snapshot_id = nessie.latest_snapshot_id(spark, cfg["source"])
         progress(
-            f"Pinned data state: nessie main={nessie_main_hash[:12] or 'unknown'}, "
+            f"Estado de datos fijado: nessie main={nessie_main_hash[:12] or 'unknown'}, "
             f"{cfg['source']} snapshot_id={source_snapshot_id}"
         )
 
-        progress(f"Reading {cfg['source']}...")
+        progress(f"Leyendo {cfg['source']}...")
         cols_to_keep = [cfg["label_col"], *cfg["numerical_cols"], *cfg["categorical_cols"]]
         df = spark.table(cfg["source"]).select(*cols_to_keep)
         if cfg["label_filter_predicate"] is not None:
@@ -243,13 +243,13 @@ def main() -> None:
         eval_splits: dict[str, DataFrame] = {"val": val, "common_test": common_test}
         splits: dict[str, DataFrame] = {"train": train, **eval_splits}
 
-        progress("Materializing cached splits...")
+        progress("Materializando splits cacheados...")
         split_counts: dict[str, int] = {}
         for name, split_df in splits.items():
             split_counts[name] = split_df.count()
-            progress(f"  {name}: {split_counts[name]:,} rows")
+            progress(f"  {name}: {split_counts[name]:,} filas")
         if split_counts["train"] == 0 or split_counts["val"] == 0:
-            print("Empty train or val. Is gold populated?")
+            print("train o val vacío. ¿Está gold poblado?")
             sys.exit(1)
 
         # Construimos los Datasets de entrada una vez y los reutilizamos entre runs (barato:
@@ -271,8 +271,8 @@ def main() -> None:
         }
 
         # ---- Baseline -----------------------------------------------------
-        print("\n=== Baseline: mean(label) per group ===")
-        progress("Baseline: scoring mean-per-group floor on every split...")
+        print("\n=== Baseline: media(label) por grupo ===")
+        progress("Baseline: puntuando el suelo media-por-grupo en cada split...")
         baseline_metrics = log_baseline_run(
             train_df=train,
             eval_splits=splits,
@@ -283,7 +283,7 @@ def main() -> None:
             extra_params=common_params,
             input_datasets=full_inputs,
         )
-        print(f"  Baseline on common_test: {baseline_metrics}")
+        print(f"  Baseline en common_test: {baseline_metrics}")
 
         # Única fuente de verdad para elegir al champion; cada fase va añadiendo.
         candidates: list[dict] = []
@@ -304,18 +304,18 @@ def main() -> None:
         # ---- Fase 1: Entrenamiento — CV completo por algoritmo -------------------
         # Un CV(k=cv_folds) por algoritmo sobre su grid completo; gana el algoritmo
         # cuyo bestModel del CV obtiene el menor val_rmse.
-        print(f"\n=== Phase 1: Training — CV(k={cv_folds}) per algorithm ===")
+        print(f"\n=== Fase 1: Entrenamiento — CV(k={cv_folds}) por algoritmo ===")
         progress(
-            f"Phase 1: tuning {len(ALGORITHMS)} algorithm(s) "
-            f"({', '.join(ALGORITHMS)}) with CV(k={cv_folds})."
+            f"Fase 1: ajustando {len(ALGORITHMS)} algoritmo(s) "
+            f"({', '.join(ALGORITHMS)}) con CV(k={cv_folds})."
         )
         for idx, algorithm in enumerate(ALGORITHMS, start=1):
             grid = full_grids[algorithm]
             run_name = f"train-{algorithm}"
-            print(f"\n--- {run_name} ({len(grid)} points) ---")
+            print(f"\n--- {run_name} ({len(grid)} puntos) ---")
             progress(
-                f"Phase 1 [{idx}/{len(ALGORITHMS)}]: starting tuning for "
-                f"'{algorithm}' over {len(grid)} grid point(s) × {cv_folds} folds."
+                f"Fase 1 [{idx}/{len(ALGORITHMS)}]: iniciando ajuste de "
+                f"'{algorithm}' sobre {len(grid)} punto(s) de grid × {cv_folds} folds."
             )
             run_id, best_params, metrics, model = tune_with_cv(
                 algorithm=algorithm,
@@ -334,7 +334,7 @@ def main() -> None:
             record(run_id, run_name, algorithm, "training", best_params,
                    metrics, model)
             _print_metrics(metrics)
-            print(f"  best params: {best_params}")
+            print(f"  mejores params: {best_params}")
 
         training_winner_candidate = min(
             (c for c in candidates if c["phase"] == "training"),
@@ -345,17 +345,17 @@ def main() -> None:
         winner_run_id = training_winner_candidate["run_id"]
         winner_metrics = training_winner_candidate["metrics"]
         progress(
-            f"Phase 1 done. Winner by val_rmse: '{winner}' "
+            f"Fase 1 terminada. Ganador por val_rmse: '{winner}' "
             f"(val_rmse={winner_metrics['val']['rmse']:.4f})."
         )
-        print(f"\n>>> Phase 1 winner (val_rmse): {winner} "
+        print(f"\n>>> Ganador Fase 1 (val_rmse): {winner} "
               f"(val_rmse={winner_metrics['val']['rmse']:.4f}, "
               f"common_test_rmse={winner_metrics['common_test']['rmse']:.4f})")
-        print(f"    best params: {winner_params}")
+        print(f"    mejores params: {winner_params}")
 
         # ---- Fase 2: Más datos — A (subconjunto) vs ganador de la Fase 1 (= B) ------
         # Ambos se puntúan sobre common_test = TEST_YEAR, aislando "¿ayudan más datos?".
-        print(f"\n=== Phase 2: More-data — A vs Phase-1 winner (= B) for {winner} ===")
+        print(f"\n=== Fase 2: Más datos — A vs ganador Fase 1 (= B) para {winner} ===")
         MlflowClient().set_tag(winner_run_id, "more_data_subset", "B")
         training_winner_candidate["extra_tags"]["more_data_subset"] = "B"
         print(f"  B = train-{winner} (run {winner_run_id}, "
@@ -364,13 +364,13 @@ def main() -> None:
         sub_train = train.filter(col(cfg["year_col"]).isin(SUBSET_A_YEARS))
         sub_count = sub_train.count()
         run_name = "more-data-A"
-        print(f"\n--- {run_name}: years={SUBSET_A_YEARS} ({sub_count:,} rows) ---")
+        print(f"\n--- {run_name}: años={SUBSET_A_YEARS} ({sub_count:,} filas) ---")
         if sub_count == 0:
-            print("  Skipping A: empty.")
+            print("  Se omite A: vacío.")
         else:
             progress(
-                f"Phase 2: starting more-data-A — refitting '{winner}' on "
-                f"years={SUBSET_A_YEARS} ({sub_count:,} rows)."
+                f"Fase 2: iniciando more-data-A — reentrenando '{winner}' sobre "
+                f"años={SUBSET_A_YEARS} ({sub_count:,} filas)."
             )
             ds_train_a = _make_dataset(sub_train, f"{use_case}_train_subsetA", cfg)
             run_id, metrics, model_a = train_and_log_run(
@@ -397,7 +397,7 @@ def main() -> None:
             _print_metrics(metrics)
 
         # ---- Resumen — ordenado por val_rmse; common_test se reporta, nunca se usa para rankear ----
-        print("\n=== Summary (all candidates, sorted by val_rmse) ===")
+        print("\n=== Resumen (todos los candidatos, ordenados por val_rmse) ===")
         header = (
             f"{'run_name':<22} {'algorithm':<6} "
             f"{'val_rmse':>12} {'common_test_rmse':>18} "
@@ -417,7 +417,7 @@ def main() -> None:
             )
         print(
             f"\nBaseline common_test_rmse: {baseline_metrics['rmse']:.4f}  "
-            f"(reported only — common_test isn't used to rank candidates)"
+            f"(solo informativo — common_test no se usa para rankear candidatos)"
         )
 
         # ---- Fase 3: Registramos cada candidato ---------------------------
@@ -499,7 +499,7 @@ def main() -> None:
         }
 
         progress(
-            f"Phase 3: registering {len(candidates)} candidates to "
+            f"Fase 3: registrando {len(candidates)} candidatos en "
             f"{cfg['experiment']}..."
         )
         registered = register_candidates(
@@ -516,8 +516,8 @@ def main() -> None:
         )
 
         print(
-            f"\n=== Phase 3: registered {len(registered)} version(s) of "
-            f"{cfg['experiment']} (ranked by val_rmse) ==="
+            f"\n=== Fase 3: registradas {len(registered)} versión(es) de "
+            f"{cfg['experiment']} (ordenadas por val_rmse) ==="
         )
         for c in ranked:
             mv, status = registered[c["run_id"]]
@@ -528,10 +528,10 @@ def main() -> None:
                 f"[{status}]"
             )
         print(
-            f"\nLoad champion: "
+            f"\nCargar champion: "
             f"mlflow.spark.load_model('models:/{cfg['experiment']}@champion')"
         )
-        print(f"Tracking URI: {MLFLOW_TRACKING_URI}  Experiment: {cfg['experiment']}")
+        print(f"URI de tracking: {MLFLOW_TRACKING_URI}  Experimento: {cfg['experiment']}")
     finally:
         spark.stop()
 

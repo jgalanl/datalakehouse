@@ -50,12 +50,12 @@ def clean(df: DataFrame) -> DataFrame:
 def validate(silver_count: int) -> tuple[bool, str]:
     """Paso de auditoría: devuelve (passed, reason). Nunca lanza excepción."""
     if silver_count == 0:
-        return False, "silver empty after cleaning"
+        return False, "silver vacío tras la limpieza"
     if silver_count < MIN_EXPECTED_ROWS:
-        return False, f"only {silver_count} rows (expected >= {MIN_EXPECTED_ROWS})"
+        return False, f"solo {silver_count} filas (se esperaban >= {MIN_EXPECTED_ROWS})"
     if silver_count > MAX_EXPECTED_ROWS:
-        return False, f"{silver_count} rows exceeds upper bound {MAX_EXPECTED_ROWS}"
-    return True, f"{silver_count} rows kept"
+        return False, f"{silver_count} filas supera la cota superior {MAX_EXPECTED_ROWS}"
+    return True, f"{silver_count} filas conservadas"
 
 
 def main() -> None:
@@ -72,27 +72,27 @@ def main() -> None:
     )
 
     if nessie.ref_exists(spark, branch_name):
-        print(f"  Dropping stale WAP branch '{branch_name}'")
+        print(f"  Eliminando rama WAP obsoleta '{branch_name}'")
         nessie.drop_branch(spark, branch_name)
 
-    print(f"\n  WAP clean (branch: {branch_name})")
+    print(f"\n  Limpieza WAP (rama: {branch_name})")
     try:
         nessie.create_branch(spark, branch_name, from_ref="silver")
 
         nessie.set_spark_branch(spark, "bronze")
         bronze_df = spark.table(SOURCE)
         bronze_count = bronze_df.count()
-        print(f"  Bronze: {bronze_count:,} rows")
+        print(f"  Bronze: {bronze_count:,} filas")
 
         silver_df = clean(bronze_df).cache()
         try:
             silver_count = silver_df.count()
-            print(f"  After cleaning: {silver_count:,} rows")
+            print(f"  Tras la limpieza: {silver_count:,} filas")
 
             nessie.set_spark_branch(spark, branch_name)
             spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
-            print(f"  Writing {TARGET}")
+            print(f"  Escribiendo {TARGET}")
             # Refresco completo: sobrescribimos una tabla estable para que cada ejecución
             # sea un snapshot limpio, en vez de borrar y recrear dejando ficheros huérfanos.
             spark.sql(f"""
@@ -111,26 +111,26 @@ def main() -> None:
 
         passed, reason = validate(silver_count)
         if passed:
-            print(f"  Audit passed: {reason}")
+            print(f"  Auditoría superada: {reason}")
             nessie.merge_branch(spark, source=branch_name, into="silver")
             nessie.set_spark_branch(spark, "silver")
-            print(f"  Creating tag '{tag_name}'")
+            print(f"  Creando tag '{tag_name}'")
             nessie.create_tag(spark, tag_name, from_ref="silver")
             nessie.drop_branch(spark, branch_name)
-            print(f"\nDone. Zone lookup written to {TARGET}")
+            print(f"\nHecho. Tabla de zonas escrita en {TARGET}")
         else:
             review_tag = nessie.review_tag_name(
                 "silver", "taxi_zone_lookup", today.year, today.month,
             )
-            print(f"  Audit FAILED: {reason}")
-            print(f"  Quarantining as tag '{review_tag}'")
+            print(f"  Auditoría FALLIDA: {reason}")
+            print(f"  Poniendo en cuarentena como tag '{review_tag}'")
             nessie.create_tag(spark, review_tag, from_ref=branch_name)
             nessie.drop_branch(spark, branch_name)
-            print(f"\nNOT merged to silver. Inspect the quarantine tag: {review_tag}")
+            print(f"\nNO fusionado a silver. Inspecciona el tag de cuarentena: {review_tag}")
     finally:
         nessie.set_spark_branch(spark, "silver")
 
-    print("\nNessie references after silver ETL:")
+    print("\nReferencias Nessie tras el ETL silver:")
     nessie.print_references(spark)
     spark.stop()
 
