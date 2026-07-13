@@ -1,14 +1,14 @@
 {
   "dataframe_split": {
     "columns": [
-      "trip_distance", "passenger_count", "pickup_year", "pickup_month",
+      "trip_distance", "passenger_count", "pickup_month",
       "pickup_week", "pickup_dow", "pickup_hour", "pu_location_id",
       "do_location_id", "vendor_id", "ratecode_id", "payment_type"
     ],
     "data": [
-      [3.4, 1, 2025, 1, 3, 2, 18, 142, 236, 2, 1, 1],
-      [0.8, 1, 2025, 1, 3, 2, 9, 236, 237, 1, 1, 1],
-      [18.2, 2, 2025, 1, 3, 5, 15, 132, 230, 2, 2, 1]
+      [3.4, 1, 1, 3, 2, 18, 142, 236, 2, 1, 1],
+      [0.8, 1, 1, 3, 2, 9, 236, 237, 1, 1, 1],
+      [18.2, 2, 1, 3, 5, 15, 132, 230, 2, 2, 1]
     ]
   }
 }

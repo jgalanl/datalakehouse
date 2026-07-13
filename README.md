@@ -391,9 +391,17 @@ sigue activa y es la red de seguridad real.
    una población de tarifa distinta, y una valla global estaría dominada por `RatecodeID = 1`
    (~99,5 % de filas) y recortaría viajes legítimos de aeropuerto/negociados.
 
-Implementación: un único `groupBy("RatecodeID").agg(percentile_approx(...))` se `.collect()`-a a
+Implementación: un único `groupBy("RatecodeID").agg(percentile(...))` se `.collect()`-a a
 Python y las vallas por código se hornean en un solo `CASE WHEN` por columna, de modo que el
 filtro corre en una sola pasada sin *join*.
+
+Los cuartiles son **exactos** (`percentile`), no aproximados (`percentile_approx`). El sketch
+aproximado se fusiona por partición, así que devuelve cuartiles distintos según cómo esté
+particionado el dato: la misma rodaja de bronze producía vallas —y por tanto filas de silver—
+distintas en cada ejecución, y el chequeo de la regla en el notebook de verificación de silver
+fallaba por unas pocas filas al borde de la valla. El percentil exacto agrega sobre **valores
+distintos** (≤ ~13 k por columna y mes), no sobre filas, así que en este volumen es incluso más
+barato que el aproximado, además de reproducible.
 
 **Puerta de auditoría** `MAX_DROP_RATIO = 0.3`: pone en cuarentena cualquier mes cuya limpieza
 descarte más del 30 % de filas. La canalización de
@@ -487,6 +495,14 @@ El *dict* `USE_CASES` en `train.py` lleva los parámetros por caso (`source`, `l
 `label_filter_predicate`, `redundant_categoricals`). Solo `duration` filtra
 `trip_duration_minutes > 0` (corrección de viajes sub-segundo que `unix_timestamp` trunca a 0).
 
+**La columna de año NO es una feature.** `pickup_year` / `hour_year` solo sirven de clave del
+*holdout*: se proyectan desde *gold* pero no entran en `numerical_cols`. *Razón:* con el
+*holdout* del último año, `common_test` tiene un valor de año (`TEST_YEAR`) que **no aparece en
+ninguna fila de entrenamiento**. Los árboles no extrapolan (2025 caería en la rama terminal de
+2024, así que la *feature* no aporta nada y solo consume divisiones), y GLR sí extrapola:
+con enlace log aplicaría un factor `exp(β·Δaño)` a todas las predicciones del año de test, un
+sesgo sistemático a cambio de nada. La estacionalidad ya la capturan mes / semana / día / hora.
+
 ### 5.2. Preparación de datos
 
 **Split last-year holdout.** `common_test` es **toda fila de `TEST_YEAR = 2025`** (totalmente
@@ -509,8 +525,10 @@ llamada es **eager** y los *splits* que devuelve vienen ya cacheados.
 *antes* del *split*, así que `train` / `val` / `common_test` se muestrean proporcionalmente. El
 modo `--fast` usa `FAST_SAMPLE_FRACTION = 0.01` para *smoke tests*.
 
-**Codificación cíclica.** *Features* sin/cos de hora y día de la semana para GLR; los árboles
-(GBT, RFR) conservan las columnas enteras.
+**Codificación cíclica.** *Features* sin/cos de hora, día de la semana y **semana ISO** para
+GLR; los árboles (GBT, RFR) conservan las columnas enteras. La semana entra aquí porque
+`weekofyear` es ISO: el 1 de enero cae en la **semana 52** del año anterior, así que sin
+codificar GLR vería un salto artificial de 52 a 1 dentro del mismo enero.
 
 ### 5.3. Flujo de entrenamiento
 
@@ -576,8 +594,11 @@ Registry* bajo el nombre del experimento (`fare_prediction`, `trip_duration`, `d
 - **Política de promoción — estricta sobre `val_rmse`.** El contendiente de la invocación (menor
   `val_rmse`) pasa a `@champion` **solo si** su `val_rmse` es estrictamente menor que el del
   campeón anterior. En caso contrario se etiqueta `validation_status="challenger"`. El resto de
-  candidatos se etiquetan siempre `challenger`; el alias `@challenger` apunta al mejor
-  no-campeón de la invocación.
+  candidatos se etiquetan siempre `challenger`; el alias `@challenger` apunta al mejor candidato
+  de la invocación que **no** se haya quedado con `@champion` — si el contendiente no fue
+  promovido, sigue siendo candidato a `@challenger` y de hecho es el mejor por `val_rmse`. Si el
+  campeón vigente no expone `val_rmse` en su *run* (borrado, o registrado con otro esquema de
+  métricas), no hay comparación posible: se promociona al contendiente y se avisa por consola.
 - **Política de reproducibilidad.** Cada versión lleva dos *pins* del estado de los datos en el
   momento del entrenamiento: `nessie_main_hash` (hash completo de `main`) y `source_snapshot_id`
   (último *snapshot* Iceberg de la tabla origen). Bastan para reconstruir el input exacto más
@@ -660,12 +681,12 @@ python src/ml/api/client.py fare        # duration | demand, o --json <file> / -
 ```
 
 El campeón de `fare` es un GBT (árbol), así que el *payload* son las columnas crudas de *gold*
-**sin** codificación cíclica (`trip_distance`, `passenger_count`,
-`pickup_year/month/week/dow/hour`, `pu_location_id`, `do_location_id`, `vendor_id`,
-`ratecode_id`, `payment_type`); los campeones de árbol (GBT, RFR) consumen `pickup_hour`/
-`pickup_dow` enteros directamente. Un campeón **GLR** esperaría las columnas cíclicas `*_sin`/
-`*_cos` (que `ml/splits.py` deriva de hora/día en el entrenamiento); habría que añadirlas al
-*payload* si se promociona un modelo GLR.
+**sin** codificación cíclica (`trip_distance`, `passenger_count`, `pickup_month/week/dow/hour`,
+`pu_location_id`, `do_location_id`, `vendor_id`, `ratecode_id`, `payment_type`); los campeones
+de árbol (GBT, RFR) consumen `pickup_hour` / `pickup_dow` / `pickup_week` enteros directamente.
+El año **no** va en el *payload*: no es una *feature* (ver 5.1). Un campeón **GLR** esperaría las
+columnas cíclicas `*_sin`/`*_cos` (que `ml/splits.py` deriva de hora, día y semana en el
+entrenamiento); habría que añadirlas al *payload* si se promociona un modelo GLR.
 
 **Parar:**
 

@@ -58,9 +58,14 @@ from ml.tracking import (
 CREATED_BY = "jgalanllano"
 
 # Conjunto de features de yellow_taxi_trips, compartido por los casos fare y duration.
+# El año (pickup_year) NO es feature: es la clave del holdout, así que en common_test toma un
+# valor (TEST_YEAR) que no aparece en ninguna fila de entrenamiento. Los árboles no extrapolan
+# —2025 caería en la rama terminal de 2024— y GLR sí, aplicando un factor exp(beta*delta_año)
+# a todas las predicciones del año de test: un sesgo sistemático a cambio de nada. La
+# estacionalidad ya la cubren mes/semana/día/hora.
 TRIP_NUMERICAL_COLS = [
     "trip_distance", "passenger_count",
-    "pickup_year", "pickup_month", "pickup_week",
+    "pickup_month", "pickup_week",
     "pickup_dow", "pickup_hour",
 ]
 TRIP_CATEGORICAL_COLS = [
@@ -107,8 +112,9 @@ USE_CASES: dict[str, dict] = {
         "source": "nessie.nyc.pickup_demand_zone_hour",
         "label_col": "n_pickups",
         "year_col": "hour_year",
+        # hour_year fuera por la misma razón que pickup_year (ver TRIP_NUMERICAL_COLS).
         "numerical_cols": [
-            "hour_year", "hour_month", "hour_week",
+            "hour_month", "hour_week",
             "hour_dow", "hour_of_day",
         ],
         "categorical_cols": [
@@ -230,7 +236,11 @@ def main() -> None:
         )
 
         progress(f"Leyendo {cfg['source']}...")
-        cols_to_keep = [cfg["label_col"], *cfg["numerical_cols"], *cfg["categorical_cols"]]
+        # year_col se proyecta aunque no sea feature: make_splits y la Fase 2 filtran por él.
+        cols_to_keep = [
+            cfg["label_col"], cfg["year_col"],
+            *cfg["numerical_cols"], *cfg["categorical_cols"],
+        ]
         df = spark.table(cfg["source"]).select(*cols_to_keep)
         if cfg["label_filter_predicate"] is not None:
             df = df.filter(cfg["label_filter_predicate"](col(cfg["label_col"])))

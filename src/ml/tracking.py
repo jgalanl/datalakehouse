@@ -474,6 +474,14 @@ def prune_old_versions(
     return deleted
 
 
+def _run_metric(client: MlflowClient, run_id: str, metric: str) -> float | None:
+    """Métrica de un run, o None si el run ya no existe o no la registró."""
+    try:
+        return client.get_run(run_id).data.metrics[metric]
+    except (MlflowException, KeyError):
+        return None
+
+
 def register_candidates(
     *,
     name: str,
@@ -547,18 +555,32 @@ def register_candidates(
         )
 
     contender_mv = registered[champion_run_id]
-    contender_metric = client.get_run(champion_run_id).data.metrics[promotion_metric]
+    contender_metric = _run_metric(client, champion_run_id, promotion_metric)
 
     cur_champ_version: str | None = None
     cur_champ_metric: float | None = None
     try:
         cur_champ = client.get_model_version_by_alias(name, "champion")
-        cur_champ_version = cur_champ.version
-        cur_champ_metric = client.get_run(cur_champ.run_id).data.metrics[promotion_metric]
-        promoted = contender_metric < cur_champ_metric
     except MlflowException:
-        # Todavía no hay champion, así que el aspirante gana por defecto.
-        promoted = True
+        cur_champ = None  # todavía no hay champion
+
+    if cur_champ is None:
+        promoted = True  # el aspirante gana por defecto
+    else:
+        cur_champ_version = cur_champ.version
+        # El run del champion puede haberse borrado o no llevar la métrica (versiones
+        # registradas con otro esquema de métricas): sin referencia con la que comparar,
+        # promovemos y lo avisamos en vez de reventar con el registro a medias.
+        cur_champ_metric = _run_metric(client, cur_champ.run_id, promotion_metric)
+        if cur_champ_metric is None:
+            print(
+                f"  El champion actual (v{cur_champ_version}) no expone "
+                f"'{promotion_metric}' en su run: no hay comparación posible, "
+                f"se promueve al aspirante."
+            )
+            promoted = True
+        else:
+            promoted = contender_metric < cur_champ_metric
 
     if promoted:
         client.set_registered_model_alias(name, "champion", contender_mv.version)
@@ -584,18 +606,21 @@ def register_candidates(
             f"el de v{cur_champ_version} {cur_champ_metric:.4f})"
         )
 
-    # Apuntamos @challenger al mejor candidato que no sea champion de esta ejecución.
-    non_champion_run_ids = [c["run_id"] for c in candidates if c["run_id"] != champion_run_id]
+    # @challenger apunta al mejor candidato de esta ejecución que NO se haya quedado con
+    # @champion. Si el aspirante no fue promovido sigue siendo candidato — y de hecho es el
+    # mejor por promotion_metric —, así que entra en el sorteo.
+    challenger_pool = [
+        c["run_id"] for c in candidates
+        if not (promoted and c["run_id"] == champion_run_id)
+    ]
     challenger_alias_version: str | None = None
-    if non_champion_run_ids:
+    if challenger_pool:
         run_metrics = {
-            rid: client.get_run(rid).data.metrics[promotion_metric]
-            for rid in non_champion_run_ids
+            rid: _run_metric(client, rid, promotion_metric) or float("inf")
+            for rid in challenger_pool
         }
         best_other = min(run_metrics, key=run_metrics.get)
         challenger_alias_version = registered[best_other].version
-    elif not promoted:
-        challenger_alias_version = contender_mv.version
 
     if challenger_alias_version is not None:
         client.set_registered_model_alias(

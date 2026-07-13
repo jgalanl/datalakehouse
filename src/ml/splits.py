@@ -55,13 +55,18 @@ def make_splits(
     return train, val, common_test
 
 
-# Codificamos hora (0..23) y día de la semana (0..6) como sin/cos para que las 23h queden
-# pegadas a las 0h. GLR lo necesita; los árboles dividen sobre los enteros, así que no.
+# Codificamos hora (0..23), día de la semana (0..6) y semana ISO (1..53) como sin/cos para
+# que los extremos queden pegados: las 23h junto a las 0h, y la semana 52/53 junto a la 1
+# (weekofyear es ISO, así que el 1 de enero cae en la semana 52 del año anterior — sin esta
+# codificación GLR ve un salto artificial de 52 a 1 dentro del mismo enero).
+# GLR lo necesita; los árboles dividen sobre los enteros, así que no.
 CYCLICAL_COLS: dict[str, int] = {
     "pickup_hour": 24,
     "pickup_dow": 7,
+    "pickup_week": 52,
     "hour_of_day": 24,
     "hour_dow": 7,
+    "hour_week": 52,
 }
 
 

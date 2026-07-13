@@ -2,8 +2,8 @@ import sys
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
-    col, lit, month as spark_month,
-    percentile_approx, unix_timestamp, when, year as spark_year,
+    col, expr, lit, month as spark_month,
+    unix_timestamp, when, year as spark_year,
 )
 from pyspark.sql.types import (
     DoubleType, LongType, StringType, StructField, StructType, TimestampNTZType,
@@ -31,8 +31,6 @@ VALID_PAYMENT_TYPES = [0, 1, 2, 3, 4, 5, 6]  # Flex Fare, Tarjeta, Efectivo, Sin
 # Eliminación de outliers por IQR: descarta las filas fuera de los límites Tukey "far out"
 # [Q1-k*IQR, Q3+k*IQR] (k=3.0), calculados por RatecodeID.
 IQR_K = 3.0
-QUANTILE_RELATIVE_ERROR = 0.001
-QUANTILE_ACCURACY = int(1 / QUANTILE_RELATIVE_ERROR)
 # Duración del viaje (segundos): solo sirve de base para su propio límite IQR; se descarta antes de escribir, no se guarda.
 DURATION_COL = "_trip_duration_s"
 OUTLIER_COLS = ["fare_amount", "total_amount", "trip_distance", DURATION_COL]
@@ -73,9 +71,14 @@ def remove_outliers(df: DataFrame) -> DataFrame:
     Los q1/q3 de cada código (un groupBy, <=7 filas recogidas) se incrustan en un
     CASE WHEN por columna, así el filtro corre en una sola pasada y sin join. Se recortan
     ambas colas.
+
+    Los cuantiles son exactos (percentile, no percentile_approx): el sketch aproximado
+    depende del particionado, así que la misma rodaja de bronze producía vallas —y por
+    tanto filas— distintas en cada ejecución. Aquí es además más barato: percentile
+    agrega sobre valores distintos (<= ~13 k por columna al mes), no sobre filas.
     """
     fences = df.groupBy("RatecodeID").agg(
-        *[percentile_approx(c, [0.25, 0.75], QUANTILE_ACCURACY).alias(c)
+        *[expr(f"percentile({c}, array(0.25, 0.75))").alias(c)
           for c in OUTLIER_COLS],
     ).collect()
 
