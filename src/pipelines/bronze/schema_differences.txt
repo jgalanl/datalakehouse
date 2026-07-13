@@ -1,10 +1,10 @@
 ================================================================================
-NYC TLC Yellow Taxi — Schema Comparison Report
-Generated: 2026-05-31T16:41:03.821219
-Reference: yellow_tripdata_2023-01.parquet  |  Files compared: 9
+NYC TLC Yellow Taxi — Informe de comparación de esquemas
+Generado: 2026-07-12T17:00:29.598323
+Referencia: yellow_tripdata_2023-01.parquet  |  Ficheros comparados: 9
 ================================================================================
 
---- Reference schema (yellow_tripdata_2023-01.parquet) ---
+--- Esquema de referencia (yellow_tripdata_2023-01.parquet) ---
    1. VendorID                            int64
    2. tpep_pickup_datetime                timestamp[us]
    3. tpep_dropoff_datetime               timestamp[us]
