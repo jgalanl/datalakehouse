@@ -1,6 +1,6 @@
 ================================================================================
 NYC TLC Yellow Taxi — Informe de comparación de esquemas
-Generado: 2026-07-12T17:00:29.598323
+Generado: 2026-07-14T09:49:48.290481
 Referencia: yellow_tripdata_2023-01.parquet  |  Ficheros comparados: 9
 ================================================================================
 
