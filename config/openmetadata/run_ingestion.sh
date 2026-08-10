@@ -61,8 +61,8 @@ ingest "$OUT"
 # --- Linaje del medallón + modelos ---
 # OM no infiere linaje tabla-a-tabla desde Iceberg/MLflow (ingesta solo de entidad),
 # así que las aristas del flujo bronze->silver->gold->modelos se declaran explícitamente
-# (idempotente). Se ejecuta en la imagen de ingesta, sobre la red de Compose.
-echo ">> declarando las aristas de linaje (bronze -> silver -> gold -> modelos)"
+# (idempotente). Se corre en la imagen de ingesta, sobre la red de Compose.
+echo ">> declaring lineage edges (bronze -> silver -> gold -> modelos)"
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
 docker run --rm --network "$NETWORK" \
   --entrypoint python3 \
