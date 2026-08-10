@@ -3,11 +3,15 @@
 # Esto preserva la semántica real de las tablas Iceberg (esquemas, columnas) y lee el mismo
 # almacén Nessie en el que escribe Spark. OM 1.12.1 OSS no tiene conector de Dremio (solo Collate),
 # así que el catálogo Iceberg REST es la vía nativa de OSS para estas tablas.
-# Los secretos (__MINIO_KEY__, __MINIO_SECRET__, __OM_JWT__) los inyecta en tiempo de ejecución
-# run_ingestion.sh desde .env.
+#
+# Plantilla reutilizada una vez por rama del medallón: run_ingestion.sh renderiza
+# __ICEBERG_SERVICE__ (iceberg_bronze | iceberg_silver | iceberg_gold) y fija la variable
+# NESSIE_ICEBERG_PREFIX (bronze | silver | main) que el conector parcheado usa como prefix
+# Iceberg-REST — cada rama se cataloga como un servicio de catálogo diferenciado por referencia.
+# Los secretos (__MINIO_KEY__, __MINIO_SECRET__, __OM_JWT__) los inyecta run_ingestion.sh desde .env.
 source:
   type: iceberg
-  serviceName: iceberg_lakehouse
+  serviceName: __ICEBERG_SERVICE__
   serviceConnection:
     config:
       type: Iceberg
