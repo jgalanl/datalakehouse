@@ -1,8 +1,8 @@
 # Diseño e implementación de una arquitectura Data Lakehouse para el ciclo de vida del dato: ingeniería, aprendizaje automático y gobernanza
 
-Prueba de concepto de una arquitectura **data lakehouse** construida íntegramente con componentes
+Implementación de una arquitectura **data lakehouse** construida íntegramente con componentes
 de código abierto y desplegada en local mediante contenedores. Cubre tres dimensiones del ciclo de
-vida del dato, **ingeniería**, **aprendizaje automático** y **gobernanza**, empleando los registros
+vida del dato, **ingeniería**, **aprendizaje automático** y **gobernanza**. Emplea los registros
 de viajes de taxi amarillo de la New York City Taxi and Limousine Commission (NYC TLC).
 
 Los datos se organizan en capas siguiendo la **arquitectura de medallón**, y su promoción entre
@@ -27,6 +27,7 @@ OpenMetadata · Jupyter Notebook, Docker Compose.
 7. [Gobernanza](#7-gobernanza)
 8. [Puesta en marcha](#8-puesta-en-marcha)
 9. [Licencia](#9-licencia)
+10. [Cómo citar](#10-cómo-citar)
 
 ---
 
@@ -107,8 +108,8 @@ usuario no *root*) y `openmetadata-migrate` aplica las migraciones de esquema.
 | `mlflow-artifacts` | Modelos serializados, una carpeta por experimento | Sí                    |
 | `spark-logs`       | Registros de eventos de Spark (prefijo `events/`) | No                    |
 
-Los datos del dominio ya se versionan por encima (con los *snapshots* de Iceberg y con el catálogo
-de Nessie), así que el versionado de objetos se reserva a los artefactos de modelos. Dentro de
+Los datos del dominio ya se versionan con los *snapshots* de Iceberg y con el catálogo
+de Nessie. El versionado de objetos se reserva a los artefactos de modelos. Dentro de
 `warehouse` la jerarquía es **capa antes que dominio**:
 
 ```
@@ -159,7 +160,7 @@ identificador apunta a una tabla física distinta según la referencia activa de
 | -------- | -------------------------------------- | ----------------------------------------------------------------------- |
 | `bronze` | `nessie.nyc.yellow_taxi`               | Ingesta fiel al origen, particionada por `months(tpep_pickup_datetime)` |
 | `bronze` | `nessie.nyc.taxi_zone_lookup`          | Referencia, sin particionar (265 filas)                                 |
-| `silver` | `nessie.nyc.yellow_taxi`               | Depurada y conformada                                                   |
+| `silver` | `nessie.nyc.yellow_taxi`               | Transformación                                                   |
 | `silver` | `nessie.nyc.taxi_zone_lookup`          | Nombres de zona normalizados                                            |
 | `main`   | `nessie.nyc.yellow_taxi_trips`         | Nivel viaje: zonas desnormalizadas y atributos temporales               |
 | `main`   | `nessie.nyc.pickup_demand_zone_hour`   | Agregado por `(pu_location_id, hour_bucket)`                            |
@@ -262,7 +263,7 @@ Nueve ficheros mensuales y una tabla de referencia, consolidados por capa:
 | main   | `yellow_taxi_trips`       | 24.393.325 | 32 (24 obligatorias)     | 9 · 458,4 MiB    |
 | main   | `pickup_demand_zone_hour` | 631.388    | 16 (15 obligatorias)     | 9                |
 
-**Evolución de esquema.** Los nueve ficheros de origen presentan tres tipos de deriva: cambios de
+**Evolución de esquema.** Los nueve ficheros de origen presentan tres tipos de modificaciones: cambios de
 tipo (`int64` → `int32`, `double` → `int64`), cambio de nombre (`airport_fee` → `Airport_fee`) y
 **una columna nueva**, `cbd_congestion_fee`, a partir de enero de 2025. La ingesta resuelve los dos
 primeros proyectando sobre el esquema canónico, y el tercero con `ALTER TABLE ADD COLUMNS` cuando
@@ -304,7 +305,7 @@ quedó en cuarentena.
 **Aislamiento por ramas.** Con la sesión situada en `bronze`, `nessie.nyc.yellow_taxi` devuelve
 30.137.291 registros; con la sesión en `silver`, el mismo identificador devuelve 24.393.325. Al ser
 idéntico en varias ramas, una lectura sobre la referencia equivocada no da error, sino un resultado
-incorrecto: solo falla cuando la tabla no existe en la referencia activa.
+incorrecto. Solo falla cuando la tabla no existe en la referencia activa.
 
 Spark fija la referencia **por sesión** (`USE REFERENCE <ref> IN nessie`) y Dremio la cualifica
 **por sentencia**:
@@ -361,7 +362,7 @@ interpretable), **`GBTRegressor`** (árboles con *boosting*, reduce el sesgo) y
 
 ### 6.2. Preparación de los datos
 
-- **Reparto de los subconjuntos.** El conjunto de **prueba son todos los viajes de 2025**, que no
+- **Reparto de los subconjuntos.** El conjunto de **test son todos los viajes de 2025**, que no
   intervienen ni en el entrenamiento ni en la elección del modelo. Entrenamiento y validación
   salen de 2023 y 2024 mediante un reparto aleatorio estratificado por año, con el 15 % para
   validación.
@@ -416,12 +417,12 @@ arrancar, necesita que ya exista una versión con ese alias, por lo que no se pu
 del entrenamiento.
 
 ```bash
-docker compose --profile api up -d model-server   # queda "healthy" cuando el modelo ha cargado
+docker compose --profile api up -d model-server
 
 curl -s -X POST http://localhost:5001/invocations \
   -H 'Content-Type: application/json' -d @src/ml/api/examples/fare_request.json
 
-python src/ml/api/client.py fare                  # cliente incluido (solo biblioteca estándar)
+python src/ml/api/client.py fare
 ```
 
 | Método | Ruta           | Propósito                                        |
@@ -596,7 +597,7 @@ docker compose --profile api up -d model-server
 config/openmetadata/run_ingestion.sh
 ```
 
-Los notebooks se abren desde Jupyter (`http://localhost:8888`) intercalados en esa secuencia:
+Los notebooks se abren desde el servicio de Jupyter (`http://localhost:8888`):
 [explore](src/notebooks/bronze/explore.ipynb) →
 [verify bronze](src/notebooks/bronze/verify_iceberg.ipynb) →
 [preprocess](src/notebooks/bronze/preprocess.ipynb) →
@@ -615,9 +616,9 @@ docker compose down       # conserva los volúmenes con nombre
 docker compose down -v    # elimina los volúmenes: reinicio real desde cero
 ```
 
-La primera opción conserva todo el estado persistente (datos, historial del catálogo, experimentos
-e inventario de gobernanza). La segunda lo destruye y es la única que produce un arranque en frío
-desde el repositorio.
+La primera opción baja el entorno pero mantiene los datos persistentes (datos, historial del catálogo y experimentos e inventario de gobernanza).
+La segunda, además, elimina todos los volúmenes persistentes permitiendo volver al estado 
+original del sistema.
 
 ---
 
@@ -627,3 +628,35 @@ Este proyecto se distribuye bajo la **Licencia Pública General de GNU, versión
 el texto completo está en [LICENSE](LICENSE). Es una licencia *copyleft*: garantiza la libertad de
 usar, estudiar, compartir y modificar el software, siempre que las obras derivadas se distribuyan
 bajo los mismos términos.
+
+---
+
+## 10. Cómo citar
+
+Los metadatos de citación están en [CITATION.cff](CITATION.cff), en formato
+[Citation File Format](https://citation-file-format.github.io/). GitHub los reconoce y ofrece la
+exportación a APA y BibTeX desde el botón *Cite this repository* de la portada del repositorio.
+
+Referencia en texto (APA 7):
+
+> Galán Llano, J. (2026). *Diseño e implementación de una arquitectura Data Lakehouse para el
+> ciclo de vida del dato: ingeniería, aprendizaje automático y gobernanza* (Versión 1.0.0)
+> [Software]. https://github.com/jgalanl/datalakehouse
+
+Entrada BibTeX:
+
+```bibtex
+@misc{GalanLlano2026Datalakehouse,
+  author       = {Galán Llano, Jesús},
+  title        = {Diseño e implementación de una arquitectura Data Lakehouse para el
+                  ciclo de vida del dato: ingeniería, aprendizaje automático y gobernanza},
+  year         = {2026},
+  version      = {1.0.0},
+  howpublished = {\url{https://github.com/jgalanl/datalakehouse}},
+  note         = {Artefacto software del Trabajo Fin de Máster, UNED}
+}
+```
+
+Para citar un estado concreto del código —y no la rama en evolución— añádase la etiqueta o el
+identificador del *commit* a la URL, por ejemplo
+`https://github.com/jgalanl/datalakehouse/tree/v1.0.0`.
