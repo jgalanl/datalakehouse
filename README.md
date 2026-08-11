@@ -634,14 +634,14 @@ bajo los mismos términos.
 ## 10. Cómo citar
 
 Los metadatos de citación están en [CITATION.cff](CITATION.cff), en formato
-[Citation File Format](https://citation-file-format.github.io/). GitHub los reconoce y ofrece la
-exportación a APA y BibTeX desde el botón *Cite this repository* de la portada del repositorio.
+[Citation File Format](https://citation-file-format.github.io/)
 
-Referencia en texto (APA 7):
+Referencia en texto (estilo IEEE):
 
-> Galán Llano, J. (2026). *Diseño e implementación de una arquitectura Data Lakehouse para el
-> ciclo de vida del dato: ingeniería, aprendizaje automático y gobernanza* (Versión 1.0.0)
-> [Software]. https://github.com/jgalanl/datalakehouse
+> [1] J. Galán Llano, *Diseño e implementación de una arquitectura Data Lakehouse para el ciclo
+> de vida del dato: ingeniería, aprendizaje automático y gobernanza* (versión 1.0.0). (2026).
+> Accedido: 12 de agosto de 2026. [En línea]. Disponible en:
+> https://github.com/jgalanl/datalakehouse
 
 Entrada BibTeX:
 
@@ -653,10 +653,5 @@ Entrada BibTeX:
   year         = {2026},
   version      = {1.0.0},
   howpublished = {\url{https://github.com/jgalanl/datalakehouse}},
-  note         = {Artefacto software del Trabajo Fin de Máster, UNED}
 }
 ```
-
-Para citar un estado concreto del código —y no la rama en evolución— añádase la etiqueta o el
-identificador del *commit* a la URL, por ejemplo
-`https://github.com/jgalanl/datalakehouse/tree/v1.0.0`.
