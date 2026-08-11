@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "Si utiliza este software, por favor cítelo empleando los metadatos de este fichero."
+title: >-
+  Diseño e implementación de una arquitectura Data Lakehouse para el ciclo de
+  vida del dato: ingeniería, aprendizaje automático y gobernanza
+abstract: >-
+  Implementación de referencia de una arquitectura data lakehouse construida
+  íntegramente con componentes de código abierto y desplegada en local mediante
+  contenedores (MinIO, Apache Iceberg, Project Nessie, Apache Spark, Dremio OSS,
+  MLflow y OpenMetadata). Organiza los registros de viajes de taxi amarillo de la
+  NYC TLC en una arquitectura de medallón cuya promoción entre capas se gobierna
+  con el patrón Write-Audit-Publish sobre las ramas de un catálogo versionado.
+  Además, entrena y sirve tres modelos de regresión sobre la capa final y proporciona
+  gobernanza sobre las tablas empleadas y de los modelos generados.
+type: software
+authors:
+  - family-names: "Galán Llano"
+    given-names: "Jesús"
+    email: jgalan279@alumno.uned.es
+    affiliation: "Universidad Nacional de Educación a Distancia (UNED)"
+version: "1.0.0"
+date-released: "2026-08-12"
+license: GPL-3.0-only
+repository-code: "https://github.com/jgalanl/datalakehouse"
+url: "https://github.com/jgalanl/datalakehouse"
+keywords:
+  - data lakehouse
+  - ingeniería del dato
+  - arquitectura Medallion
+  - patrón Write-Audit-Publish
+  - aprendizaje automático
+  - gobernanza del dato
