@@ -3,9 +3,6 @@ FROM docker.getcollate.io/openmetadata/ingestion:1.12.1
 RUN pip install --no-cache-dir "mlflow-skinny==2.22.1"
 
 # Selección de la última versión de cada modelo registrado.
-# MlflowSource la busca por coincidencia de marca de tiempo con el modelo; cuando ninguna
-# versión coincide devuelve None y el modelo se cataloga sin versión. Se sustituye por el
-# número de versión más alto, que es el criterio estable.
 RUN python - <<'PY'
 import pathlib, re
 p = pathlib.Path("/home/airflow/.local/lib/python3.10/site-packages/"
@@ -25,11 +22,6 @@ p.write_text(patched)
 PY
 
 # Selección de referencia de Nessie en el conector Iceberg-REST.
-# La RestCatalogConnection de OM OSS no expone el `prefix` de Iceberg-REST, y el
-# endpoint de Nessie fija ese prefix por defecto a la rama main (patrón {ref}|{warehouse}),
-# de modo que un servicio solo alcanza la capa gold. Se inyecta el prefix desde la
-# variable NESSIE_ICEBERG_PREFIX (una por invocación) para catalogar bronze/silver/gold,
-# cada uno como un servicio de catálogo diferenciado por referencia.
 RUN python - <<'PY'
 import pathlib
 p = pathlib.Path("/home/airflow/.local/lib/python3.10/site-packages/"

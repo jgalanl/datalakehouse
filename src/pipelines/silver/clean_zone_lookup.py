@@ -16,7 +16,7 @@ TARGET_LOCATION = nessie.table_location("silver", "taxi_zone_lookup")
 VALID_LOCATION_MIN = 1
 VALID_LOCATION_MAX = 265
 
-# Bronze tiene 265 filas; toleramos una pequeña variación pero marcamos cambios grandes.
+# Bronze tiene 265 filas; se tolera una variación pequeña, pero un cambio grande se marca.
 MIN_EXPECTED_ROWS = 250
 MAX_EXPECTED_ROWS = 300
 
@@ -93,8 +93,7 @@ def main() -> None:
             spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {nessie.NAMESPACE}")
 
             print(f"  Escribiendo {TARGET}")
-            # Refresco completo: sobrescribimos una tabla estable para que cada ejecución
-            # sea un snapshot limpio, en vez de borrar y recrear dejando ficheros huérfanos.
+            # Reinicio de la tabla si no existe; si ya existía, se sobreescribe.
             spark.sql(f"""
                 CREATE TABLE IF NOT EXISTS {TARGET} (
                     {schema_to_ddl(SILVER_ZONE_SCHEMA)}

@@ -6,11 +6,6 @@ Cada ejecución registra todo en un único experimento de MLflow:
   Fase 2    más datos A (subconjunto) vs B (el ganador, reutilizado); ambos puntúan sobre TEST_YEAR.
   Fase 3    registra los 4 candidatos; el ganador se queda con @champion solo si su
             val_rmse supera al del champion del registro; si no, sigue de challenger.
-
-A tener en cuenta: val_rmse guía cada decisión (common_test queda reservado y solo se
-reporta), el split es un holdout del último año (common_test = TEST_YEAR), cada versión se
-fija con nessie_main_hash + source_snapshot_id, el @champion recibe un tag de latencia de
-inferencia, y el registro se poda a REGISTRY_MAX_VERSIONS conservando las versiones con alias.
 """
 
 import sys
@@ -58,11 +53,6 @@ from ml.tracking import (
 CREATED_BY = "jgalanllano"
 
 # Conjunto de features de yellow_taxi_trips, compartido por los casos fare y duration.
-# El año (pickup_year) NO es feature: es la clave del holdout, así que en common_test toma un
-# valor (TEST_YEAR) que no aparece en ninguna fila de entrenamiento. Los árboles no extrapolan
-# —2025 caería en la rama terminal de 2024— y GLR sí, aplicando un factor exp(beta*delta_año)
-# a todas las predicciones del año de test: un sesgo sistemático a cambio de nada. La
-# estacionalidad ya la cubren mes/semana/día/hora.
 TRIP_NUMERICAL_COLS = [
     "trip_distance", "passenger_count",
     "pickup_month", "pickup_week",
@@ -112,7 +102,6 @@ USE_CASES: dict[str, dict] = {
         "source": "nessie.nyc.pickup_demand_zone_hour",
         "label_col": "n_pickups",
         "year_col": "hour_year",
-        # hour_year fuera por la misma razón que pickup_year (ver TRIP_NUMERICAL_COLS).
         "numerical_cols": [
             "hour_month", "hour_week",
             "hour_dow", "hour_of_day",
@@ -130,7 +119,7 @@ USE_CASES: dict[str, dict] = {
 
 
 def _parse_cli(argv: list[str]) -> tuple[str, bool]:
-    """Devuelve (use_case, fast). Sale con un mensaje de uso si la entrada es incorrecta."""
+    """Devuelve (use_case, fast)"""
     positional = [a for a in argv if not a.startswith("--")]
     if len(positional) != 1 or positional[0] not in USE_CASES:
         names = "|".join(USE_CASES)
@@ -140,7 +129,7 @@ def _parse_cli(argv: list[str]) -> tuple[str, bool]:
 
 
 def _build_pipeline(algorithm: str, params: dict, cfg: dict):
-    """Construye el pipeline de features + el estimador para `algorithm` según cfg."""
+    """Construye el pipeline de features y el estimador para `algorithm` según cfg."""
     pipeline_config = algorithm_pipeline_config(algorithm)
     numerical_cols = resolve_numerical_cols(algorithm, cfg["numerical_cols"])
 
@@ -164,9 +153,9 @@ def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
 
 
 def _make_dataset(df: DataFrame, name: str, cfg: dict):
-    """Envuelve un split como Dataset de MLflow. El digest es el hash semántico del plan
-    lógico (sin escaneo). Sin `version=` — eso es solo para Delta; el snapshot lo fijamos
-    a través de source_snapshot_id."""
+    """Crea un split como Dataset de MLflow. El digest es el hash semántico del plan
+    lógico (sin escaneo). Sin `version=` — eso es solo para Delta; el snapshot se fija
+    con source_snapshot_id."""
     return mlflow.data.from_spark(
         df,
         table_name=cfg["source"],
@@ -183,9 +172,7 @@ def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
         "phase": phase,
         "project_name": cfg["project_name"],
         "created_by": CREATED_BY,
-        # Se pone en cada run para que la columna nunca esté dispersa; solo la Fase 2 fija A/B.
         "more_data_subset": "none",
-        # Los años del pool de entrenamiento (more-data-A lo sobrescribe con su subconjunto).
         "training_data": str(TRAIN_VAL_YEARS),
     }
     if extra:
@@ -210,13 +197,19 @@ def main() -> None:
                 f"MODO RÁPIDO — muestreando {FAST_SAMPLE_FRACTION:.0%} de gold, "
                 "grids/folds mínimos. Solo prueba de humo; métricas sin valor."
             )
+        elif sample_fraction >= 1.0:
+            progress(
+                f"Entrenando sobre la tabla gold completa "
+                f"(sample_fraction={SAMPLE_FRACTION:.2f}; bajarla es la palanca "
+                "para acotar el coste del CV)."
+            )
         else:
             progress(
                 f"Muestreando {SAMPLE_FRACTION:.0%} de gold para entrenar "
                 "(acota el coste del CV; cada fold sigue con millones de filas)."
             )
 
-        # ---- Fase 0: descartamos las categóricas redundantes (derivables de location_id) ----
+        # ---- Fase 0: se descartan las categóricas redundantes (derivables de location_id) ----
         redundant = list(cfg["redundant_categoricals"])
         cfg = {**cfg, "categorical_cols": [
             c for c in cfg["categorical_cols"] if c not in redundant
@@ -225,9 +218,9 @@ def main() -> None:
         print(f"  descartadas: {redundant}")
         print(f"  categóricas restantes: {cfg['categorical_cols']}")
 
-        # ---- Carga + proyección + muestreo opcional + features cíclicas ----
-        # Fijamos el estado de los datos (hash de main en Nessie + snapshot id del origen)
-        # en cada versión, para que más adelante se pueda reconstruir la entrada exacta.
+        # ---- Carga, proyección, muestreo opcional y features cíclicas ----
+        # El estado de los datos (hash de main en Nessie y snapshot id del origen) se fija
+        # en cada versión para poder reconstruir después la entrada exacta.
         nessie_main_hash = nessie.current_ref_hash(spark, "main") or ""
         source_snapshot_id = nessie.latest_snapshot_id(spark, cfg["source"])
         progress(
@@ -236,7 +229,6 @@ def main() -> None:
         )
 
         progress(f"Leyendo {cfg['source']}...")
-        # year_col se proyecta aunque no sea feature: make_splits y la Fase 2 filtran por él.
         cols_to_keep = [
             cfg["label_col"], cfg["year_col"],
             *cfg["numerical_cols"], *cfg["categorical_cols"],
@@ -262,8 +254,6 @@ def main() -> None:
             print("train o val vacío. ¿Está gold poblado?")
             sys.exit(1)
 
-        # Construimos los Datasets de entrada una vez y los reutilizamos entre runs (barato:
-        # el digest es un hash semántico) para que el campo "Datasets used" salga uniforme.
         ds_train = _make_dataset(train, f"{use_case}_train", cfg)
         ds_val = _make_dataset(val, f"{use_case}_val", cfg)
         ds_common_test = _make_dataset(common_test, f"{use_case}_common_test", cfg)
@@ -295,7 +285,7 @@ def main() -> None:
         )
         print(f"  Baseline en common_test: {baseline_metrics}")
 
-        # Única fuente de verdad para elegir al champion; cada fase va añadiendo.
+        # Lista de candidatos a registrar
         candidates: list[dict] = []
 
         def record(run_id, run_name, algorithm, phase, params, all_metrics,
@@ -364,7 +354,7 @@ def main() -> None:
         print(f"    mejores params: {winner_params}")
 
         # ---- Fase 2: Más datos — A (subconjunto) vs ganador de la Fase 1 (= B) ------
-        # Ambos se puntúan sobre common_test = TEST_YEAR, aislando "¿ayudan más datos?".
+        # Ambos se puntúan sobre common_test = TEST_YEAR
         print(f"\n=== Fase 2: Más datos — A vs ganador Fase 1 (= B) para {winner} ===")
         MlflowClient().set_tag(winner_run_id, "more_data_subset", "B")
         training_winner_candidate["extra_tags"]["more_data_subset"] = "B"
@@ -406,7 +396,7 @@ def main() -> None:
                                "training_data": str(SUBSET_A_YEARS)})
             _print_metrics(metrics)
 
-        # ---- Resumen — ordenado por val_rmse; common_test se reporta, nunca se usa para rankear ----
+        # ---- Resumen — ordenado por val_rmse----
         print("\n=== Resumen (todos los candidatos, ordenados por val_rmse) ===")
         header = (
             f"{'run_name':<22} {'algorithm':<6} "
@@ -427,10 +417,10 @@ def main() -> None:
             )
         print(
             f"\nBaseline common_test_rmse: {baseline_metrics['rmse']:.4f}  "
-            f"(solo informativo — common_test no se usa para rankear candidatos)"
+            f"(solo informativo — common_test no se usa para ordenar candidatos)"
         )
 
-        # ---- Fase 3: Registramos cada candidato ---------------------------
+        # ---- Fase 3: se registra cada candidato ---------------------------
         # El candidato con menor val_rmse es el aspirante a @champion.
         champ_candidate = ranked[0]
 

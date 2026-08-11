@@ -82,7 +82,10 @@ def review_tag_name(layer: str, table: str, year: int, month: int) -> str:
 
 
 def current_ref_hash(spark: SparkSession, ref: str = "main") -> str | None:
-    """Hash del último commit en `ref` (rama o tag), o None si no se conoce. Fija el estado de Nessie en tiempo de ejecución."""
+    """Hash del último commit de `ref` (rama o tag), o None si no existe.
+
+    Fija el estado de Nessie en un instante dado.
+    """
     rows = (
         spark.sql("LIST REFERENCES IN nessie")
         .filter(f"name = '{ref}'")

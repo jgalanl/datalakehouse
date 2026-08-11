@@ -24,7 +24,8 @@ TABLE_LOCATION = nessie.table_location("bronze", "yellow_taxi")
 SCHEMA_REPORT_PATH = Path(__file__).parent / "schema_differences.txt"
 DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")
 
-# Esquema de las tablas bronze. Todos los campos son nullable para permitir la evolución del esquema.
+# Esquema canónico de bronze. Todos los campos son nullable: bronze es fiel al origen,
+# incluidos sus valores ausentes.
 BRONZE_SCHEMA = StructType([
     StructField("VendorID", LongType(), nullable=True),
     StructField("tpep_pickup_datetime", TimestampNTZType(), nullable=True),
@@ -166,9 +167,9 @@ def validate_ingestion(
             f"Discrepancia de columnas. Faltan: {missing or 'ninguna'}, sobran: {extra or 'ninguna'}"
         )
 
-    # Validamos solo el delta del append: la tabla acumula los meses anteriores ya
+    # Se valida solo el delta del append: la tabla acumula los meses anteriores ya
     # fusionados, así que su total no dice nada sobre lo que escribió este mes.
-    # (No filtramos por (año, mes): el parquet de la TLC trae filas sueltas fuera de
+    # (Sin filtro por (año, mes): el parquet de la TLC trae filas sueltas fuera de
     # ventana, así que num_rows del fichero no coincide con la partición.)
     appended = table_df.count() - prev_count
     if appended != expected_count:

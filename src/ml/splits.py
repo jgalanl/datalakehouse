@@ -5,12 +5,14 @@ from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, cos as spark_cos, lit, sin as spark_sin
 from pyspark.sql.types import DoubleType
 
+from ml.algorithms import TREE_ALGORITHMS
+
 
 TEST_YEAR: int = 2025
 TRAIN_VAL_YEARS: list[int] = [2023, 2024]
 SUBSET_A_YEARS: list[int] = [2023]
 
-# Reparticionamos para que cada bloque columnar cacheado quepa en un executor de 3 GB.
+# Se reparticiona para que cada bloque columnar cacheado quepa en un executor de 3 GB.
 SPLIT_PARTITIONS = 64
 
 
@@ -25,14 +27,13 @@ def make_splits(
 ) -> tuple[DataFrame, DataFrame, DataFrame]:
     """Holdout del último año: (train, val, common_test).
 
-    common_test son todas las filas de test_year, que nunca se tocan durante el
-    entrenamiento ni la selección. train/val es un split aleatorio por año de train_val_years.
+    common_test son todas las filas de test_year, nunca vistas durante el
+    entrenamiento ni la selección. train/val se reparte al azar por año dentro
+    de train_val_years.
     """
     train_val_years = train_val_years or TRAIN_VAL_YEARS
     test_year = test_year if test_year is not None else TEST_YEAR
 
-    # Cacheamos una vez para que randomSplit sea determinista. Si no, el padre lazy
-    # se recalcula en cada acción y las filas se mueven entre (o fuera de) los splits.
     df = df.cache()
 
     common_test = df.filter(col(year_col) == test_year)
@@ -47,19 +48,14 @@ def make_splits(
     val = reduce(DataFrame.unionByName, (p[1] for p in parts)).repartition(n_partitions)
     common_test = common_test.repartition(n_partitions)
 
-    # Materializamos los hijos en su propia caché (con el padre aún cacheado, así
-    # randomSplit es determinista) y soltamos el padre: nadie más lo consume.
     for child in (train, val, common_test):
         child.cache().count()
     df.unpersist()
     return train, val, common_test
 
 
-# Codificamos hora (0..23), día de la semana (0..6) y semana ISO (1..53) como sin/cos para
-# que los extremos queden pegados: las 23h junto a las 0h, y la semana 52/53 junto a la 1
-# (weekofyear es ISO, así que el 1 de enero cae en la semana 52 del año anterior — sin esta
-# codificación GLR ve un salto artificial de 52 a 1 dentro del mismo enero).
-# GLR lo necesita; los árboles dividen sobre los enteros, así que no.
+# Hora (0..23), día de la semana (0..6) y semana ISO (1..53) se codifican como sin/cos
+# para pegar los extremos: las 23h junto a las 0h, y la semana 52/53 junto a la 1
 CYCLICAL_COLS: dict[str, int] = {
     "pickup_hour": 24,
     "pickup_dow": 7,
@@ -94,8 +90,6 @@ def resolve_numerical_cols(
     algorithm: str, base_numerical_cols: list[str],
 ) -> list[str]:
     """Los árboles (GBT, RFR) mantienen la hora/día enteros; GLR cambia al par sin/cos."""
-    from ml.algorithms import TREE_ALGORITHMS  # import tardío para romper un ciclo
-
     if algorithm in TREE_ALGORITHMS:
         return base_numerical_cols
     out: list[str] = []

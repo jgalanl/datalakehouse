@@ -17,7 +17,7 @@ from common import nessie_manager as nessie
 
 YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
-# SOURCE_* se leen en silver, TARGET se escribe en main; la rama activa selecciona la capa.
+# Se leen desde silver, se escribe en main.
 SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
 SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
 TARGET = "nessie.nyc.pickup_demand_zone_hour"
@@ -27,8 +27,7 @@ TARGET_LOCATION = nessie.table_location("gold", "pickup_demand_zone_hour")
 # join nunca debería dejar una zona en nulo.
 MAX_NULL_ZONE_ROWS = 0
 
-# Las claves del group-by, las features temporales y la auditoría hacen que todas las
-# columnas sean no nulas salvo service_zone (el zone_lookup de silver lo deja nullable).
+# Schema de la tabla gold, que se crea si no existe
 GOLD_SCHEMA = StructType([
     StructField("hour_bucket", TimestampNTZType(), nullable=False),
     StructField("pu_location_id", IntegerType(), nullable=False),
@@ -90,7 +89,7 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
             "pu_location_id", "pu_borough", "pu_zone", "pu_service_zone",
             # Features temporales derivadas
             "hour_year", "hour_month", "hour_week", "hour_dow", "hour_of_day",
-            # Variable objetivo + métricas auxiliares
+            # Variable objetivo y métricas auxiliares
             "n_pickups",
             "total_revenue", "avg_fare", "avg_tip",
             "avg_distance", "avg_passengers",
@@ -148,7 +147,7 @@ def wap_aggregate(
 
         gold_df = transform(trips, zones).cache()
         try:
-            # Una sola pasada de agregación: recuento de filas, conservación de pickups y filas con zona nula.
+            # Recuento de filas, conservación de pickups y filas con zona nula.
             stats = gold_df.agg(
                 count("*").alias("gold_count"),
                 spark_sum("n_pickups").alias("total_pickups"),

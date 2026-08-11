@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Envía un payload dataframe_split a un modelo de MLflow servido en local e imprime las predicciones.
-Solo librería estándar — corre en el host. Uso: python src/ml/api/client.py [fare|duration|demand] [--json FILE] [--host H] [--port P]"""
+Uso: python src/ml/api/client.py [fare|duration|demand] [--json FILE] [--host H] [--port P]"""
 import argparse
 import json
 import os
@@ -37,7 +37,7 @@ def main():
         with urllib.request.urlopen(req, timeout=60) as resp:
             print(json.dumps(json.load(resp), indent=2))
     except urllib.error.HTTPError as e:
-        # MLflow devuelve el motivo del fallo en el cuerpo de la respuesta; lo mostramos.
+        # MLflow devuelve el motivo del fallo en el cuerpo de la respuesta.
         sys.exit(f"HTTP {e.code} desde {url}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
         sys.exit(f"No se pudo conectar con {url}: {e.reason} (¿está activo el perfil `api`?)")

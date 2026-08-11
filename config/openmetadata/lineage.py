@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
-"""Declara el linaje del medallón + modelos en OpenMetadata como aristas manuales.
+"""Declara en OpenMetadata el linaje de la arquitectura medallón y los modelos.
 
-OM OSS no infiere linaje tabla-a-tabla desde los conectores de Iceberg/MLflow
-(la ingesta es solo de metadatos de entidad), así que el grafo del flujo se declara
-explícitamente aquí, a nivel de tabla y de columna. Idempotente (PUT /api/v1/lineage):
-run_ingestion.sh lo ejecuta tras las ingestas, de modo que el linaje se reconstruye
-en cada ejecución.
-
-El mapeo de columnas reproduce los pipelines gold: renombrados a snake_case, features
-temporales derivadas del timestamp de recogida, y las columnas de zona que provienen del
-broadcast join con taxi_zone_lookup. Las aristas gold->modelo quedan a nivel de tabla
-(una entidad ML Model no tiene columnas mapeables). El recuento n_pickups se omite del
-linaje de columna por ser un count(*) sin columna de origen.
-
-Entorno: OM_HOST (por defecto http://localhost:8585) y OM_JWT (JWT del ingestion-bot).
+Las aristas se envían como PUT idempotentes, así que se reconstruyen en cada ingesta.
 """
 import json
 import os
@@ -31,7 +19,7 @@ S = "iceberg_silver.nessie.nyc."
 G = "iceberg_gold.nessie.nyc."
 M = "mlflow_registry."
 
-# Mapeo de columnas silver -> gold yellow_taxi_trips (renombrados + derivadas del timestamp)
+# Mapeo de columnas silver -> gold yellow_taxi_trips (renombrados y derivadas del timestamp)
 TRIPS_FROM_TAXI = [
     ("pickup_datetime", ["tpep_pickup_datetime"]),
     ("dropoff_datetime", ["tpep_dropoff_datetime"]),
@@ -93,14 +81,14 @@ ZONE_BRONZE_TO_SILVER = [
 EDGES = [
     # bronze -> silver (limpieza)
     (B + "yellow_taxi", S + "yellow_taxi",
-     "Silver ETL — clean_yellow_taxi.py: filtrado de validez + outliers IQR (Tukey k=3) por RatecodeID",
+     "Silver ETL — clean_yellow_taxi.py: filtrado de validez y outliers IQR (Tukey k=3) por RatecodeID",
      "IDENTITY"),
     (B + "taxi_zone_lookup", S + "taxi_zone_lookup",
      "Silver ETL — clean_zone_lookup.py: refresco completo de la tabla de zonas",
      ZONE_BRONZE_TO_SILVER),
     # silver -> gold (enriquecimiento / agregación)
     (S + "yellow_taxi", G + "yellow_taxi_trips",
-     "Gold ETL — build_yellow_taxi_trips.py: enriquecimiento + features temporales",
+     "Gold ETL — build_yellow_taxi_trips.py: enriquecimiento y features temporales",
      TRIPS_FROM_TAXI),
     (S + "taxi_zone_lookup", G + "yellow_taxi_trips",
      "Gold ETL — build_yellow_taxi_trips.py: broadcast join de zonas (PU/DO)",
@@ -111,7 +99,7 @@ EDGES = [
     (S + "taxi_zone_lookup", G + "pickup_demand_zone_hour",
      "Gold ETL — aggregate_demand_zone_hour.py: broadcast join de zonas",
      DEMAND_FROM_ZONE),
-    # gold -> modelos (entrenamiento) — a nivel de tabla (un ML Model no tiene columnas)
+    # gold -> modelos (entrenamiento) — a nivel de tabla
     (G + "yellow_taxi_trips", M + "fare_prediction",
      "Entrenamiento — train.py fare (GBT @champion)", None),
     (G + "yellow_taxi_trips", M + "trip_duration",
@@ -154,7 +142,7 @@ def build_columns_lineage(mapping, src_fqn, dst_fqn, cols):
 
 
 def main():
-    # id + type por FQN; y FQN de cada columna por (tablaFQN, nombre)
+    # id y type por FQN; y FQN de cada columna por (tablaFQN, nombre)
     ref, cols = {}, {}
     _, tpage = api("GET", "/api/v1/tables?fields=columns&limit=1000")
     for t in tpage["data"]:

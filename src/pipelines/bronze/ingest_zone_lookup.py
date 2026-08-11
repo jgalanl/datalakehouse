@@ -18,7 +18,7 @@ ZONE_LOOKUP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.c
 TABLE = "nessie.nyc.taxi_zone_lookup"
 TABLE_LOCATION = nessie.table_location("bronze", "taxi_zone_lookup")
 DOWNLOAD_DIR = Path("/opt/spark/src/.tmp_ingest")  # bind mount compartido
-# Esquema bronze de la tabla de zonas. Todos los campos son nullable para permitir la evolución del esquema.
+# Esquema bronze de la tabla de zonas. Todos los campos son nullable: bronze es fiel al origen.
 BRONZE_ZONE_SCHEMA = StructType([
     StructField("LocationID", IntegerType(), nullable=True),
     StructField("Borough", StringType(), nullable=True),

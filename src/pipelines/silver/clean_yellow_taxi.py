@@ -23,24 +23,24 @@ TARGET_LOCATION = nessie.table_location("silver", "yellow_taxi")
 VALID_LOCATION_MIN = 1
 VALID_LOCATION_MAX = 265
 
-# Diccionario de datos de la TLC (edición 2024).
+# Diccionario de datos de la TLC
 VALID_VENDOR_IDS    = [1, 2, 6, 7]           # Creative Mobile Tech, Curb Mobility, Myle Technologies, Helix
 VALID_RATE_CODES    = [1, 2, 3, 4, 5, 6, 99] # Estándar, JFK, Newark, Nassau/Westchester, Negociada, Grupo, Nulo/desconocido
 VALID_PAYMENT_TYPES = [0, 1, 2, 3, 4, 5, 6]  # Flex Fare, Tarjeta, Efectivo, Sin cargo, Disputa, Desconocido, Anulado
 
-# Eliminación de outliers por IQR: descarta las filas fuera de los límites Tukey "far out"
-# [Q1-k*IQR, Q3+k*IQR] (k=3.0), calculados por RatecodeID.
+# Eliminación de outliers por IQR
+# [Q1-k*IQR, Q3+k*IQR] (k=3.0), calculadas por RatecodeID.
 IQR_K = 3.0
-# Duración del viaje (segundos): solo sirve de base para su propio límite IQR; se descarta antes de escribir, no se guarda.
+# Duración del viaje (segundos)
 DURATION_COL = "_trip_duration_s"
 OUTLIER_COLS = ["fare_amount", "total_amount", "trip_distance", DURATION_COL]
 
 # Fracción máxima de filas que clean() puede descartar antes de que falle la auditoría.
 MAX_DROP_RATIO = 0.3
 
-# Esquema silver: NOT NULL en cada columna que clean() vuelve no nula de forma demostrable;
-# nullable en los recargos que no filtra (extra, mta_tax, improvement_surcharge) y en los
-# campos que dependen del año (congestion_surcharge, airport_fee, cbd_congestion_fee).
+# Esquema silver: Not null en todas las columnas salvo las que TLC
+# documenta como opcionales
+# (extra, mta_tax, improvement_surcharge, congestion_surcharge, airport_fee, cbd_congestion_fee).
 SILVER_SCHEMA = StructType([
     StructField("VendorID", LongType(), nullable=False),
     StructField("tpep_pickup_datetime", TimestampNTZType(), nullable=False),
@@ -66,16 +66,7 @@ SILVER_SCHEMA = StructType([
 
 
 def remove_outliers(df: DataFrame) -> DataFrame:
-    """Descarta las filas fuera de los límites Tukey "far out", calculados por RatecodeID.
-
-    Los q1/q3 de cada código (un groupBy, <=7 filas recogidas) se incrustan en un
-    CASE WHEN por columna, así el filtro corre en una sola pasada y sin join. Se recortan
-    ambas colas.
-
-    Los cuantiles son exactos (percentile, no percentile_approx): el sketch aproximado
-    depende del particionado, así que la misma rodaja de bronze producía vallas —y por
-    tanto filas— distintas en cada ejecución. Aquí es además más barato: percentile
-    agrega sobre valores distintos (<= ~13 k por columna al mes), no sobre filas.
+    """Descarta las filas fuera de las vallas de Tukey "far out", calculadas por RatecodeID.
     """
     fences = df.groupBy("RatecodeID").agg(
         *[expr(f"percentile({c}, array(0.25, 0.75))").alias(c)
@@ -84,7 +75,7 @@ def remove_outliers(df: DataFrame) -> DataFrame:
 
     keep = lit(True)
     for c in OUTLIER_COLS:
-        col_keep = lit(True)  # por defecto: sin límite -> la fila pasa
+        col_keep = lit(True)
         for r in fences:
             q1, q3 = r[c]
             iqr = q3 - q1
@@ -98,16 +89,15 @@ def remove_outliers(df: DataFrame) -> DataFrame:
 
 
 def clean(df: DataFrame) -> DataFrame:
-    """Aplica las reglas de limpieza silver a una porción de bronze: primero el
-    filtrado de validez (nulos, orden incorrecto, importes no positivos, códigos/IDs
-    fuera de rango, duplicados) y después la eliminación de outliers por IQR."""
+    """Aplica las reglas de limpieza silver a bronze.
+    Devuelve un DataFrame con el mismo esquema que SILVER_SCHEMA"""
     valid = (
         df
         .filter(col("tpep_pickup_datetime").isNotNull())
         .filter(col("tpep_dropoff_datetime").isNotNull())
         .filter(col("tpep_pickup_datetime") < col("tpep_dropoff_datetime"))
         .filter(col("trip_distance") >= 0)
-        .filter(col("fare_amount") > 0)   
+        .filter(col("fare_amount") > 0)
         .filter(col("total_amount") > 0)
         .filter(col("tip_amount") >= 0)
         .filter(col("tolls_amount") >= 0)
@@ -136,7 +126,7 @@ def table_exists(spark: SparkSession) -> bool:
 
 
 def validate(bronze_count: int, silver_count: int) -> tuple[bool, str]:
-    """Paso de auditoría: devuelve (passed, reason). Nunca lanza excepción; el WAP decide qué hacer."""
+    """Validación de la auditoría: devuelve (passed, reason). Nunca lanza excepción; el WAP decide qué hacer."""
     if silver_count == 0:
         return False, "silver vacío tras la limpieza"
     drop_ratio = (bronze_count - silver_count) / bronze_count
@@ -154,15 +144,13 @@ def validate(bronze_count: int, silver_count: int) -> tuple[bool, str]:
 def wap_clean(
     spark: SparkSession, year_val: int, m: int, branch_name: str
 ) -> tuple[int, int, bool, str]:
-    """Ciclo WAP: Write → Audit → Publish (merge) o rechazo. Nunca fusiona si falla;
-    quien llama pone la rama en cuarentena. Devuelve (bronze, silver, passed, reason)."""
+    """Ciclo WAP: Write → Audit → Publish (merge) o rechazo. Nunca fusiona si falla.
+    Devuelve (bronze, silver, passed, reason)."""
     label = f"{year_val}-{m:02d}"
 
     try:
         nessie.create_branch(spark, branch_name, from_ref="silver")
-
         nessie.set_spark_branch(spark, "bronze")
-        # Cacheamos la porción de bronze: se lee tres veces (recuento, cuantiles, materialización de silver).
         bronze_df = spark.table(SOURCE).filter(
             (spark_year(col("tpep_pickup_datetime")) == year_val) &
             (spark_month(col("tpep_pickup_datetime")) == m)
@@ -175,8 +163,8 @@ def wap_clean(
                 print(f"  [{label}] Sin datos bronze este mes, se omite")
                 return 0, 0, True, "sin datos bronze"
 
-            # Cacheamos la porción limpia: se materializa en el ref de bronze antes del
-            # cambio, así la escritura nunca vuelve a resolver el origen contra la rama WAP.
+            # Se cachea la porción limpia: se materializa en el ref de bronze antes del
+            # cambio, así la escritura nunca resuelve el origen contra la rama WAP.
             silver_df = clean(bronze_df).cache()
             try:
                 silver_count = silver_df.count()
@@ -239,7 +227,7 @@ def main():
             )
 
             if not passed:
-                # Cuarentena: congelamos el snapshot fallido como tag de revisión, borramos la rama y seguimos.
+                # Cuarentena: el snapshot fallido se congela como tag de revisión y se borra la rama.
                 review_tag = nessie.review_tag_name("silver", "yellow_taxi", year_val, m)
                 print(f"  [{label}] Poniendo en cuarentena como tag '{review_tag}'")
                 nessie.create_tag(spark, review_tag, from_ref=branch_name)
@@ -247,7 +235,7 @@ def main():
                 quarantined.append((label, review_tag, reason))
                 continue
 
-            # Aprobado (o mes vacío): borramos la rama WAP.
+            # Aprobado (o mes vacío): se borra la rama WAP.
             nessie.drop_branch(spark, branch_name)
 
             if bronze_count == 0:
@@ -258,7 +246,7 @@ def main():
             processed += 1
             merged_in_year += 1
 
-        # Etiquetamos el año si se fusionó al menos un mes, aunque algún mes posterior
+        # El año se etiqueta si se fusionó al menos un mes, aunque alguno posterior
         # quedara en cuarentena: el tag sigue marcando un snapshot real de silver.
         if merged_in_year > 0:
             tag_name = nessie.yearly_tag_name("silver", "yellow_taxi", year_val)

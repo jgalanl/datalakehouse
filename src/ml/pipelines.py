@@ -18,7 +18,7 @@ def build_regression_pipeline(
     label_col: str,
     estimator,
     one_hot: bool = False,
-    scale: str | None = None,        # "standard" o None
+    scale: str | None = None,
     vector_index: bool = False,
 ) -> Pipeline:
     indexers = [
@@ -37,8 +37,8 @@ def build_regression_pipeline(
     stages: list = [*indexers, *encoders]
 
     if scale == "standard":
-        # Escalamos solo las numéricas. Las columnas one-hot tienen una desviación casi nula,
-        # así que escalarlas dispararía las categorías raras a magnitudes enormes.
+        # Solo se escalan las numéricas: las one-hot tienen desviación casi nula, así
+        # que escalarlas dispararía las categorías raras a magnitudes enormes.
         stages.append(VectorAssembler(
             inputCols=numerical_cols,
             outputCol="numerical_raw",

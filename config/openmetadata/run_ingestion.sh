@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 # Ejecuta los flujos de ingesta de OpenMetadata mediante la imagen oficial de ingesta.
-#   - Iceberg: un servicio de catálogo por rama del medallón (bronze/silver/gold),
-#     inyectando la referencia de Nessie vía NESSIE_ICEBERG_PREFIX (el conector OSS no
-#     expone el prefix Iceberg-REST — ver docker/om-ingestion/Dockerfile).
-#   - MLflow: todos los modelos registrados (los tres experimentos), sin filtro.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -37,7 +33,6 @@ ingest() {  # ingest <rendered-yaml> [docker-run extra args...]
 }
 
 # --- Iceberg: una capa (rama de Nessie) por servicio ---
-# rama de Nessie  ->  nombre del servicio en OpenMetadata
 declare -A ICEBERG_SERVICES=(
   [bronze]=iceberg_bronze
   [silver]=iceberg_silver
@@ -58,10 +53,7 @@ render config/openmetadata/mlflow_metadata.yaml "$OUT"
 echo ">> ingestando mlflow (todos los modelos registrados)"
 ingest "$OUT"
 
-# --- Linaje del medallón + modelos ---
-# OM no infiere linaje tabla-a-tabla desde Iceberg/MLflow (ingesta solo de entidad),
-# así que las aristas del flujo bronze->silver->gold->modelos se declaran explícitamente
-# (idempotente). Se corre en la imagen de ingesta, sobre la red de Compose.
+# --- Linaje del medallón y modelos ---
 echo ">> declaring lineage edges (bronze -> silver -> gold -> modelos)"
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
 docker run --rm --network "$NETWORK" \

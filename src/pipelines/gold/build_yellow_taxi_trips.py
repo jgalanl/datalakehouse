@@ -17,7 +17,7 @@ from common import nessie_manager as nessie
 
 YEARS = [2023, 2024, 2025]
 MONTHS = [1, 2, 3]
-# SOURCE_* se leen en silver, TARGET se escribe en main; la rama activa selecciona la capa.
+# Se lee desde silver, se escribe en main
 SOURCE_TRIPS = "nessie.nyc.yellow_taxi"
 SOURCE_ZONES = "nessie.nyc.taxi_zone_lookup"
 TARGET = "nessie.nyc.yellow_taxi_trips"
@@ -27,8 +27,7 @@ TARGET_LOCATION = nessie.table_location("gold", "yellow_taxi_trips")
 # join nunca debería dejar una zona en nulo.
 MAX_NULL_ZONE_ROWS = 0
 
-# Gold es un contrato con el consumidor: las columnas demostrablemente no nulas llevan NOT NULL.
-# Los recargos que dependen del año y el service_zone sin filtrar siguen siendo nullable.
+# Schema de la tabla gold, que se crea si no existe
 GOLD_SCHEMA = StructType([
     StructField("pickup_datetime", TimestampNTZType(), nullable=False),
     StructField("dropoff_datetime", TimestampNTZType(), nullable=False),
@@ -88,7 +87,7 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
         .withColumnRenamed("DOLocationID", "do_location_id")
         .withColumnRenamed("tpep_pickup_datetime", "pickup_datetime")
         .withColumnRenamed("tpep_dropoff_datetime", "dropoff_datetime")
-        # Casteamos las columnas tipo entero; silver mantiene ratecode_id como Double por el drift de esquema.
+        # Se castean las columnas enteras; silver mantiene ratecode_id como Double por el drift de esquema.
         .withColumn("vendor_id", col("vendor_id").cast("int"))
         .withColumn("ratecode_id", col("ratecode_id").cast("int"))
         .withColumn("pu_location_id", col("pu_location_id").cast("int"))
@@ -112,7 +111,7 @@ def transform(trips: DataFrame, zones: DataFrame) -> DataFrame:
         .join(broadcast(do_zones), on="do_location_id", how="left")
     )
 
-    # Orden de columnas explícito: gold es un contrato con el consumidor, el esquema debe ser estable.
+    # Orden de columnas explícito
     return joined.select(
         # Identidad y tiempo
         "pickup_datetime", "dropoff_datetime",
@@ -164,7 +163,7 @@ def wap_build(
     try:
         nessie.create_branch(spark, branch_name, from_ref="main")
 
-        # Leemos las entradas de silver en el ref de silver.
+        # Las entradas se leen de silver en su propio ref.
         nessie.set_spark_branch(spark, "silver")
         zones = spark.table(SOURCE_ZONES)
         trips = spark.table(SOURCE_TRIPS).filter(
@@ -178,11 +177,11 @@ def wap_build(
             print(f"  [{label}] Sin datos silver este mes, se omite")
             return 0, 0, True, "sin datos silver"
 
-        # Materializamos antes de cambiar de ref; si no, la escritura volvería a leer silver
+        # Se materializa antes de cambiar de ref; si no, la escritura volvería a leer silver
         # mientras el catálogo apunta a la rama WAP en main.
         gold_df = transform(trips, zones).cache()
         try:
-            # Una sola pasada de agregación: recuento de filas + filas con zona nula (PU o DO).
+            # Recuento de filas y filas con zona nula (PU o DO).
             stats = gold_df.agg(
                 count("*").alias("gold_count"),
                 spark_sum(when(

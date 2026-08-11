@@ -1,6 +1,4 @@
 # Ingesta de OpenMetadata — MODELOS ML mediante MLflow.
-# Extrae los modelos registrados (p. ej. fare_prediction + versiones/champion) desde el
-# tracking + registry de MLflow hacia OpenMetadata como entidades ML Model.
 # __OM_JWT__ lo inyecta en tiempo de ejecución run_ingestion.sh desde .env.
 source:
   type: mlflow

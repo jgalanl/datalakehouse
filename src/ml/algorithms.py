@@ -65,12 +65,8 @@ _RFR_BASE: dict = {
     "maxBins": TREE_MAX_BINS, "seed": 42,
 }
 
-# Cuatro puntos por algoritmo: mismo presupuesto, acotado para que el CV salga barato
-# (4 × 3 folds = 12 fits cada uno). GLR barre regParam, GBT barre la profundidad más un
-# tanteo de GBM estocástico, y RFR barre el tamaño del bosque más un tanteo de profundidad.
+# 4 × 3 folds = 12 fits cada uno
 FULL_PARAM_GRIDS: dict[str, list[dict]] = {
-    # Saltamos regParam 0 y 0.01: con gamma/log la matriz es deficiente de rango ahí y
-    # rompe Cholesky/LBFGS. El óptimo cae en la banda 0.1–3.0 de todas formas.
     "glr": [
         {"regParam": 0.1, "maxIter": 25},
         {"regParam": 0.5, "maxIter": 25},
