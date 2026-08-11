@@ -155,15 +155,14 @@ Todas las tablas comparten un único *namespace* lógico, `nyc`, que identifica 
 no aparece en el nombre de la tabla, sino en la rama de Nessie donde reside**, así que un mismo
 identificador apunta a una tabla física distinta según la referencia activa de la sesión.
 
-```
-rama     identificador de tabla                — descripción
-bronze   nessie.nyc.yellow_taxi                — ingesta fiel al origen, particionada por months(tpep_pickup_datetime)
-bronze   nessie.nyc.taxi_zone_lookup           — referencia, sin particionar (265 filas)
-silver   nessie.nyc.yellow_taxi                — depurada y conformada
-silver   nessie.nyc.taxi_zone_lookup           — nombres de zona normalizados
-main     nessie.nyc.yellow_taxi_trips          — nivel viaje: zonas desnormalizadas y atributos temporales
-main     nessie.nyc.pickup_demand_zone_hour    — agregado (pu_location_id, hour_bucket)
-```
+| Rama     | Identificador de tabla                 | Descripción                                                             |
+| -------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| `bronze` | `nessie.nyc.yellow_taxi`               | Ingesta fiel al origen, particionada por `months(tpep_pickup_datetime)` |
+| `bronze` | `nessie.nyc.taxi_zone_lookup`          | Referencia, sin particionar (265 filas)                                 |
+| `silver` | `nessie.nyc.yellow_taxi`               | Depurada y conformada                                                   |
+| `silver` | `nessie.nyc.taxi_zone_lookup`          | Nombres de zona normalizados                                            |
+| `main`   | `nessie.nyc.yellow_taxi_trips`         | Nivel viaje: zonas desnormalizadas y atributos temporales               |
+| `main`   | `nessie.nyc.pickup_demand_zone_hour`   | Agregado por `(pu_location_id, hour_bucket)`                            |
 
 - Cada tabla se crea con un `LOCATION` explícito (`s3a://warehouse/{capa}/nyc/{tabla}`). Sin él,
   el *namespace* compartido dejaría todas las capas sobre la misma ruta.
@@ -605,7 +604,7 @@ Los notebooks se abren desde Jupyter (`http://localhost:8888`) intercalados en e
 [verify gold](src/notebooks/gold/verify_iceberg.ipynb) →
 [diagnósticos de ML](src/notebooks/ml/).
 
-No hay pruebas unitarias: la corrección se comprueba de extremo a extremo con las puertas de
+La corrección se comprueba de extremo a extremo con las puertas de
 auditoría del ciclo WAP y con los notebooks `verify_iceberg.ipynb` de cada capa. Al cambiar un
 esquema conviene volver a ejecutar el de la capa afectada.
 
