@@ -1,4 +1,4 @@
-mlflow[postgres,s3]==2.22.1
+mlflow[postgres,s3]==3.13.0rc0
 psycopg2-binary==2.9.10
 boto3==1.35.92
 pyarrow==17.0.0
