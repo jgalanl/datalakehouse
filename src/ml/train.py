@@ -1,17 +1,16 @@
 """Script de entrenamiento unificado: spark-submit src/ml/train.py <fare|duration|demand> [--fast].
 Cada ejecución registra todo en un único experimento de MLflow:
   Fase 0    descarta las categóricas redundantes (p. ej. borough, derivable de location_id).
-  baseline  media(etiqueta) por grupo — el suelo óptimo en RMSE de una constante por grupo.
-  Fase 1    un CV por algoritmo sobre su grid completo; gana el menor val_rmse.
-  Fase 2    más datos A (subconjunto) vs B (el ganador, reutilizado); ambos puntúan sobre TEST_YEAR.
-  Fase 3    registra los 4 candidatos; el ganador se queda con @champion solo si su
-            val_rmse supera al del champion del registro; si no, sigue de challenger.
+  Fase 1    un CV por algoritmo sobre su grid completo, entrenando siempre con
+            TRAIN_VAL_YEARS; gana el menor val_rmse.
+  Fase 2    registra los 3 candidatos; el ganador se queda con @champion solo si su
+            val_rmse mejora estrictamente el del champion del registro, que entonces
+            pasa a @previous (punto de reversión).
 """
 
 import sys
 
 import mlflow
-from mlflow import MlflowClient
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col
 
@@ -31,7 +30,6 @@ from ml.algorithms import (
 )
 from ml.pipelines import build_regression_pipeline
 from ml.splits import (
-    SUBSET_A_YEARS,
     TRAIN_VAL_YEARS,
     add_cyclical_features,
     make_splits,
@@ -39,18 +37,15 @@ from ml.splits import (
 )
 from ml.tracking import (
     MLFLOW_TRACKING_URI,
-    REGISTRY_MAX_VERSIONS,
     get_ml_spark,
-    log_baseline_run,
     progress,
     register_candidates,
     setup_mlflow,
-    train_and_log_run,
     tune_with_cv,
 )
 
 
-CREATED_BY = "jgalanllano"
+CREATED_BY = "jgalan"
 
 # Conjunto de features de yellow_taxi_trips, compartido por los casos fare y duration.
 TRIP_NUMERICAL_COLS = [
@@ -63,8 +58,6 @@ TRIP_CATEGORICAL_COLS = [
     "pu_borough", "do_borough",
     "vendor_id", "ratecode_id", "payment_type",
 ]
-TRIP_BASELINE_GROUP_COLS = ["pu_location_id", "pickup_hour"]
-
 TRIP_REDUNDANT_CATEGORICALS = ["pu_borough", "do_borough"]
 
 USE_CASES: dict[str, dict] = {
@@ -78,12 +71,11 @@ USE_CASES: dict[str, dict] = {
         "categorical_cols": TRIP_CATEGORICAL_COLS,
         "glr_family": "gamma",
         "project_name": "NYC Taxi Fare Prediction",
-        "baseline_group_cols": TRIP_BASELINE_GROUP_COLS,
         "label_filter_predicate": None,
         "redundant_categoricals": TRIP_REDUNDANT_CATEGORICALS,
     },
     "duration": {
-        "experiment": "trip_duration",
+        "experiment": "trip_duration_prediction",
         "app_name": "ml-trip-duration",
         "source": "nessie.nyc.yellow_taxi_trips",
         "label_col": "trip_duration_minutes",
@@ -92,7 +84,6 @@ USE_CASES: dict[str, dict] = {
         "categorical_cols": TRIP_CATEGORICAL_COLS,
         "glr_family": "gamma",
         "project_name": "NYC Taxi Trip Duration Prediction",
-        "baseline_group_cols": TRIP_BASELINE_GROUP_COLS,
         "label_filter_predicate": lambda c: c > 0,
         "redundant_categoricals": TRIP_REDUNDANT_CATEGORICALS,
     },
@@ -111,7 +102,6 @@ USE_CASES: dict[str, dict] = {
         ],
         "glr_family": "poisson",      # recuentos enteros no negativos
         "project_name": "NYC Taxi Pickup Demand Forecast",
-        "baseline_group_cols": ["pu_location_id", "hour_of_day"],
         "label_filter_predicate": None,
         "redundant_categoricals": ["pu_borough", "pu_service_zone"],
     },
@@ -172,7 +162,6 @@ def _common_tags(cfg: dict, phase: str, extra: dict | None = None) -> dict:
         "phase": phase,
         "project_name": cfg["project_name"],
         "created_by": CREATED_BY,
-        "more_data_subset": "none",
         "training_data": str(TRAIN_VAL_YEARS),
     }
     if extra:
@@ -236,14 +225,15 @@ def main() -> None:
         df = spark.table(cfg["source"]).select(*cols_to_keep)
         if cfg["label_filter_predicate"] is not None:
             df = df.filter(cfg["label_filter_predicate"](col(cfg["label_col"])))
-        if sample_fraction is not None:
+        if sample_fraction < 1.0:
             df = df.sample(sample_fraction, seed=42)
-        df, _added = add_cyclical_features(df, cfg["numerical_cols"])
+        df = add_cyclical_features(df, cfg["numerical_cols"])
 
-        # make_splits devuelve los splits ya cacheados y materializados.
+        # make_splits devuelve los splits ya cacheados
         train, val, common_test = make_splits(df, cfg["year_col"])
-        eval_splits: dict[str, DataFrame] = {"val": val, "common_test": common_test}
-        splits: dict[str, DataFrame] = {"train": train, **eval_splits}
+        splits: dict[str, DataFrame] = {
+            "train": train, "val": val, "common_test": common_test,
+        }
 
         progress("Materializando splits cacheados...")
         split_counts: dict[str, int] = {}
@@ -254,11 +244,11 @@ def main() -> None:
             print("train o val vacío. ¿Está gold poblado?")
             sys.exit(1)
 
-        ds_train = _make_dataset(train, f"{use_case}_train", cfg)
-        ds_val = _make_dataset(val, f"{use_case}_val", cfg)
-        ds_common_test = _make_dataset(common_test, f"{use_case}_common_test", cfg)
-        full_inputs = [(ds_train, "training"), (ds_val, "validation"),
-                       (ds_common_test, "testing")]
+        full_inputs = [
+            (_make_dataset(train, f"{use_case}_train", cfg), "training"),
+            (_make_dataset(val, f"{use_case}_val", cfg), "validation"),
+            (_make_dataset(common_test, f"{use_case}_common_test", cfg), "testing"),
+        ]
 
         common_params = {
             **{f"{k}_count": v for k, v in split_counts.items()},
@@ -270,40 +260,11 @@ def main() -> None:
             "source_snapshot_id": str(source_snapshot_id),
         }
 
-        # ---- Baseline -----------------------------------------------------
-        print("\n=== Baseline: media(label) por grupo ===")
-        progress("Baseline: puntuando el suelo media-por-grupo en cada split...")
-        baseline_metrics = log_baseline_run(
-            train_df=train,
-            eval_splits=splits,
-            label_col=cfg["label_col"],
-            group_cols=cfg["baseline_group_cols"],
-            tags=_common_tags(cfg, phase="baseline",
-                              extra={"algorithm": "mean-per-group"}),
-            extra_params=common_params,
-            input_datasets=full_inputs,
-        )
-        print(f"  Baseline en common_test: {baseline_metrics}")
-
-        # Lista de candidatos a registrar
-        candidates: list[dict] = []
-
-        def record(run_id, run_name, algorithm, phase, params, all_metrics,
-                   model, extra_tags=None):
-            candidates.append({
-                "run_id": run_id,
-                "run_name": run_name,
-                "algorithm": algorithm,
-                "phase": phase,
-                "params": params,
-                "metrics": all_metrics,
-                "model": model,
-                "extra_tags": extra_tags or {},
-            })
-
         # ---- Fase 1: Entrenamiento — CV completo por algoritmo -------------------
         # Un CV(k=cv_folds) por algoritmo sobre su grid completo; gana el algoritmo
-        # cuyo bestModel del CV obtiene el menor val_rmse.
+        # cuyo bestModel del CV obtiene el menor val_rmse. Todos entrenan sobre el
+        # mismo train (TRAIN_VAL_YEARS).
+        candidates: list[dict] = []
         print(f"\n=== Fase 1: Entrenamiento — CV(k={cv_folds}) por algoritmo ===")
         progress(
             f"Fase 1: ajustando {len(ALGORITHMS)} algoritmo(s) "
@@ -331,127 +292,71 @@ def main() -> None:
                 extra_params=common_params,
                 input_datasets=full_inputs,
             )
-            record(run_id, run_name, algorithm, "training", best_params,
-                   metrics, model)
+            candidates.append({
+                "run_id": run_id,
+                "run_name": run_name,
+                "algorithm": algorithm,
+                "phase": "training",
+                "params": best_params,
+                "metrics": metrics,
+                "model": model,
+            })
             _print_metrics(metrics)
             print(f"  mejores params: {best_params}")
 
-        training_winner_candidate = min(
-            (c for c in candidates if c["phase"] == "training"),
-            key=lambda c: c["metrics"]["val"]["rmse"],
-        )
-        winner = training_winner_candidate["algorithm"]
-        winner_params = training_winner_candidate["params"]
-        winner_run_id = training_winner_candidate["run_id"]
-        winner_metrics = training_winner_candidate["metrics"]
+        ranked = sorted(candidates, key=lambda c: c["metrics"]["val"]["rmse"])
+        champ_candidate = ranked[0]
         progress(
-            f"Fase 1 terminada. Ganador por val_rmse: '{winner}' "
-            f"(val_rmse={winner_metrics['val']['rmse']:.4f})."
+            f"Fase 1 terminada. Ganador por val_rmse: "
+            f"'{champ_candidate['algorithm']}' "
+            f"(val_rmse={champ_candidate['metrics']['val']['rmse']:.4f}, "
+            f"params={champ_candidate['params']})."
         )
-        print(f"\n>>> Ganador Fase 1 (val_rmse): {winner} "
-              f"(val_rmse={winner_metrics['val']['rmse']:.4f}, "
-              f"common_test_rmse={winner_metrics['common_test']['rmse']:.4f})")
-        print(f"    mejores params: {winner_params}")
-
-        # ---- Fase 2: Más datos — A (subconjunto) vs ganador de la Fase 1 (= B) ------
-        # Ambos se puntúan sobre common_test = TEST_YEAR
-        print(f"\n=== Fase 2: Más datos — A vs ganador Fase 1 (= B) para {winner} ===")
-        MlflowClient().set_tag(winner_run_id, "more_data_subset", "B")
-        training_winner_candidate["extra_tags"]["more_data_subset"] = "B"
-        print(f"  B = train-{winner} (run {winner_run_id}, "
-              f"val_rmse={winner_metrics['val']['rmse']:.4f})")
-
-        sub_train = train.filter(col(cfg["year_col"]).isin(SUBSET_A_YEARS))
-        sub_count = sub_train.count()
-        run_name = "more-data-A"
-        print(f"\n--- {run_name}: años={SUBSET_A_YEARS} ({sub_count:,} filas) ---")
-        if sub_count == 0:
-            print("  Se omite A: vacío.")
-        else:
-            progress(
-                f"Fase 2: iniciando more-data-A — reentrenando '{winner}' sobre "
-                f"años={SUBSET_A_YEARS} ({sub_count:,} filas)."
-            )
-            ds_train_a = _make_dataset(sub_train, f"{use_case}_train_subsetA", cfg)
-            run_id, metrics, model_a = train_and_log_run(
-                splits={"train": sub_train, **eval_splits},
-                label_col=cfg["label_col"],
-                pipeline=_build_pipeline(winner, winner_params, cfg),
-                run_name=run_name,
-                tags=_common_tags(cfg, phase="more_data",
-                                  extra={"algorithm": winner,
-                                         "more_data_subset": "A",
-                                         "training_data": str(SUBSET_A_YEARS)}),
-                extra_params={**common_params, **winner_params,
-                              "subset": "A",
-                              "subset_train_count": sub_count,
-                              "n_train_years": len(SUBSET_A_YEARS)},
-                input_datasets=[(ds_train_a, "training"),
-                                (ds_val, "validation"),
-                                (ds_common_test, "testing")],
-            )
-            record(run_id, run_name, winner, "more_data",
-                   winner_params, metrics, model_a,
-                   extra_tags={"more_data_subset": "A",
-                               "training_data": str(SUBSET_A_YEARS)})
-            _print_metrics(metrics)
 
         # ---- Resumen — ordenado por val_rmse----
         print("\n=== Resumen (todos los candidatos, ordenados por val_rmse) ===")
         header = (
-            f"{'run_name':<22} {'algorithm':<6} "
+            f"{'run_name':<14} {'algorithm':<6} "
             f"{'val_rmse':>12} {'common_test_rmse':>18} "
             f"{'common_test_mae':>18} {'common_test_r2':>14}"
         )
         print(header)
         print("-" * len(header))
-        ranked = sorted(candidates,
-                        key=lambda c: c["metrics"]["val"]["rmse"])
         for c in ranked:
             v = c["metrics"]["val"]
             ct = c["metrics"]["common_test"]
             print(
-                f"{c['run_name']:<22} {c['algorithm']:<6} "
+                f"{c['run_name']:<14} {c['algorithm']:<6} "
                 f"{v['rmse']:>12.4f} {ct['rmse']:>18.4f} "
                 f"{ct['mae']:>18.4f} {ct['r2']:>14.4f}"
             )
         print(
-            f"\nBaseline common_test_rmse: {baseline_metrics['rmse']:.4f}  "
-            f"(solo informativo — common_test no se usa para ordenar candidatos)"
+            "\n(common_test es solo informativo — no se usa para ordenar candidatos)"
         )
 
-        # ---- Fase 3: se registra cada candidato ---------------------------
-        # El candidato con menor val_rmse es el aspirante a @champion.
-        champ_candidate = ranked[0]
+        # ---- Fase 2: se registra cada candidato ---------------------------
+        # champ_candidate (el de menor val_rmse) es el aspirante a @champion.
+        train_years = " y ".join(str(y) for y in TRAIN_VAL_YEARS)
 
+        # La descripción contiene los hiperparámetros y el conjunto de predictores.
         def _build_version_description(c: dict) -> str:
-            training_data = c["extra_tags"].get("training_data", str(TRAIN_VAL_YEARS))
-            val_m = c["metrics"]["val"]
             ct_m = c["metrics"]["common_test"]
             return (
-                f"Run name: {c['run_name']}. "
-                f"Algorithm: {c['algorithm']}. Phase: {c['phase']}.\n"
-                f"Params: {c['params']}.\n"
-                f"Source: {cfg['source']} (Nessie main "
-                f"hash={nessie_main_hash[:12] or 'unknown'}, "
-                f"snapshot_id={source_snapshot_id}). "
-                f"Target: {cfg['label_col']}.\n"
-                f"Training data: {training_data}.\n"
-                f"Numerical features (base): {', '.join(cfg['numerical_cols'])}.\n"
-                f"Categorical features: {', '.join(cfg['categorical_cols'])}.\n"
-                f"Scores: val_rmse={val_m['rmse']:.4f}, "
-                f"common_test_rmse={ct_m['rmse']:.4f}, "
-                f"common_test_mae={ct_m['mae']:.4f}, "
-                f"common_test_r2={ct_m['r2']:.4f}. "
-                f"Baseline common_test_rmse={baseline_metrics['rmse']:.4f}."
+                f"{c['algorithm'].upper()} para predecir {cfg['label_col']} "
+                f"a partir de {cfg['source']}. Entrenado con {train_years}.\n"
+                f"Hiperparámetros: {c['params']}.\n"
+                f"Predictores numéricos (base): {', '.join(cfg['numerical_cols'])}.\n"
+                f"Predictores categóricos: {', '.join(cfg['categorical_cols'])}.\n"
+                f"val_rmse={c['metrics']['val']['rmse']:.4f} · "
+                f"common_test: rmse={ct_m['rmse']:.4f} mae={ct_m['mae']:.4f} "
+                f"r2={ct_m['r2']:.4f}."
             )
 
         def _build_version_tags(c: dict) -> dict[str, str]:
-            training_data = c["extra_tags"].get("training_data", str(TRAIN_VAL_YEARS))
             val_m = c["metrics"]["val"]
             ct_m = c["metrics"]["common_test"]
-            tags = {
-                "training_data": training_data,
+            return {
+                "training_data": str(TRAIN_VAL_YEARS),
                 "algorithm": c["algorithm"],
                 "phase": c["phase"],
                 "run_name": c["run_name"],
@@ -461,35 +366,15 @@ def main() -> None:
                 "common_test_rmse": f"{ct_m['rmse']:.4f}",
                 "common_test_mae":  f"{ct_m['mae']:.4f}",
                 "common_test_r2":   f"{ct_m['r2']:.4f}",
-                "baseline_common_test_rmse": f"{baseline_metrics['rmse']:.4f}",
                 "nessie_main_hash":   nessie_main_hash,
                 "source_snapshot_id": str(source_snapshot_id),
             }
-            if "more_data_subset" in c["extra_tags"]:
-                tags["more_data_subset"] = c["extra_tags"]["more_data_subset"]
-            return tags
 
         model_description = (
-            f"Spark MLlib regression for {cfg['experiment']}. "
-            f"Source: {cfg['source']} (Nessie main, gold layer). "
-            f"Target: {cfg['label_col']}. "
-            f"Each src/ml/train.py {use_case} invocation registers every "
-            f"candidate it trains (3 Phase-1 Training + 1 Phase-2 "
-            f"More-data = 4 per run). The best across phases (lowest "
-            f"val_rmse) gets @champion only if its val_rmse is strictly "
-            f"below the previous champion's val_rmse; otherwise it stays "
-            f"validation_status=\"challenger\". common_test is held out and "
-            f"never used to rank candidates — the test metrics on each "
-            f"version are the unbiased generalization estimate. All other "
-            f"candidates from the run are tagged "
-            f"validation_status=\"challenger\". @challenger alias points to "
-            f"the best non-champion version from the most recent run. "
-            f"Every version tags the Nessie main commit hash and the source "
-            f"Iceberg snapshot_id used at training time (reproducibility). "
-            f"The new @champion also gets an inference_latency_ms_per_row "
-            f"tag from a 1000-row sample of common_test. The registry is "
-            f"pruned to the {REGISTRY_MAX_VERSIONS} most-recent versions "
-            f"after each run; aliased versions are always retained."
+            f"Regresión con Spark MLlib para predecir {cfg['label_col']} "
+            f"a partir de {cfg['source']} (capa gold), entrenada con {train_years}.\n"
+            f"@champion es la versión vigente (menor val_rmse); "
+            f"@previous, la que relevó y a la que se revertiría."
         )
         registered_tags = {
             "framework": "spark-mllib",
@@ -499,7 +384,7 @@ def main() -> None:
         }
 
         progress(
-            f"Fase 3: registrando {len(candidates)} candidatos en "
+            f"Fase 2: registrando {len(candidates)} candidatos en "
             f"{cfg['experiment']}..."
         )
         registered = register_candidates(
@@ -516,13 +401,13 @@ def main() -> None:
         )
 
         print(
-            f"\n=== Fase 3: registradas {len(registered)} versión(es) de "
+            f"\n=== Fase 2: registradas {len(registered)} versión(es) de "
             f"{cfg['experiment']} (ordenadas por val_rmse) ==="
         )
         for c in ranked:
             mv, status = registered[c["run_id"]]
             print(
-                f"  v{mv.version:<3}  {c['run_name']:<22}  "
+                f"  v{mv.version:<3}  {c['run_name']:<14}  "
                 f"val_rmse={c['metrics']['val']['rmse']:.4f}  "
                 f"common_test_rmse={c['metrics']['common_test']['rmse']:.4f}  "
                 f"[{status}]"

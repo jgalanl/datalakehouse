@@ -21,20 +21,19 @@ def build_regression_pipeline(
     scale: str | None = None,
     vector_index: bool = False,
 ) -> Pipeline:
-    indexers = [
-        StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
-        for c in categorical_cols
-    ]
-    if one_hot:
-        encoders = [
-            OneHotEncoder(inputCol=f"{c}_idx", outputCol=f"{c}_ohe")
-            for c in categorical_cols
-        ]
-        cat_feature_cols = [f"{c}_ohe" for c in categorical_cols]
-    else:
-        encoders = []
-        cat_feature_cols = [f"{c}_idx" for c in categorical_cols]
-    stages: list = [*indexers, *encoders]
+    # Un único StringIndexer/OneHotEncoder multi-columna: ajustan todas las categóricas sobre los datos.
+    idx_cols = [f"{c}_idx" for c in categorical_cols]
+    stages: list = []
+    cat_feature_cols = idx_cols
+    if categorical_cols:
+        stages.append(StringIndexer(
+            inputCols=categorical_cols, outputCols=idx_cols, handleInvalid="keep",
+        ))
+        if one_hot:
+            cat_feature_cols = [f"{c}_ohe" for c in categorical_cols]
+            stages.append(OneHotEncoder(
+                inputCols=idx_cols, outputCols=cat_feature_cols,
+            ))
 
     if scale == "standard":
         # Solo se escalan las numéricas: las one-hot tienen desviación casi nula, así

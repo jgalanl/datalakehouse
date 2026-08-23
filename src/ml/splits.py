@@ -10,7 +10,6 @@ from ml.algorithms import TREE_ALGORITHMS
 
 TEST_YEAR: int = 2025
 TRAIN_VAL_YEARS: list[int] = [2023, 2024]
-SUBSET_A_YEARS: list[int] = [2023]
 
 # Se reparticiona para que cada bloque columnar cacheado quepa en un executor de 3 GB.
 SPLIT_PARTITIONS = 64
@@ -66,12 +65,9 @@ CYCLICAL_COLS: dict[str, int] = {
 }
 
 
-def add_cyclical_features(
-    df: DataFrame, numerical_cols: list[str],
-) -> tuple[DataFrame, list[str]]:
+def add_cyclical_features(df: DataFrame, numerical_cols: list[str]) -> DataFrame:
     """Añade sin/cos por cada feature cíclica, manteniendo también las columnas enteras
-    (los árboles las siguen usando). Devuelve (df, nombres de las columnas añadidas)."""
-    added: list[str] = []
+    (los árboles las siguen usando). `resolve_numerical_cols` deriva los nombres."""
     out = df
     for c in numerical_cols:
         if c not in CYCLICAL_COLS:
@@ -82,8 +78,7 @@ def add_cyclical_features(
             out.withColumn(f"{c}_sin", spark_sin(angle))
                .withColumn(f"{c}_cos", spark_cos(angle))
         )
-        added.extend([f"{c}_sin", f"{c}_cos"])
-    return out, added
+    return out
 
 
 def resolve_numerical_cols(

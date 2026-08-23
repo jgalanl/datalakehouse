@@ -15,8 +15,6 @@ from mlflow.exceptions import MlflowException
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import broadcast, col, lit, mean as spark_mean, when
-from pyspark.sql.types import DoubleType
 
 from common.spark_factory import get_spark
 from common import nessie_manager as nessie
@@ -68,9 +66,10 @@ CV_PARALLELISM: int = 2
 # Filas de common_test que se puntúan al medir la latencia de inferencia del @champion.
 INFERENCE_LATENCY_SAMPLE_ROWS: int = 1000
 
-# Tope de versiones que se conservan. Las que tienen alias (@champion/@challenger) quedan exentas.
+# Tope de versiones que se conservan. Las que tienen alias (@champion/@previous) quedan exentas,
+# así el punto de reversión nunca se poda.
 REGISTRY_MAX_VERSIONS: int = 20
-REGISTRY_PROTECTED_ALIASES: tuple[str, ...] = ("champion", "challenger")
+REGISTRY_PROTECTED_ALIASES: tuple[str, ...] = ("champion", "previous")
 
 
 def evaluate_predictions(
@@ -112,53 +111,6 @@ def log_input_datasets(
 
 
 # --- Utilidades de entrenamiento ---
-
-def train_and_log_run(
-    *,
-    splits: dict[str, DataFrame],
-    label_col: str,
-    pipeline: Pipeline,
-    run_name: str,
-    tags: dict,
-    extra_params: dict | None = None,
-    input_datasets: list[tuple["mlflow.data.dataset.Dataset", str]] | None = None,
-) -> tuple[str, dict[str, dict[str, float]], object]:
-    """Entrena con splits['train'], puntúa cada split y lo registra todo en MLflow.
-
-    Devuelve (run_id, métricas por split, modelo entrenado) para reutilizarlo sin recargar.
-    """
-    with mlflow.start_run(run_name=run_name) as run:
-        run_id = run.info.run_id
-        mlflow.set_tags(tags)
-        log_input_datasets(input_datasets)
-        if extra_params:
-            mlflow.log_params(extra_params)
-
-        progress(f"  [{run_name}] entrenando ({len(pipeline.getStages())} etapas)...")
-        t0 = time.perf_counter()
-        model = pipeline.fit(splits["train"])
-        progress(f"  [{run_name}] entrenamiento hecho en {time.perf_counter() - t0:.1f}s")
-
-        all_metrics: dict[str, dict[str, float]] = {}
-        for split_name, split_df in splits.items():
-            t1 = time.perf_counter()
-            metrics = evaluate_regression(model, split_df, label_col)
-            log_split_metrics(metrics, split_name)
-            all_metrics[split_name] = metrics
-            progress(
-                f"  [{run_name}] {split_name}: rmse={metrics['rmse']:.4f} "
-                f"mae={metrics['mae']:.4f} r2={metrics['r2']:.4f} "
-                f"({time.perf_counter() - t1:.1f}s)"
-            )
-
-        progress(f"  [{run_name}] registrando modelo...")
-        t2 = time.perf_counter()
-        mlflow.spark.log_model(
-            model, artifact_path="model", pip_requirements=MODEL_PIP_REQUIREMENTS,
-        )
-        progress(f"  [{run_name}] modelo registrado en {time.perf_counter() - t2:.1f}s")
-    return run_id, all_metrics, model
-
 
 def tune_with_cv(
     *,
@@ -238,8 +190,8 @@ def tune_with_cv(
                         f"{idx + 1}/{len(param_list)}: inicio entrenamiento {params}"
                     )
                     pt = time.perf_counter()
-                    pm = {estimator.getParam(k): v for k, v in params.items()}
-                    model = estimator.copy(pm).fit(train_feat)
+                    point_estimator = pipeline_factory(algorithm, params).getStages()[-1]
+                    model = point_estimator.fit(train_feat)
                     rmse = evaluator.evaluate(model.transform(val_feat))
                     progress(
                         f"    [{run_name}] fold {i + 1} · grid "
@@ -304,103 +256,6 @@ def tune_with_cv(
         )
 
     return run_id, best_params, all_metrics, best_model
-
-
-# --- Baseline ---
-
-def _fit_baseline_predictor(
-    train_df: DataFrame, label_col: str, group_cols: list[str],
-) -> tuple[DataFrame, float]:
-    """Predictor por media de grupo. Devuelve (group_means_df, media global de respaldo)."""
-    group_means = (
-        train_df
-        .groupBy(*group_cols)
-        .agg(spark_mean(col(label_col)).alias("baseline_pred"))
-    )
-    global_mean = float(
-        train_df.agg(
-            spark_mean(col(label_col)).alias("global_mean")
-        ).collect()[0]["global_mean"]
-    )
-    return group_means, global_mean
-
-
-def _score_baseline(
-    df: DataFrame, group_means: DataFrame, global_mean: float,
-    label_col: str, group_cols: list[str],
-) -> dict[str, float]:
-    """Puntúa el predictor de media por grupo sobre `df` y devuelve {rmse, mae, r2}."""
-    predictions = (
-        df
-        .join(broadcast(group_means), on=group_cols, how="left")
-        .withColumn(
-            "prediction",
-            when(col("baseline_pred").isNull(), lit(global_mean))
-            .otherwise(col("baseline_pred"))
-            .cast(DoubleType()),
-        )
-        .select(label_col, "prediction")
-        .cache()
-    )
-    try:
-        return evaluate_predictions(predictions, label_col)
-    finally:
-        predictions.unpersist()
-
-
-def compute_baseline_metrics(
-    *,
-    train_df: DataFrame,
-    test_df: DataFrame,
-    label_col: str,
-    group_cols: list[str],
-) -> dict[str, float]:
-    """Baseline de media de la etiqueta por grupo, con la media global de respaldo para
-    los grupos no vistos"""
-    group_means, global_mean = _fit_baseline_predictor(
-        train_df, label_col, group_cols,
-    )
-    return _score_baseline(test_df, group_means, global_mean, label_col, group_cols)
-
-
-def log_baseline_run(
-    *,
-    train_df: DataFrame,
-    eval_splits: dict[str, DataFrame],
-    label_col: str,
-    group_cols: list[str],
-    tags: dict,
-    extra_params: dict,
-    input_datasets: list[tuple["mlflow.data.dataset.Dataset", str]] | None = None,
-) -> dict[str, float]:
-    """Entrena con `train_df` y puntúa cada split. Devuelve las métricas de common_test."""
-    progress(f"  [baseline] entrenando predictor media-por-grupo sobre {group_cols}...")
-    group_means, global_mean = _fit_baseline_predictor(
-        train_df, label_col, group_cols,
-    )
-    group_means = group_means.cache()  # se puntúa cada split
-    try:
-        per_split: dict[str, dict[str, float]] = {}
-        with mlflow.start_run(run_name="baseline"):
-            mlflow.set_tags(tags)
-            log_input_datasets(input_datasets)
-            mlflow.log_params({
-                **extra_params,
-                "baseline_group_cols": ",".join(group_cols),
-            })
-            for split_name, split_df in eval_splits.items():
-                metrics = _score_baseline(
-                    split_df, group_means, global_mean, label_col, group_cols,
-                )
-                log_split_metrics(metrics, split_name)
-                per_split[split_name] = metrics
-                progress(
-                    f"  [baseline] {split_name}: rmse={metrics['rmse']:.4f} "
-                    f"mae={metrics['mae']:.4f} r2={metrics['r2']:.4f}"
-                )
-    finally:
-        group_means.unpersist()
-    return per_split.get("common_test", next(iter(per_split.values())))
 
 
 # --- Latencia de inferencia ---
@@ -476,6 +331,10 @@ def _run_metric(client: MlflowClient, run_id: str, metric: str) -> float | None:
         return None
 
 
+def _fmt_metric(value: float | None) -> str:
+    return "n/d" if value is None else f"{value:.4f}"
+
+
 def register_candidates(
     *,
     name: str,
@@ -494,8 +353,9 @@ def register_candidates(
     """Registra cada candidato como una versión nueva de `name`.
 
     Cada candidato es un dict con al menos "run_id". El de champion_run_id se queda con
-    @champion solo si su `promotion_metric` mejora estrictamente la del champion actual;
-    si no, queda como challenger. @challenger apunta a la mejor versión no promovida.
+    @champion solo si su `promotion_metric` mejora estrictamente la del champion actual.
+    Al relevarlo, el campeón destronado pasa a @previous: es el punto de reversión del
+    servicio y, por llevar alias, queda exento de la poda.
     Devuelve {run_id: (ModelVersion, status)}.
     """
     client = MlflowClient()
@@ -531,7 +391,7 @@ def register_candidates(
         version_tags_full = {
             **build_version_tags(c),
             "deployment_date": deployment_date,
-            "validation_status": "challenger",
+            "validation_status": "candidate",
         }
         for k, v in version_tags_full.items():
             client.set_model_version_tag(
@@ -560,7 +420,15 @@ def register_candidates(
     else:
         cur_champ_version = cur_champ.version
         cur_champ_metric = _run_metric(client, cur_champ.run_id, promotion_metric)
-        if cur_champ_metric is None:
+        if contender_metric is None:
+            # Sin métrica del aspirante no se puede demostrar mejora: no se releva.
+            print(
+                f"  El aspirante (run {champion_run_id}) no expone "
+                f"'{promotion_metric}': no hay comparación posible, "
+                f"se mantiene el champion actual (v{cur_champ_version})."
+            )
+            promoted = False
+        elif cur_champ_metric is None:
             print(
                 f"  El champion actual (v{cur_champ_version}) no expone "
                 f"'{promotion_metric}' en su run: no hay comparación posible, "
@@ -574,46 +442,33 @@ def register_candidates(
         client.set_registered_model_alias(name, "champion", contender_mv.version)
         _set_status(contender_mv.version, "champion")
         if cur_champ_version is not None:
-            _set_status(cur_champ_version, "challenger")
+            try:
+                old_prev = client.get_model_version_by_alias(name, "previous")
+                if old_prev.version != cur_champ_version:
+                    _set_status(old_prev.version, "candidate")
+            except MlflowException:
+                pass  # todavía no había @previous
+            # El campeón destronado pasa a ser el punto de reversión del servicio.
+            client.set_registered_model_alias(name, "previous", cur_champ_version)
+            _set_status(cur_champ_version, "previous")
             print(
                 f"  v{contender_mv.version} promovida a @champion "
-                f"({promotion_metric} {contender_metric:.4f} < "
-                f"el de v{cur_champ_version} {cur_champ_metric:.4f}); "
-                f"v{cur_champ_version} etiquetada validation_status=challenger"
+                f"({promotion_metric} {_fmt_metric(contender_metric)} < "
+                f"el de v{cur_champ_version} {_fmt_metric(cur_champ_metric)}); "
+                f"v{cur_champ_version} pasa a @previous (punto de reversión)"
             )
         else:
             print(
                 f"  v{contender_mv.version} establecida como @champion "
-                f"(primera versión de {name})"
+                f"(primera versión de {name}; aún no hay @previous)"
             )
     else:
-        # Ya quedó etiquetado como challenger arriba: el tag se deja como está.
         print(
-            f"  v{contender_mv.version} se queda como challenger "
-            f"({promotion_metric} {contender_metric:.4f} >= "
-            f"el de v{cur_champ_version} {cur_champ_metric:.4f})"
+            f"  v{contender_mv.version} no releva al champion "
+            f"({promotion_metric} {_fmt_metric(contender_metric)} >= "
+            f"el de v{cur_champ_version} {_fmt_metric(cur_champ_metric)}); "
+            f"@champion sigue en v{cur_champ_version}"
         )
-
-    # @challenger apunta al mejor candidato de esta ejecución que no se quedó con
-    # @champion; el aspirante no promovido sigue en el grupo.
-    challenger_pool = [
-        c["run_id"] for c in candidates
-        if not (promoted and c["run_id"] == champion_run_id)
-    ]
-    challenger_alias_version: str | None = None
-    if challenger_pool:
-        run_metrics = {
-            rid: _run_metric(client, rid, promotion_metric) or float("inf")
-            for rid in challenger_pool
-        }
-        best_other = min(run_metrics, key=run_metrics.get)
-        challenger_alias_version = registered[best_other].version
-
-    if challenger_alias_version is not None:
-        client.set_registered_model_alias(
-            name, "challenger", challenger_alias_version,
-        )
-        print(f"  @challenger -> v{challenger_alias_version}")
 
     # Tags de latencia solo en el @champion recién promovido
     if promoted and latency_model is not None and latency_sample_df is not None:
@@ -649,6 +504,6 @@ def register_candidates(
         if c["run_id"] == champion_run_id and promoted:
             status = "champion"
         else:
-            status = "challenger"
+            status = "candidate"
         result[c["run_id"]] = (mv, status)
     return result
