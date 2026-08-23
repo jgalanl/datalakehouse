@@ -336,14 +336,14 @@ El código de ML consume **solo las tablas gold publicadas en `main`**. Los mód
 en [src/ml/](src/ml/): [splits.py](src/ml/splits.py) (preparación de los datos),
 [pipelines.py](src/ml/pipelines.py) (construcción del *pipeline* de Spark ML),
 [algorithms.py](src/ml/algorithms.py) (algoritmos e hiperparámetros) y
-[tracking.py](src/ml/tracking.py) (sesión, evaluadores, modelo de referencia y registro).
+[tracking.py](src/ml/tracking.py) (sesión, evaluadores, validación cruzada y registro).
 
 ### 6.1. Casos de uso
 
 | Caso       | Variable objetivo       | Tabla de origen                      | GLR: familia / enlace | Modelo registrado |
 | ---------- | ----------------------- | ------------------------------------ | --------------------- | ----------------- |
 | `fare`     | `fare_amount`           | `nessie.nyc.yellow_taxi_trips`       | gamma / log           | `fare_prediction` |
-| `duration` | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips`       | gamma / log           | `trip_duration`   |
+| `duration` | `trip_duration_minutes` | `nessie.nyc.yellow_taxi_trips`       | gamma / log           | `trip_duration_prediction` |
 | `demand`   | `n_pickups`             | `nessie.nyc.pickup_demand_zone_hour` | poisson / log         | `demand_forecast` |
 
 Los tres comparten un único proceso de entrenamiento, que recibe el caso de uso como argumento. Lo
@@ -365,7 +365,8 @@ interpretable), **`GBTRegressor`** (árboles con *boosting*, reduce el sesgo) y
 - **Reparto de los subconjuntos.** El conjunto de **test son todos los viajes de 2025**, que no
   intervienen ni en el entrenamiento ni en la elección del modelo. Entrenamiento y validación
   salen de 2023 y 2024 mediante un reparto aleatorio estratificado por año, con el 15 % para
-  validación.
+  validación. **Todos los candidatos se entrenan sobre ese mismo conjunto**, de modo que la
+  comparación entre ellos aísla el algoritmo y sus hiperparámetros.
 - **Uso de las métricas.** La validación es el único subconjunto que interviene en las decisiones,
   tanto en el ajuste de hiperparámetros como en la elección entre algoritmos. Las métricas de
   prueba se calculan solo al final, para documentar el rendimiento esperado ante datos nuevos.
@@ -377,26 +378,28 @@ interpretable), **`GBTRegressor`** (árboles con *boosting*, reduce el sesgo) y
 
 ### 6.3. Experimentación
 
-- **Modelo de referencia:** la media de la variable objetivo dentro de su grupo, que marca el suelo
-  que cualquier modelo debe superar.
-- **Ajuste de hiperparámetros:** cada algoritmo se explora sobre cuatro configuraciones con
-  validación cruzada de tres particiones calculada solo sobre el entrenamiento, es decir, doce
-  ajustes por algoritmo, lanzados de dos en dos sobre los dos ejecutores. Gana el de menor error de
-  validación.
-- **Contraste de volumen de entrenamiento:** se añade un candidato más, el algoritmo ganador
-  entrenado solo con 2023, y se compara con el mismo entrenado con 2023 y 2024 sobre el mismo
-  conjunto de prueba, para comprobar si compensa entrenar con más años.
+No hay modelos con hiperparámetros por defecto: cada algoritmo entra directamente en el **ajuste de
+hiperparámetros**, explorado sobre cuatro configuraciones con validación cruzada de tres particiones
+calculada solo sobre el entrenamiento, es decir, doce ajustes por algoritmo, lanzados de dos en dos
+sobre los dos ejecutores. Gana el de menor error de validación, que se reentrena sobre todo el
+conjunto de entrenamiento con esa configuración. El resultado es un candidato por algoritmo, los
+tres entrenados con los mismos años y evaluados sobre los mismos subconjuntos.
 
 ### 6.4. Registro y promoción
 
-Cada ejecución registra **cuatro candidatos** —los tres ganadores de cada algoritmo y el reentrenado
-en el contraste de volumen— como versiones nuevas del modelo registrado, con sus métricas sobre los
-tres subconjuntos, sus hiperparámetros y su procedencia.
+Cada ejecución registra **tres candidatos** —uno por algoritmo, ya optimizado— como versiones nuevas
+del modelo registrado, con sus métricas sobre los tres subconjuntos, sus hiperparámetros y su
+procedencia.
 
-Dos alias marcan el estado del registro: **`@champion`** (modelo vigente) y **`@challenger`** (mejor
-aspirante). El mejor candidato de la ejecución sustituye al campeón solo si su error de validación
-es estrictamente menor; en caso contrario, queda como aspirante. Al terminar se conservan las
-**veinte versiones más recientes** y todas las que tengan alias, y el resto se elimina.
+Dos alias marcan roles de despliegue: **`@champion`** es la versión que se sirve, y **`@previous`**
+aquella a la que se revertiría, es decir, la que el campeón vigente relevó. El mejor candidato de la
+ejecución sustituye al campeón solo si su error de validación es estrictamente menor; al hacerlo, el
+destronado pasa a `@previous`. Si no lo mejora, ningún alias se mueve y la versión queda registrada
+como candidata. Al terminar se conservan las **veinte versiones más recientes** y todas las que tengan alias
+—lo que garantiza que el punto de reversión nunca se elimina—, y el resto se descarta.
+
+En cada versión, el atributo `validation_status` refleja su situación: `champion`, `previous` o
+`candidate`.
 
 Al promocionar, el nuevo `@champion` recibe además una medición de **latencia de inferencia** sobre
 1000 filas de prueba, útil para comparar el coste entre campeones sucesivos.
@@ -406,7 +409,7 @@ Hay un notebook de diagnóstico por caso de uso
 [duration](src/notebooks/ml/duration_diagnostics.ipynb) ·
 [demand](src/notebooks/ml/demand_diagnostics.ipynb)): carga el `@champion`, reconstruye los
 subconjuntos con la misma semilla, mide el modelo en cada uno y muestra predicho frente a real,
-residuos, importancia de los predictores y el resultado del contraste de volumen. **No reentrena.**
+residuos e importancia de los predictores. **No reentrena.**
 
 ### 6.5. Servicio del modelo (API REST)
 
@@ -456,7 +459,9 @@ rama**, de forma que cada capa se cataloga como un servicio propio:
 | `iceberg_bronze`         | `bronze`       | `yellow_taxi`, `taxi_zone_lookup`                     |
 | `iceberg_silver`         | `silver`       | `yellow_taxi`, `taxi_zone_lookup`                     |
 | `iceberg_gold`           | `main`         | `yellow_taxi_trips`, `pickup_demand_zone_hour`        |
-| `mlflow_registry`        | —              | `fare_prediction`, `trip_duration`, `demand_forecast` |
+| `mlflow_registry`        | —              | `fare_prediction`, `trip_duration_prediction`, `demand_forecast` |
+
+De cada modelo se cataloga la versión **`@champion`**, la que se sirve.
 
 **Linaje.** Los conectores de metadatos no deducen las relaciones entre tablas, así que el grafo se
 **declara como código**: [lineage.py](config/openmetadata/lineage.py) publica al final de cada
