@@ -102,7 +102,7 @@ EDGES = [
     # gold -> modelos (entrenamiento) — a nivel de tabla
     (G + "yellow_taxi_trips", M + "fare_prediction",
      "Entrenamiento — train.py fare (GBT @champion)", None),
-    (G + "yellow_taxi_trips", M + "trip_duration",
+    (G + "yellow_taxi_trips", M + "trip_duration_prediction",
      "Entrenamiento — train.py duration (GBT @champion)", None),
     (G + "pickup_demand_zone_hour", M + "demand_forecast",
      "Entrenamiento — train.py demand (GBT @champion)", None),
