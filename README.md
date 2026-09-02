@@ -1,5 +1,10 @@
 # Diseño e implementación de una arquitectura Data Lakehouse para el ciclo de vida del dato: ingeniería, aprendizaje automático y gobernanza
 
+**Autor:** Jesús Galán Llano · **Director:** Agustín Carlos Caminero Herraez
+
+Trabajo de Fin de Máster del Máster Universitario en Ingeniería y Ciencia de Datos.
+Universidad Nacional de Educación a Distancia (UNED).
+
 Implementación de una arquitectura **data lakehouse** construida íntegramente con componentes
 de código abierto y desplegada en local mediante contenedores. Cubre tres dimensiones del ciclo de
 vida del dato, **ingeniería**, **aprendizaje automático** y **gobernanza**. Emplea los registros
